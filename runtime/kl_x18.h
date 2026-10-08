@@ -314,6 +314,10 @@ typedef struct {
 // Encodings that were refused, with counts — the work list for extending the
 // decoder. Prints nothing when there are none.
 void kl_x18_report(FILE *f);
+// ...and forget it, for a caller that emits the same image a second time (klepton-ld
+// does when the first pool placement left sites out of reach): the list would
+// otherwise name every refused encoding twice.
+void kl_x18_report_reset(void);
 
 // ---------------------------------------------------- data inside code
 //

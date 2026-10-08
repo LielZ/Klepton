@@ -1428,6 +1428,10 @@ int kl_x18_next_code(uint64_t sec_va, size_t sec_size,
     return 0;
 }
 
+void kl_x18_report_reset(void) {
+    g_nrefused_kinds = g_refused_total = 0;
+}
+
 void kl_x18_report(FILE *f) {
     if (!g_refused_total) return;
     fprintf(f, "  [klepton] x18: %u sites refused (reading Darwin's x18):\n",
