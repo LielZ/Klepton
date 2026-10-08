@@ -218,7 +218,45 @@ print(phys[0]["identifier"])
     echo "[4/5] install skipped (KL_SKIP_INSTALL=1 - existing app and its data container kept)"
   else
     echo "[4/5] installing…"
-    xcrun devicectl device install app --device "$DEVID" "$APP" | tail -2
+    # The install is the first step that needs the headset itself, and the two
+    # ways it fails for a first-time owner have nothing to do with the build:
+    #
+    #  - the headset is not in the signing profile, because it has never been
+    #    registered with the developer account. The build above is for a generic
+    #    destination and cannot register anything; so build once more FOR this
+    #    device, which lets Xcode register it and re-sign, then install again.
+    #  - the connection drops ("peer is no longer reachable"). Once more, after
+    #    a pause, is all it has ever taken.
+    #
+    # Either way the outcome is this script's status, with the reason on a line
+    # of its own — a pipe into `tail` used to be all that reported it.
+    INSTALL_LOG="$(mktemp)"
+    install_app() {
+      xcrun devicectl device install app --device "$DEVID" "$APP" > "$INSTALL_LOG" 2>&1
+      local rc=$?
+      tail -2 "$INSTALL_LOG"
+      return $rc
+    }
+    set +e
+    install_app; INSTALL_RC=$?
+    if [ $INSTALL_RC -ne 0 ] && grep -qiE 'provisioning profile|not registered|0xe8008015|0xe8008012' "$INSTALL_LOG"; then
+      echo "  this headset is not in the signing profile yet — registering it and signing again…"
+      xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" -configuration Debug \
+        -destination "id=$DEVID" -derivedDataPath "build/dd-device-$KLT_NAME$DD_SUFFIX" \
+        -allowProvisioningUpdates -allowProvisioningDeviceRegistration build 2>&1 | grep -E 'error:|\*\* BUILD'
+      install_app; INSTALL_RC=$?
+    elif [ $INSTALL_RC -ne 0 ]; then
+      echo "  install failed — once more in 5 s"
+      sleep 5
+      install_app; INSTALL_RC=$?
+    fi
+    set -e
+    if [ $INSTALL_RC -ne 0 ]; then
+      echo "!! install FAILED: $(grep -iE 'error|failed' "$INSTALL_LOG" | tail -1 | cut -c1-200)"
+      rm -f "$INSTALL_LOG"
+      exit 1
+    fi
+    rm -f "$INSTALL_LOG"
   fi
   # Installing can rotate the data container, so assets are staged *after*.
   stage_if_needed "$DEVID" "$DEVID"
