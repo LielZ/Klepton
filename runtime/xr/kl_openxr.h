@@ -46,6 +46,7 @@
 // unresolved-import report still works — see the note in kl_shim_lookup about
 // a gateway that can never say no.
 void *kl_openxr_lookup(const char *name);
+const char *kl_openxr_name(int i);      // the i-th name lookup answers for; NULL past the end
 
 // XR_KHR_android_surface_swapchain seam, reached from kl_ndk and kl_egl:
 //   - kl_xr_swapchain_for_surface: which surface-backed swapchain a

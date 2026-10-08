@@ -448,7 +448,59 @@ static const kl_gp_word k_hl2_matqueue_allow[] = {
     { 0xe49f8, 0x0a150308, 0x320003e8, "and w8,w24,w21 -> mov w8,#1  (allow=1 forced)" },
 };
 
+// ---- Half-Life: Alyx (Linux ARM64, depot 546564 build of 2026-09) -----------
+//
+// Source 2 hands LuaJIT its memory from below 2 GB. vscript's mmap override
+// (lua_VALVE_OVERRIDE_MMAP) asks tier0's Plat_VirtualAlloc for a region with an
+// upper address limit of 0x80000000; Plat_VirtualAlloc probes hint after hint in
+// 64 KB steps, unmapping whatever the kernel returns above the limit, and
+// vscript then checks the address once more itself. On Linux that finds a hole.
+// On Darwin arm64 there is none to find: everything below 4 GB is __PAGEZERO,
+// on a Mac and on a headset alike. So the probe fails after tens of thousands
+// of mmap/munmap pairs and the engine dies with "Lua unable to create VM".
+//
+// The limit is policy, not need. This LuaJIT is a GC64 build — lua_gettop reads
+// base and top at 0x20/0x28, the 64-bit GCRef layout — so it is correct for any
+// address below 2^47, which is every address a Darwin process has. The two
+// comparisons are therefore removed: Plat_VirtualAlloc takes the first mapping
+// it is given, and vscript does not second-guess it.
+//
+// Taking the first mapping also ends the start-up storm: tier0's own static
+// initialiser makes the same request for a 2 GB reserve, and used to burn
+// ~390,000 syscalls discovering there was no room. Its caller still declines the
+// high address, as it did before, and carries on without the reserve.
+static const kl_gp_word k_alyx_valloc_limit[] = {
+    { 0x70ef0, 0x54000309, 0x14000018, "b.ls -> b: an address above the caller's limit is accepted" },
+};
+static const kl_gp_word k_alyx_lua_limit[] = {
+    { 0x4dfd8, 0x540005a8, 0xd503201f, "b.hi -> nop: Lua's arena may sit above 2 GB" },
+};
+
+// Half-Life: Alyx, libclient.so — UTIL_PlayerByUserId. It walks the players and
+// returns the one whose engine user id equals the id an event carries, or NULL;
+// and the handler for `player_teleport_finish` (libclient.so+0xffabd8) reads a
+// byte off the result without looking. Here the two ids do not agree — the
+// event's "userid" matches no player — so the FIRST teleport of a session ended
+// it with a fault at address 0x3bd (measured on a Vision Pro, 2026-10-06).
+//
+// Why they disagree is not established; the suspect is the offline Steam stand-in
+// (kl_lx_steam.c), which is what the engine fills its player info from. Until
+// that is, the comparison is skipped: the function returns the first player
+// there is, which in a single-player game is the only one and the one meant.
+static const kl_gp_word k_alyx_player_by_userid[] = {
+    { 0x1460bc8, 0x540000e0, 0x14000007, "b.eq -> b: the first player is the player" },
+};
+
 static const kl_gp_patch k_patches[] = {
+    { "alyx-player-by-userid", "libclient.so",
+      "an event's userid resolves to the single player even when the ids disagree",
+      k_alyx_player_by_userid, sizeof k_alyx_player_by_userid / sizeof *k_alyx_player_by_userid },
+    { "alyx-virtualalloc-no-address-limit", "libtier0.so",
+      "Plat_VirtualAlloc does not insist on memory below 2 GB, which Darwin cannot give",
+      k_alyx_valloc_limit, sizeof k_alyx_valloc_limit / sizeof *k_alyx_valloc_limit },
+    { "alyx-lua-arena-anywhere", "libvscript.so",
+      "the Lua VM's arena is accepted wherever it is mapped (GC64 LuaJIT)",
+      k_alyx_lua_limit, sizeof k_alyx_lua_limit / sizeof *k_alyx_lua_limit },
     // DISABLED: "hl2-multiview-force2" forced libtogl to generate a MULTIVIEW shader
     // variant for every world shader — Strategy A (make ANGLE-Metal multiview work),
     // which never got past "no usable vertex shader variant". We now commit to

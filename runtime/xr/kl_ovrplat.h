@@ -36,7 +36,13 @@
 // else is measured and answered as the trace forces it.
 //
 // Reporting that the platform is unavailable is true here; answering "yes,
-// entitled" would not be.
+// entitled" to content we cannot see would not be.
+//
+// Walkabout courses are the narrow exception that stays on that side of the
+// line. A course is reported installed, and its own store ids are reported
+// purchased, only when the real track bundle is already on disk — files the
+// user copied from a Quest they own. A stub bundle does not count. Download,
+// delete, consume and checkout still abort.
 #ifndef KL_OVRPLAT_H
 #define KL_OVRPLAT_H
 #include <stdio.h>

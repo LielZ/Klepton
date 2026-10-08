@@ -72,6 +72,57 @@ TARGETS = {
         "kind":    "unity",
         "product": "Klepton",
         "display": "Beat Saber",
+        # See beatsaber128.
+        "hand_matting": False,
+    },
+    "beatsaber140": {
+        # Beat Saber 1.40 beside 1.6.0, as its own app. A version variant of
+        # `beatsaber` normally just takes over beatsaber/ (see the trees note in
+        # tools/gen_libc_table.py); a second ROW is what gives it a bundle id, a
+        # container and a userdata profile of its own, so both stay installed.
+        # Split application binary: the OBB is main.<versionCode>.<package>.obb
+        # under this target's userdata, not beatsaber's.
+        "libs":    None,
+        "srcdir":  "beatsaber140/lib/arm64-v8a",
+        "tree":    "beatsaber140",
+        "apk":     "beatsaber-1.40.apk",
+        "assets":  "beatsaber140/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "Klepton",
+        "display": "Beat Saber 1.40",
+        # See beatsaber128.
+        "hand_matting": False,
+        # The in-app data panel (KleptonGameData.swift): the OBB's file name,
+        # and the store's binary ids for the APK and the OBB this build was
+        # translated from. Empty ids leave the panel on its no-network path
+        # (copy the files in through Files, then Unpack).
+        "obb_file":    "main.1716.com.beatgames.beatsaber.obb",
+        "meta_apk_id": "30506607092319862",
+        "meta_obb_id": "30506602615653643",
+    },
+    "beatsaber128": {
+        # Beat Saber 1.28 (Unity 2019.4), a third row for the same reason as
+        # beatsaber140: its own bundle id, container and userdata. Not a split
+        # binary — the assets are in the APK, so there is no OBB to stage.
+        "libs":    None,
+        "srcdir":  "beatsaber128/lib/arm64-v8a",
+        "tree":    "beatsaber128",
+        "apk":     "beatsaber-1.28.apk",
+        "assets":  "beatsaber128/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "Klepton",
+        "display": "Beat Saber 1.28",
+        # Beat Saber draws its own sabers where the hands are, so the system's
+        # matte of the user's arms (and the controllers in them) over the
+        # picture is a second pair in the same place. False opens the space with
+        # .upperLimbVisibility(.hidden); see KLChromaSettings.handMatting.
+        "hand_matting": False,
     },
     "superhot": {
         # SUPERHOT VR — Unity + IL2CPP + the Oculus Mobile SDK, i.e. the same
@@ -98,6 +149,93 @@ TARGETS = {
         "kind":    "unity",
         "product": "KleptonSuperhot",
         "display": "SUPERHOT",
+    },
+    "walkabout": {
+        # Walkabout Mini Golf 6.7 (Mighty Coconut), package
+        # com.MightyCoconut.WalkaboutMiniGolf — Unity + IL2CPP through the stock
+        # com.unity3d.player.UnityPlayerActivity, Beat Saber 1.40's shape:
+        # libOVRPlugin + libOculusXRPlugin for the display, libovrplatformloader
+        # for the Meta platform.
+        #
+        # Split application binary (assets/unity_obb_guid is present): the APK
+        # carries the first scene only and the courses are in
+        # main.60366.com.MightyCoconut.WalkaboutMiniGolf.obb under this target's
+        # userdata.
+        "libs":    None,
+        "srcdir":  "walkabout/lib/arm64-v8a",
+        "tree":    "walkabout",
+        "apk":     "walkabout.apk",
+        "assets":  "walkabout/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonWalkabout",
+        "display": "Walkabout Mini Golf",
+        # The downloadable courses' `<course>common_assets_.bundle` files live
+        # BESIDE the packaged OBB, in Android's own obb directory, and the main
+        # menu's Addressables dependencies name all ten: with any missing it
+        # retries the load forever on the loading screen. So that directory is
+        # staged too (real bundles from the headset, or the placeholders
+        # tools/walkabout_stub_bundles.py writes).
+        "stage_files": "Android/obb/com.MightyCoconut.WalkaboutMiniGolf",
+        # See beatsaber128: the game draws its own hands and putter where the
+        # user's are, so the system's matte of the real arms is a second pair in
+        # the same place. False opens the space with
+        # .upperLimbVisibility(.hidden).
+        "hand_matting": False,
+    },
+    "batman": {
+        # Batman: Arkham Shadow 1.4.1 (com.camouflaj.manta, versionCode 350961).
+        # Unity 2022 + IL2CPP + Burst, the Oculus XR plugin, Wwise for audio,
+        # and Vulkan REQUIRED by its manifest — so the same shape as bonelab
+        # (MoltenVK), on a title shipped for Quest 3 only. A FEASIBILITY target:
+        # added to run the host gates and the shim gap list against it, not
+        # because it is known to boot.
+        #
+        # The NAME is load-bearing: the runtime already special-cases a target
+        # called "batman" — the Adreno identity MoltenVK's device is reported
+        # under (kl_vulkan.c, KL_VK_SPOOF_ADRENO), the Quest 3 hardware identity
+        # (kl_jni.c), and two smaller ones. Under any other name this title pops
+        # "Your device does not match the hardware requirements", abandons
+        # Vulkan and dies in a GLES2 context — measured, as "arkhamshadow".
+        "libs":    None,
+        "srcdir":  "batman/lib/arm64-v8a",
+        "tree":    "batman",
+        "apk":     "batman.apk",
+        "assets":  "batman/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        # Its own product, so its generated .xcodeproj sits beside Klepton.xcodeproj
+        # instead of replacing whichever Beat Saber build that one holds.
+        "product": "KleptonArkham",
+        "display": "Arkham Shadow",
+        # The game draws its own gauntlets where the hands are; the passthrough
+        # hands on top of them are a second, mismatched pair. Default them off
+        # (the in-app toggle still turns them back on).
+        "hand_matting": False,
+        # Fraction of the capped eye-texture size the game is told (the
+        # in-app "Render resolution" slider starts here). Measured on an M5 at
+        # 1.0 = 3072x2464 per eye: 71 fps in the menus, 50 in play, and in play
+        # the compositor itself fell from 100 Hz to 50 — every reprojection
+        # shown twice, judder on head turns. The game's own fixed foveation
+        # does not exist under MoltenVK, so resolution is the lever. 0.7 is
+        # half the pixels.
+        "render_scale": 0.7,
+        # In-game video on by default. A Vulkan guest's is otherwise refused
+        # (kl_mediandk.c, klm_extractor_enabled), on the assumption that decoded
+        # frames reach the renderer as AHardwareBuffers imported into Vulkan —
+        # which this title's Unity never does: it decodes with no surface and
+        # uploads the NV12 bytes itself, and that path is served. Confirmed on
+        # device with its tutorial clips.
+        "video": True,
+        # Its OBB directory is not one packaged *.obb: 69 Addressables bundles,
+        # three audio OBBs, the videos and a manifest sit LOOSE beside the main
+        # OBB, and the game opens each by name. Stage the directory wholesale
+        # (stage_assets.sh, KLT_OBB_RAW) or the device gets one file of 84.
+        "obb_raw": 1,
     },
     "bonelab": {
         # BONELAB — Unity 2021.3.16f1 + IL2CPP, and the same front door again
@@ -407,6 +545,71 @@ TARGETS = {
         "product": "KleptonIntoTheRadius",
         "display": "Into the Radius",
     },
+    "wrath2": {
+        # Asgard's Wrath 2 (Sanzaru), package com.Sanzaru.Wrath2, versionCode
+        # 5513 (12.1.1689309) — UE 4.27.2 on Sanzaru's branch, GameActivity door,
+        # the shape vampire's row calls "wrath2's": FMOD Studio audio plus the
+        # Oculus spatializer, playcore, and libFbnsPlugin (Meta push, excluded by
+        # kl_dl.c). Vulkan only.
+        #
+        # The NAME is load-bearing, more than any other row's: the runtime
+        # already carries this title's measured workarounds under it — two guest
+        # patches keyed on THIS build's instruction words (IsVulkanAvailable and
+        # FShaderPipelineCache::NumPrecompilesRemaining, kl_guestpatch.c; all
+        # four expect-words verified against this APK), the no-async-loading-
+        # thread command line (kl_ue4.c), the MoltenVK compile timeout
+        # (kl_vulkan.c), the FMOD-poll usleep cap and guest QoS (kl_driver.c),
+        # and the ICU directory synthesis (kl_obbmap.c).
+        #
+        # One OBB, main.5513, tens of GB, read through in place.
+        "libs":    None,
+        "srcdir":  "wrath2/lib/arm64-v8a",
+        "tree":    "wrath2",
+        "apk":     "wrath2.apk",
+        "assets":  "wrath2/assets",
+        "qtplugins": "",
+        "obb":     "Android/obb/com.Sanzaru.Wrath2",
+        "entry":   "libUE4",
+        "kind":    "ue4",
+        "product": "KleptonWrath2",
+        "display": "Asgard's Wrath 2",
+        "autoboot": False,
+        "hand_matting": False,
+    },
+    "moss": {
+        # Moss (Polyarc), package com.polyarc.MossGame, versionCode 151047 —
+        # UE 4.27.2 through com.epicgames.ue4.GameActivity, RE4's shape, built
+        # for the original Quest (com.oculus.supportedDevices = quest). Audio is
+        # Wwise, linked into libUE4 with its effect plugins beside it as loose
+        # libAk*.so; XR is OVRPlugin 1.70 (the real plugin ships and is
+        # replaced, as always). bSupportsVulkan is true and both RHIs are in the
+        # binary, so which one it takes is read off the first run. A FEASIBILITY
+        # target until it has booted.
+        "libs":    None,
+        "srcdir":  "moss/lib/arm64-v8a",
+        "tree":    "moss",
+        "apk":     "moss.apk",
+        "assets":  "moss/assets",
+        "qtplugins": "",
+        # UE4 builds <external>/Android/obb/<package>/ itself — RE4's layout.
+        "obb":     "Android/obb/com.polyarc.MossGame",
+        "entry":   "libUE4",
+        "kind":    "ue4",
+        "product": "KleptonMoss",
+        "display": "Moss",
+        # Wait for the Start button instead of booting as soon as the window
+        # is up, so the settings below it can be changed first.
+        "autoboot": False,
+        # Moss draws its own controllers; the passthrough hands on top of them
+        # are a second pair. Off by default, the toggle turns them back on.
+        "hand_matting": False,
+        # The "Foveated rendering" setting starts ON for this target. Note what
+        # that setting reaches: the rate map is attached to render passes
+        # Klepton creates, i.e. an OpenGL guest's. A Vulkan guest's passes are
+        # MoltenVK's, so for Moss this is a stored preference with no effect on
+        # the picture until a Vulkan path for it exists.
+        "foveation": True,
+    },
     # ---- JKXR: ONE APK, TWO GAMES, TWO ROWS ----
     #
     # JKXR is Team Beef's VR port of Jedi Knight II: Jedi Outcast and Jedi
@@ -606,6 +809,44 @@ TARGETS = {
         "product": "KleptonHalfLifeVR",
         "display": "Half Life",
     },
+    "doom3quest": {
+        # Doom3Quest 1.4.8 (Team Beef, com.drbeef.doom3quest) — id Tech 4 (d3es)
+        # behind drbeef's GLES3JNILib door, entry libdoom3, OpenXR. The same
+        # family as hl1/jkxr with one difference the driver carries: these
+        # natives take no handle (onCreate returns void).
+        #
+        # The APK ships the original Doom 3 DEMO (assets/demo0N.pk4) beside the
+        # port's own pak399; the Activity copies both into
+        # /sdcard/Doom3Quest/base, and kl_gles3jni does the same here. Retail
+        # pak000-008.pk4 from a copy the user owns go in
+        # userdata/doom3quest/Doom3Quest/base and take over from the demo.
+        "libs":    None,
+        "srcdir":  "doom3quest/lib/arm64-v8a",
+        "tree":    "doom3quest",
+        "apk":     "doom3quest.apk",
+        "assets":  "doom3quest/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "stage_files": "Doom3Quest",
+        "entry":   "libdoom3",
+        "kind":    "gles3jni",
+        "product": "KleptonDoom3",
+        "display": "Doom 3",
+        # The game draws its own arms and weapons where the hands are; the
+        # system's matte of the user's real arms over the picture is a second
+        # pair in the same place (see beatsaber128).
+        "hand_matting": False,
+        # The whole of the eye-size ceiling kl_ovrp.c gives this target (4000):
+        # 4400x4400 per eye. Affordable because the eyes are foveated (below) —
+        # on device, 2026-10-08, 87-90 frames a second at this size with the
+        # map against 31-55 without it. The "Render resolution" setting lowers
+        # it (50% is the old picture).
+        "render_scale": 1.0,
+        # Fixed foveation on by default: this guest shades every pixel once per
+        # light, and its eyes can take the map although they are mirrored
+        # (kl_glfb.c, klfb_mirror_vrr).
+        "foveation": True,
+    },
     #   Source engine:
     "hl2": {
         # Half-Life 2 VR (com.valvesoftware.source.vrtest) — Source + SDL2
@@ -640,6 +881,34 @@ TARGETS = {
         "kind":    "sdl2",
         "product": "KleptonPortalVR",
         "display": "Portal",
+    },
+
+
+    # ---- A Linux (glibc) process, not an Android app ----
+    "alyx": {
+        # Half-Life: Alyx — Valve's own Linux ARM64 build (Steam app 546560,
+        # game/bin/linuxsteamrtarm64), run as a whole Linux process on the Steam
+        # Linux Runtime's ld.so and glibc (runtime/linux/, kl_linuxproc). Nothing
+        # of it is in this repository: the game and the runtime are the user's
+        # own Steam files beside the checkout (../alyx, ../steamrt).
+        #
+        # No APK, no assets/, no OBB — those fields are the Android shape and are
+        # empty here. The translated libraries are not a property of one
+        # directory either: they come from the game AND the sysroot, and the set
+        # is the one the process really loads (visionos/lx/alyx.loaded, recorded
+        # by a host run with KL_LX_LOADLOG). mklxguest.sh builds them and writes
+        # the list that `libs` is then read from — see lx_libs() below.
+        "libs":    "",
+        "srcdir":  "",
+        "tree":    "lx",
+        "apk":     "",
+        "assets":  "",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "hlvr",
+        "kind":    "linux",
+        "product": "KleptonAlyx",
+        "display": "Half-Life Alyx",
     },
 }
 
@@ -707,6 +976,20 @@ def libs_for(srcdir):
 # identity is kept — changing this orphans the container the assets were staged
 # into, so the first build after it re-stages (run.sh's stamp is keyed on the id,
 # which is what makes that automatic rather than a silent empty container).
+# A Linux target's frameworks, as mklxguest.sh last built them. Read from the
+# list it writes rather than derived here, because the names carry a content
+# fingerprint (runtime/linux/kl_lx_name.h) and only the translator knows it.
+# Empty before the first mklxguest.sh run, which is what lets run.sh resolve the
+# target in order to run it.
+def lx_libs(name):
+    import os
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Frameworks", name, "LIBS")
+    try:
+        return " ".join(open(p).read().split())
+    except OSError:
+        return ""
+
+
 BUNDLE_PREFIX = "dev.klepton.target"
 
 
@@ -726,7 +1009,28 @@ def resolve(name):
     t = dict(TARGETS[name])
     t["name"] = name
     t["bundle"] = bundle_for(name)
-    if t["libs"] is None:
+    # The DEFAULTS only: the settings panel, KL_HAND_MATTING and KL_VRR still
+    # decide. Both are what a player wants from a game they just installed:
+    #
+    #  - hands hidden: nearly every guest draws its own hands or controllers
+    #    where the player's are, and the system's cut-out of the real arms on
+    #    top of them is a second pair in the same place.
+    #  - foveation on: it is the cheaper picture wherever it applies (an OpenGL
+    #    guest's passes; see KleptonRendering) and a stored preference with no
+    #    effect elsewhere. A target that must not have it says False.
+    t.setdefault("hand_matting", False)
+    t.setdefault("render_scale", 1.0)
+    t.setdefault("video", False)
+    t.setdefault("autoboot", True)
+    t.setdefault("foveation", True)
+    # Absent means "no data panel for this target" (obb_file) or "no download"
+    # (the ids); a Unity target that wants the panel states obb_file, even "".
+    for k in ("obb_file", "meta_apk_id", "meta_obb_id"):
+        t.setdefault(k, "")
+    t["data_panel"] = "obb_file" in TARGETS[name]
+    if t["kind"] == "linux":
+        t["libs"] = lx_libs(name)
+    elif t["libs"] is None:
         t["libs"] = libs_for(t["srcdir"])
     return t
 

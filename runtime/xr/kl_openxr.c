@@ -414,6 +414,18 @@ typedef struct { int32_t type; const void *next;
                  float radius, centralAngle, aspectRatio;
                } XrCompositionLayerCylinderKHR;
 
+// A panorama around the viewer (XR_KHR_composition_layer_equirect2): what a
+// SteamVR game's skybox override arrives as through xrizer — Half-Life: Alyx's
+// loading screen, the only thing it submits while a level loads.
+#define XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR 1000091000
+typedef struct { int32_t type; const void *next;
+                 uint64_t layerFlags; void *space;
+                 int32_t eyeVisibility;
+                 XrSwapchainSubImage subImage;
+                 XrPosef pose;
+                 float radius, centralHorizontalAngle, upperVerticalAngle, lowerVerticalAngle;
+               } XrCompositionLayerEquirect2KHR;
+
 typedef struct { int32_t type; const void *next;
                  int64_t displayTime;
                  int32_t environmentBlendMode;
@@ -572,9 +584,12 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     X(xrEnumerateDisplayRefreshRatesFB) X(xrGetDisplayRefreshRateFB)           \
     X(xrRequestDisplayRefreshRateFB)                                           \
     X(xrConvertTimespecTimeToTimeKHR) X(xrConvertTimeToTimespecTimeKHR)         \
+    X(xrGetVisibilityMaskKHR)                                                  \
     X(xrPerfSettingsSetPerformanceLevelEXT)                                    \
     X(xrSetAndroidApplicationThreadKHR)                                        \
     X(xrEnumerateColorSpacesFB) X(xrSetColorSpaceFB)                          \
+    X(xrCreateFoveationProfileFB) X(xrDestroyFoveationProfileFB)               \
+    X(xrUpdateSwapchainFB)                                                     \
     X(xrCreatePassthroughFB) X(xrDestroyPassthroughFB)                         \
     X(xrPassthroughStartFB) X(xrPassthroughPauseFB)                            \
     X(xrCreatePassthroughLayerFB) X(xrDestroyPassthroughLayerFB)               \
@@ -871,6 +886,23 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     // spec makes the level advisory and the notification event optional, so an
     // app cannot distinguish "noted and ignored" from "noted and unhelpful".
     { "XR_EXT_performance_settings",    4, KLXR_GATE_ALWAYS },
+    // XR_FB_foveation (+ _configuration) and XR_FB_swapchain_update_state
+    // (+ _opengl_es) — Doom3Quest, which REQUIRES all four at instance creation
+    // and uses them for exactly one thing: it builds a fixed-foveation profile
+    // and attaches it to its eye swapchain with xrUpdateSwapchainFB.
+    //
+    // Fixed foveation is the app asking the runtime to shade the periphery of
+    // ITS swapchain images at a lower rate — a tiled-GPU feature of the Quest's
+    // own driver. Nothing here can do that to a texture the guest renders into
+    // through ANGLE, and nothing needs to: an unfoveated image is a correct
+    // image, only a more expensive one, and the spec lets a runtime leave a
+    // requested level unapplied. So the profile is a handle with nothing
+    // behind it and the update is accepted and said so once. (Foveation of the
+    // guest's own rendering is a different mechanism here — KL_VRR.)
+    { "XR_FB_foveation",                        1, KLXR_GATE_ALWAYS },
+    { "XR_FB_foveation_configuration",          1, KLXR_GATE_ALWAYS },
+    { "XR_FB_swapchain_update_state",           3, KLXR_GATE_ALWAYS },
+    { "XR_FB_swapchain_update_state_opengl_es", 1, KLXR_GATE_ALWAYS },
     // XR_KHR_android_thread_settings — JKXR again, and required by it for the
     // same reason and with the same shape: one entry point, carrying a hint.
     // The app names a thread by tid and says what it is for (its main thread,
@@ -895,6 +927,10 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     { "XR_KHR_android_surface_swapchain",     4, KLXR_GATE_ALWAYS },
     { "XR_KHR_composition_layer_cylinder",    4, KLXR_GATE_ALWAYS },
     { "XR_KHR_composition_layer_equirect2",   1, KLXR_GATE_ALWAYS },
+    // The part of each eye's picture the display cannot show — see
+    // klxr_GetVisibilityMaskKHR. Claimed always: with nothing hidden the mask
+    // comes back empty, which is the extension's own way of saying so.
+    { "XR_KHR_visibility_mask",               2, KLXR_GATE_ALWAYS },
     { "XR_FB_composition_layer_image_layout", 1, KLXR_GATE_ALWAYS },
     { "XR_FB_composition_layer_settings",     3, KLXR_GATE_ALWAYS },
     // XR_FB_passthrough — some guests REQUIRE it (instance creation fails
@@ -1385,7 +1421,7 @@ static XrResult klxr_EnumerateViewConfigurationViews(
     if (!views) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
 
     int ew = 0, eh = 0;
-    kl_ovrp_eye_texture_size(&ew, &eh);
+    kl_ovrp_eye_texture_size_for_cone(&ew, &eh);
     if (ew <= 0 || eh <= 0) { ew = 2290; eh = 2400; }   // the Quest 2 default
 
     for (uint32_t i = 0; i < 2; i++) {
@@ -1884,6 +1920,34 @@ static XrResult klxr_SetColorSpaceFB(void *session, int space) {
     return KLXR_SUCCESS;
 }
 
+
+// ------------------------------------- XR_FB_foveation / XR_FB_swapchain_update_state
+//
+// See the extension table: accepted, recorded, not applied. The profile handle
+// is a cookie — nothing reads it back — and it is non-NULL because the guest
+// passes it on to xrUpdateSwapchainFB and a NULL there is XR_NULL_HANDLE.
+static XrResult klxr_CreateFoveationProfileFB(void *session, const void *info,
+                                              void **profile) {
+    (void)info;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!profile) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    static int cookie;
+    *profile = &cookie;
+    return KLXR_SUCCESS;
+}
+static XrResult klxr_DestroyFoveationProfileFB(void *profile) {
+    (void)profile;
+    return KLXR_SUCCESS;
+}
+static XrResult klxr_UpdateSwapchainFB(void *swapchain, const void *state) {
+    (void)swapchain; (void)state;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [xr] xrUpdateSwapchainFB: swapchain state (fixed "
+                        "foveation) accepted and not applied — the guest's eye "
+                        "images are rendered at full rate\n");
+    return KLXR_SUCCESS;
+}
 
 // ---------------------------------------------------------- XR_EXT_performance_settings
 //
@@ -4083,6 +4147,15 @@ typedef struct {
     int      next_index;      // round-robin, which is all "which is free" means
                               // here: nothing else reads these images yet
     int      eye;             // which eye this swapchain was registered as, -1 if not
+    // Vulkan: the eyes this swapchain's images are published for, bit per eye.
+    // A mask and not `mtl_eye`'s single value because an ARRAY swapchain serves
+    // both eyes at once (xrizer submits one, slice 0 and slice 1): with one
+    // value the two views took the swapchain from each other every frame —
+    // six texture publications and four log lines a frame — and its destruction
+    // released only whichever eye had it last, leaving the other eye's table
+    // entries pointing at freed textures.
+    unsigned vk_pub;
+    unsigned said_eyes;      // ...and the eyes its registration line was printed for
     int      mtl_eye;         // ...and which eye its images were BACKED as, -1 if
                               // none. Separate from `eye` because every
                               // projection layer's views claim an eye and only
@@ -4195,6 +4268,7 @@ static XrResult klxr_EnumerateSwapchainFormats(void *session, uint32_t capacity,
 // knowing which is underneath — exactly as klovrp_SetupEyeTexture2 does it.
 static void (*gl_GenTextures)(int32_t, uint32_t *);
 static void (*gl_DeleteTextures)(int32_t, const uint32_t *);
+static void (*gl_Finish)(void);
 static void (*gl_BindTexture)(uint32_t, uint32_t);
 static void (*gl_TexStorage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
 static void (*gl_TexStorage3D)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t);
@@ -4214,6 +4288,7 @@ static void klxr_gl_init(void) {
     if (gl_GenTextures) return;
     gl_GenTextures    = kl_egl_sym("glGenTextures");
     gl_DeleteTextures = kl_egl_sym("glDeleteTextures");
+    gl_Finish = kl_egl_sym("glFinish");
     gl_BindTexture    = kl_egl_sym("glBindTexture");
     gl_TexStorage2D   = kl_egl_sym("glTexStorage2D");
     gl_TexStorage3D   = kl_egl_sym("glTexStorage3D");
@@ -4247,10 +4322,25 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
                 s->gfx == KLXR_GFX_VULKAN ? "VkFormat" : "GL internal format");
         KLXR_RET(KLXR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED);
     }
-    if (info->sampleCount > 1) {
+    if (info->sampleCount > 1 && s->gfx == KLXR_GFX_VULKAN) {
         fprintf(stderr, "  [xr] xrCreateSwapchain: sampleCount %u — only 1 is served\n",
                 info->sampleCount);
         KLXR_RET(KLXR_ERROR_FEATURE_UNSUPPORTED);
+    }
+    // On GLES the count is not a property of the IMAGES. A Quest hands back
+    // ordinary single-sample textures for a "2-sample" GLES swapchain, and the
+    // app gets its antialiasing by attaching them with a multisampled-render-to-
+    // texture call (glFramebufferTexture[2D]Multisample[Multiview]…), which
+    // resolves implicitly. Doom3Quest asks for 2 this way and treats a refusal as
+    // having no eye buffer at all. So the swapchain is served exactly as a
+    // 1-sample one; whether the guest then multisamples is decided by which of
+    // those attach entry points it finds (kl_egl_sym).
+    if (info->sampleCount > 1) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [xr] xrCreateSwapchain: sampleCount %u on GLES — served as "
+                            "single-sample images (the guest's own multisampled attach, "
+                            "if it has one, is what would antialias)\n", info->sampleCount);
     }
     // faceCount 6 is a cubemap. Nothing in the eye path wants one; refused
     // rather than served as a 2D image.
@@ -4301,6 +4391,8 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
     sc->last_released = -1;
     sc->eye = -1;
     sc->mtl_eye = -1;
+    sc->vk_pub = 0;
+    sc->said_eyes = 0;
 
     if (s->gfx == KLXR_GFX_VULKAN) {
         // The images are VkImages, allocated by kl_vulkan on the device the
@@ -4412,7 +4504,7 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
 // released image would leave the compositor sampling a stage that was never
 // filled on the two frames either side of it.
 static void klxr_publish_eye_vulkan(klxr_swapchain *sc, int eye, int slice) {
-    if (sc->mtl_eye == eye) return;
+    if (sc->vk_pub & (1u << eye)) return;
     if (klxr_format_is_depth(sc->session, sc->format)) return;
     int done = 0;
     for (int k = 0; k < sc->count; k++) {
@@ -4427,9 +4519,12 @@ static void klxr_publish_eye_vulkan(klxr_swapchain *sc, int eye, int slice) {
         // time, and the guest rebuilds its eye swapchains across scenes with
         // the OLD one destroyed after the new one is asserted.
         for (int i = 0; i < KLXR_SWAPCHAIN_MAX; i++)
-            if (&g_swapchains[i] != sc && g_swapchains[i].mtl_eye == eye)
-                g_swapchains[i].mtl_eye = -1;
+            if (&g_swapchains[i] != sc) {
+                if (g_swapchains[i].mtl_eye == eye) g_swapchains[i].mtl_eye = -1;
+                g_swapchains[i].vk_pub &= ~(1u << eye);
+            }
         sc->mtl_eye = eye;
+        sc->vk_pub |= 1u << eye;
         fprintf(stderr, "  [xr] eye %d: %d Vulkan swapchain image(s) %ux%u slice %d "
                         "exported as MTLTextures — the compositor can sample them\n",
                 eye, done, sc->width, sc->height, slice);
@@ -4921,7 +5016,11 @@ static XrResult klxr_DestroySwapchain(void *swapchain) {
     // or the other rather than both: deleting twice is a silent GL no-op but
     // double-counts in the object census, which is what that census exists to
     // be trusted for.
-    if (sc->mtl_eye >= 0) {
+    if (sc->vk_pub) {
+        for (int e = 0; e < 2; e++)
+            if (sc->vk_pub & (1u << e))
+                for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(e, i);
+    } else if (sc->mtl_eye >= 0) {
         for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(sc->mtl_eye, i);
     } else if (gl_DeleteTextures) {
         gl_DeleteTextures(sc->count, sc->tex);
@@ -5147,6 +5246,14 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
     // on is true.
     state->shouldRender = (s->state == KLXR_SESSION_STATE_VISIBLE ||
                            s->state == KLXR_SESSION_STATE_FOCUSED);
+    // Said whenever it changes: an app told "no" submits nothing, and from the
+    // outside that is indistinguishable from an app that never rendered.
+    { static int last = -1;
+      if (last != (int)state->shouldRender) {
+          last = (int)state->shouldRender;
+          fprintf(stderr, "  [xr] xrWaitFrame: shouldRender -> %d (session state %d)\n",
+                  last, (int)s->state);
+      } }
     s->frame_predicted_time = state->predictedDisplayTime;
     s->frames_waited++;
     return KLXR_SUCCESS;
@@ -5282,6 +5389,8 @@ static void klxr_pose_trace_report(klxr_session *s) {
 }
 
 static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
+    // The stall watch's heartbeat (runtime/diag/kl_stall.c; KL_STALL_MS).
+    { extern void kl_stall_frame(void); kl_stall_frame(); }
     KLXR_TRACE("xrEndFrame");
     klxr_session *s = klxr_sess(session);
     if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
@@ -5292,6 +5401,30 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     if (!s->frame_begun) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
     s->frame_begun = 0;
     s->frames_ended++;
+
+    // Back-pressure for a GLES guest that out-runs the GPU. xrWaitFrame paces by
+    // the clock, and ANGLE queues a frame's commands without waiting for them,
+    // so nothing here ever told the guest its previous frame had not finished:
+    // Doom3Quest kept submitting ~100 frames a second into a GPU completing far
+    // fewer, the queue grew without bound, and the compositor's own passes sat
+    // behind all of it (cadence 11 ms -> 22 ms -> 440 ms over three minutes, on
+    // device). A real runtime blocks in xrWaitFrame/xrAcquireSwapchainImage in
+    // that state. glFinish here is the same contract by the bluntest means: the
+    // guest cannot end frame N+1 until frame N is on the GPU's finished side, so
+    // it runs at the rate the GPU sustains and the compositor is never more than
+    // one guest frame behind. Per target, since a guest that fits its budget
+    // only pays latency for it; KL_XR_GL_FINISH=0/1 is the A/B.
+    if (s->gfx != KLXR_GFX_VULKAN && gl_Finish) {
+        static int fin = -1;
+        if (fin < 0) {
+            extern const char *kl_driver_target_name(void);
+            const char *t = kl_driver_target_name();
+            fin = kl_env_on("KL_XR_GL_FINISH", t && strcmp(t, "doom3quest") == 0);
+            if (fin) fprintf(stderr, "  [xr] xrEndFrame waits for the guest's GL frame to "
+                                     "complete (KL_XR_GL_FINISH)\n");
+        }
+        if (fin) gl_Finish();
+    }
 
     // KL_GLFB_DRAW_CENSUS: periodically dump WHERE the guest's draws land and
     // each framebuffer's colour attachment (texture, array layer, format). The
@@ -5510,6 +5643,51 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             // one layer" is indistinguishable from "the guest composites nothing
             // we understand" — which is the state JKXR was in until the quad was
             // drawn. Cylinder and equirect are the two that would come next.
+            // The panorama: filed with the panels, as the shape the compositor
+            // draws behind everything (kl_ovrp_overlay shape 5). In a frame with
+            // no projection layer it is the whole picture.
+            if (layer->type == XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR) {
+                const XrCompositionLayerEquirect2KHR *eq =
+                    (const XrCompositionLayerEquirect2KHR *)layer;
+                klxr_swapchain *sc = klxr_swapchain_of(eq->subImage.swapchain);
+                if (sc && sc->last_released >= 0 && sc->last_released < sc->count &&
+                    nquads < (int)(sizeof quads / sizeof *quads)) {
+                    kl_ovrp_overlay *o = &quads[nquads];
+                    memset(o, 0, sizeof *o);
+                    o->layer_id = klxr_layer_id(sc);
+                    o->shape    = 5;                  // ovrpShape Equirect
+                    o->stage    = sc->last_released;
+                    o->tex_w    = (int)sc->width;
+                    o->tex_h    = (int)sc->height;
+                    o->pose[3]  = 1.0f;
+                    o->origin_top_left = sc->session && sc->session->gfx == KLXR_GFX_VULKAN;
+                    // Not a handle: the compositor asks for a non-zero one before
+                    // it draws a panorama, and resolves one below 0x10000 through
+                    // the layer's own image, which is where this picture is.
+                    o->tex      = 1;
+                    o->eq_hscale = eq->centralHorizontalAngle > 0.01f
+                                 ? 6.2831853f / eq->centralHorizontalAngle : 1.0f;
+                    klxr_back_layer_images(sc, sc->array_size > 1
+                        ? (int)eq->subImage.imageArrayIndex : -1);
+                    static int said_eq;
+                    if (!said_eq++)
+                        fprintf(stderr, "  [xr] an equirect layer (a skybox, the loading screen of a "
+                                        "SteamVR game): %ux%u, format %lld, %.0f x %.0f degrees — "
+                                        "composited behind everything\n",
+                                sc->width, sc->height, (long long)sc->format,
+                                (double)(eq->centralHorizontalAngle * 57.2958f),
+                                (double)((eq->upperVerticalAngle - eq->lowerVerticalAngle) * 57.2958f));
+                    if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN)
+                        kl_vulkan_xr_image_capture((unsigned long long)(uintptr_t)sc->vk_img[sc->last_released],
+                                                   sc->width, sc->height, (long long)sc->format, 0,
+                                                   (unsigned)s->frames_ended, 0, 9);
+                    nquads++;
+                    s->layers_quad++;
+                    continue;
+                }
+                s->layers_ignored++;
+                continue;
+            }
             if (layer->type != XR_TYPE_COMPOSITION_LAYER_QUAD &&
                 layer->type != XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR) {
                 static int said[8];
@@ -5544,22 +5722,36 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     qbuf.next = cyl->next; qbuf.layerFlags = cyl->layerFlags;
                     qbuf.space = cyl->space; qbuf.eyeVisibility = cyl->eyeVisibility;
                     qbuf.subImage = cyl->subImage; qbuf.pose = cyl->pose;
-                    float w = cyl->radius * cyl->centralAngle;   // arc length -> flat width
-                    if (!(w > 0)) w = 1.0f;
-                    // A wide cylinder flattens to an ENORMOUS flat panel — cs1's
-                    // menu came out 18.85 m (~124deg), which is what "the menu is
-                    // huge" is. Cap the flat width to a comfortable field of view
-                    // so the flattened menu matches the quad-layer menus (hl1's is
-                    // ~58deg). The guest renders the same texture; only the panel
-                    // it is shown on shrinks, so the cursor mapping is unchanged.
-                    if (cyl->radius > 0.0f) {
-                        const float cap_deg = 53.0f;   // ~hl1's quad menu (5 m @ 4.5 m)
-                        float cap_w = 2.0f * cyl->radius *
-                                      tanf(cap_deg * 0.5f * 3.14159265f / 180.0f);
-                        if (w > cap_w) w = cap_w;
-                    }
+                    // The flat stand-in for a curved panel, placed where the
+                    // panel IS.
+                    //
+                    // A cylinder layer's pose is the CENTRE of the cylinder — its
+                    // axis — and the visible section lies `radius` in front of
+                    // that (pose -Z), spanning centralAngle. This used to hand the
+                    // quad the cylinder's pose unchanged, i.e. put the panel on
+                    // the axis: Doom3Quest's menu (radius 12 m, 90 deg, centre 4 m
+                    // in front of the head) became a 12 m panel at 4 m, >110 deg
+                    // across, where a Quest shows that same layer ~68 deg wide.
+                    // (cs1's "18.85 m, ~124 deg" was this too, and the width cap
+                    // that answered it measured the angle from the wrong point.)
+                    //
+                    // So the quad is the CHORD of the section: as wide as the
+                    // chord, at the chord's plane — which puts both vertical
+                    // edges exactly where the cylinder's are — and as tall as the
+                    // cylinder section (arc length / aspectRatio). Only the bow
+                    // of the middle is lost.
+                    float r = cyl->radius, half = cyl->centralAngle * 0.5f;
+                    if (!(r > 0)) r = 1.0f;
+                    if (!(half > 0) || half > 1.5f) half = half > 1.5f ? 1.5f : 0.5f;
+                    float w = 2.0f * r * sinf(half);
+                    float arc = r * 2.0f * half;
+                    XrVector3f fwd = { 0.0f, 0.0f, -r * cosf(half) };
+                    XrVector3f off = klxr_qrot(cyl->pose.orientation, fwd);
+                    qbuf.pose.position.x += off.x;
+                    qbuf.pose.position.y += off.y;
+                    qbuf.pose.position.z += off.z;
                     qbuf.size.width  = w;
-                    qbuf.size.height = cyl->aspectRatio > 0 ? w / cyl->aspectRatio : w;
+                    qbuf.size.height = cyl->aspectRatio > 0 ? arc / cyl->aspectRatio : arc;
                     q = &qbuf;
                 }
                 klxr_swapchain *sc = klxr_swapchain_of(q->subImage.swapchain);
@@ -5843,6 +6035,38 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     // for a texture it allocated.
                     pl_cur->origin_top_left =
                         sc->session && sc->session->gfx == KLXR_GFX_VULKAN;
+                    // The part of the image that is the picture. Left at zero
+                    // (= all of it) for a rect that is empty or reaches outside
+                    // the image, which is not a rect anybody can sample.
+                    {
+                        const XrRect2Di *ir = &proj->views[v].subImage.imageRect;
+                        float *pr = pl_cur->rect[v];
+                        pr[0] = pr[1] = pr[2] = pr[3] = 0.0f;
+                        if (sc->width > 0 && sc->height > 0 && ir->offset.x >= 0 &&
+                            ir->offset.y >= 0 && ir->extent.width > 0 &&
+                            ir->extent.height > 0 &&
+                            (uint32_t)(ir->offset.x + ir->extent.width) <= sc->width &&
+                            (uint32_t)(ir->offset.y + ir->extent.height) <= sc->height) {
+                            pr[0] = (float)ir->offset.x / (float)sc->width;
+                            pr[1] = (float)ir->offset.y / (float)sc->height;
+                            pr[2] = (float)(ir->offset.x + ir->extent.width) / (float)sc->width;
+                            pr[3] = (float)(ir->offset.y + ir->extent.height) / (float)sc->height;
+                        }
+                        // The guest's own resolution scaling, said when it moves
+                        // and at most once a second: it is the only place the
+                        // size it is REALLY drawing at appears, and a controller
+                        // hunting between two sizes would otherwise fill the log.
+                        static int said_w, said_h;
+                        static time_t said_at;
+                        time_t now = time(NULL);
+                        if (v == 0 && li == 0 && now != said_at &&
+                            (ir->extent.width != said_w || ir->extent.height != said_h)) {
+                            said_w = ir->extent.width; said_h = ir->extent.height; said_at = now;
+                            fprintf(stderr, "  [xr] the guest is drawing %dx%d of its %ux%u "
+                                            "eye texture\n", ir->extent.width,
+                                    ir->extent.height, sc->width, sc->height);
+                        }
+                    }
                     // The head, as the eye pass wants it: the first view seeds
                     // the pose and the second averages its position in. The
                     // orientation is view 0's — the two are measured 0.000 deg
@@ -5945,8 +6169,24 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     ninset++;
                 }
             }
-            if (sc->eye == (int)v) continue;            // already this eye
+            // KL_VK_OUT, for the Vulkan eyes. The capture path below is GL's;
+            // without this a Vulkan guest's eye images can only be judged by
+            // wearing them, and the host has nothing to wear them with.
+            if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN &&
+                sc->last_released >= 0 && sc->last_released < sc->count)
+                kl_vulkan_xr_image_capture(sc->vk_img[sc->last_released], sc->width,
+                                           sc->height, (long long)sc->format,
+                                           proj->views[v].subImage.imageArrayIndex,
+                                           (unsigned)s->frames_ended, (int)v, (int)li);
+            // Already this eye. For a Vulkan swapchain that is "already published
+            // for this eye": an array swapchain is both eyes' at once, and asking
+            // whether it was last seen as the OTHER one is true every frame.
+            if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN
+                    ? (sc->eye >= 0 && (sc->vk_pub & (1u << v)) && sc->said_eyes & (1u << v))
+                    : sc->eye == (int)v)
+                continue;
             sc->eye = (int)v;
+            sc->said_eyes |= 1u << v;
             // The capture path is GL's, and there are no GL names on the Vulkan
             // path to give it — the eyes reach a compositor through the
             // MTLTextures published above instead.
@@ -6229,7 +6469,98 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // frame" — see kl_ovrp.h. A guest that alternates between a projection pair
     // and a quad shows one or the other, not both at once.
     kl_ovrp_eye_layer_external(proj_layers > 0);
+    if (proj_layers > 0) kl_interstitial_done();
 
+    return KLXR_SUCCESS;
+}
+
+// ---------------------------------------------------------- XR_KHR_visibility_mask
+//
+// Which part of the picture a guest draws can never reach the eye, as a mesh it
+// can stencil out before shading anything. A headset's own answer is the shape
+// of its lenses; this runtime has no such shape to offer, but it has one large
+// region it knows exactly: under KL_OVRP_UNIFY_FRUSTUM both eyes are told the
+// UNION of the two cones, so each eye draws the other eye's outer field — on a
+// Vision Pro the 45..60 degree band on the nose side, a fifth of the picture's
+// width — which that eye's display does not have. A fill-bound guest (Half-Life:
+// Alyx, ~2 ms per megapixel on the headset) spends that fifth of its frame on
+// nothing.
+//
+// Vertices are in view space on the plane z = -1, i.e. tangents: +x right, +y
+// up. A margin is kept beyond the display's edge because the compositor
+// reprojects the picture to a newer head rotation, which slides the edge inward
+// by however far the head turned since the frame was drawn.
+typedef struct {
+    int type; const void *next;
+    uint32_t vertexCapacityInput, vertexCountOutput; XrVector2f *vertices;
+    uint32_t indexCapacityInput, indexCountOutput; uint32_t *indices;
+} XrVisibilityMaskKHR;
+#define KLXR_VISMASK_MARGIN 1.10f
+
+static XrResult klxr_GetVisibilityMaskKHR(void *session, int view_config, uint32_t view,
+                                          int type, XrVisibilityMaskKHR *mask) {
+    KLXR_TRACE("xrGetVisibilityMaskKHR");
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!mask || view > 1) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (view_config != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
+        KLXR_RET(KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
+
+    float px, py, pz, qx, qy, qz, qw, told[4], disp[4];
+    kl_ovrp_eye_view((int)view, &px, &py, &pz, &qx, &qy, &qz, &qw, told);
+    kl_ovrp_eye_display_tangents((int)view, disp);
+    // The visible rectangle inside the told one, in tangents: [x0,x1] x [y0,y1].
+    float X0 = -told[0], X1 = told[1], Y1 = told[2], Y0 = -told[3];
+    float x0 = -disp[0] * KLXR_VISMASK_MARGIN, x1 = disp[1] * KLXR_VISMASK_MARGIN;
+    float y1 = disp[2] * KLXR_VISMASK_MARGIN,  y0 = -disp[3] * KLXR_VISMASK_MARGIN;
+    if (x0 < X0) x0 = X0;
+    if (x1 > X1) x1 = X1;
+    if (y0 < Y0) y0 = Y0;
+    if (y1 > Y1) y1 = Y1;
+
+    XrVector2f v[16];
+    uint32_t   ix[24], nv = 0, ni = 0;
+    #define QUAD(ax, ay, bx, by) do {                                   \
+        uint32_t b = nv;                                                \
+        v[nv++] = (XrVector2f){ (ax), (ay) }; v[nv++] = (XrVector2f){ (bx), (ay) }; \
+        v[nv++] = (XrVector2f){ (bx), (by) }; v[nv++] = (XrVector2f){ (ax), (by) }; \
+        ix[ni++] = b; ix[ni++] = b + 1; ix[ni++] = b + 2;               \
+        ix[ni++] = b; ix[ni++] = b + 2; ix[ni++] = b + 3;               \
+    } while (0)
+    const float eps = 0.01f;
+    // KL_XR_VISMASK=0: nothing is hidden. The A/B for what the mask saves, and
+    // the way back if a guest draws its mask wrongly.
+    if (!kl_env_on("KL_XR_VISMASK", 1)) { x0 = X0; x1 = X1; y0 = Y0; y1 = Y1; }
+    if (type == 1) {                         // XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR
+        if (x0 - X0 > eps) QUAD(X0, Y0, x0, Y1);            // left band
+        if (X1 - x1 > eps) QUAD(x1, Y0, X1, Y1);            // right band
+        if (y0 - Y0 > eps) QUAD(x0, Y0, x1, y0);            // bottom band
+        if (Y1 - y1 > eps) QUAD(x0, y1, x1, Y1);            // top band
+    } else if (type == 2) {                  // ...VISIBLE_TRIANGLE_MESH_KHR
+        QUAD(x0, y0, x1, y1);
+    } else if (type == 3) {                  // ...LINE_LOOP_KHR
+        v[nv++] = (XrVector2f){ x0, y0 }; v[nv++] = (XrVector2f){ x1, y0 };
+        v[nv++] = (XrVector2f){ x1, y1 }; v[nv++] = (XrVector2f){ x0, y1 };
+        for (uint32_t i = 0; i < 4; i++) ix[ni++] = i;
+    } else {
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    }
+    #undef QUAD
+
+    static unsigned said;
+    if (type == 1 && !(said & (1u << view))) {
+        said |= 1u << view;
+        float hidden = 1.0f - ((x1 - x0) * (y1 - y0)) / ((X1 - X0) * (Y1 - Y0));
+        fprintf(stderr, "  [xr] visibility mask, eye %u: %u hidden triangle(s), %.0f%% of the "
+                        "picture is outside what the display shows\n", view, ni / 3,
+                (double)(hidden * 100.0f));
+    }
+    mask->vertexCountOutput = nv;
+    mask->indexCountOutput = ni;
+    if (mask->vertexCapacityInput == 0 && mask->indexCapacityInput == 0) return KLXR_SUCCESS;
+    if (mask->vertexCapacityInput < nv || mask->indexCapacityInput < ni)
+        KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (nv && mask->vertices) memcpy(mask->vertices, v, nv * sizeof *v);
+    if (ni && mask->indices)  memcpy(mask->indices, ix, ni * sizeof *ix);
     return KLXR_SUCCESS;
 }
 
@@ -6541,6 +6872,7 @@ static void klxr_install(void) {
         {"xrGetDisplayRefreshRateFB", (void *)klxr_GetDisplayRefreshRateFB},
         {"xrRequestDisplayRefreshRateFB",
                                    (void *)klxr_RequestDisplayRefreshRateFB},
+        {"xrGetVisibilityMaskKHR",  (void *)klxr_GetVisibilityMaskKHR},
         {"xrConvertTimespecTimeToTimeKHR",
                                    (void *)klxr_ConvertTimespecTimeToTimeKHR},
         {"xrConvertTimeToTimespecTimeKHR",
@@ -6551,6 +6883,9 @@ static void klxr_install(void) {
                                    (void *)klxr_SetAndroidApplicationThreadKHR},
         {"xrEnumerateColorSpacesFB", (void *)klxr_EnumerateColorSpacesFB},
         {"xrSetColorSpaceFB",        (void *)klxr_SetColorSpaceFB},
+        {"xrCreateFoveationProfileFB",  (void *)klxr_CreateFoveationProfileFB},
+        {"xrDestroyFoveationProfileFB", (void *)klxr_DestroyFoveationProfileFB},
+        {"xrUpdateSwapchainFB",         (void *)klxr_UpdateSwapchainFB},
         // XR_FB_passthrough (stubbed — see above)
         {"xrCreatePassthroughFB",       (void *)klxr_CreatePassthroughFB},
         {"xrDestroyPassthroughFB",      (void *)klxr_DestroyPassthroughFB},
@@ -6626,6 +6961,14 @@ static void klxr_install(void) {
         klxr_row *r = klxr_row_for(impl[i].name);
         if (r) r->fn = impl[i].fn;
     }
+}
+
+// Every entry point this runtime has a row for, implemented or refused, by
+// index; NULL past the end. For a caller that has to publish the whole surface
+// up front rather than answer lookups one at a time (a Linux guest's loader
+// wants an ELF symbol table — runtime/linux/kl_lx_openxr.c).
+const char *kl_openxr_name(int i) {
+    return i >= 0 && i < KLXR_COUNT ? g_xr[i].name : NULL;
 }
 
 void *kl_openxr_lookup(const char *name) {

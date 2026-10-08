@@ -38,3 +38,7 @@
 // where it reads the fence value. The eye TEXTURE still arrives through
 // kl_glfb's own table, so nothing else about this seam widens.
 #import "kl_vulkan.h"
+// One call, declared here rather than importing kl_mediandk.h: that header is
+// the guest-facing media table and wants <stdio.h> and CoreVideo context the
+// Swift side has no other use for.
+void kl_mediandk_set_video_default(int on);

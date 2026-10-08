@@ -1880,7 +1880,7 @@ X(klb_stat) X(klb_lstat) X(klb_fstat) X(klb_statfs) X(klb_uname) X(klb_sigaction
 X(klb_opendir) X(klb_readdir) X(klb_closedir) X(klb_scandir) X(klb_alphasort)
 X(klb_FD_ISSET_chk) X(klb_FD_SET_chk) X(klb_ctype_mb_cur_max) X(klb_lseek64)
 X(klb_close) X(klb_lseek) X(klb_pread)
-X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename)
+X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename) X(klb_link)
 X(klh_android_log_print)
 X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_system) X(klb_syscall) X(klb_swprintf)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
@@ -1963,6 +1963,123 @@ static int klb_timer_getoverrun(void *t) { (void)t; return 0; }
 // host's, it only checks its own prologue value against its own epilogue value.
 uintptr_t klb_stack_chk_guard = (uintptr_t)0x00000aff0a0000ULL;  // NUL/newline bytes trap overruns
 
+// ---------- free(), with Android's tolerance ----------
+//
+// A guest's free() is the host's free(), and the host's allocator is stricter
+// than the one the guest was written against. bionic's scudo keeps a freed
+// block in a QUARANTINE before reusing it, so a write that lands just after the
+// free — one thread still walking a buffer another thread has replaced — hits
+// memory nobody owns yet and nothing ever notices. Darwin's allocator checks a
+// free block when it hands it out again and stops the process:
+// "BUG IN CLIENT OF LIBMALLOC: memory corruption of free block", raised in
+// whichever host code allocates next (ANGLE, the Swift compositor, UIKit), which
+// is why the crash never names the guest.
+//
+// Doom3Quest does exactly this. Its renderer runs a front end and a back end on
+// two threads sharing idList<idImage*> queues: idImageManager::AddAllocList
+// appends under a critical section (and Append reallocates — new[], copy,
+// delete[] old), while GetNextAllocImage / GetNextPurgeImage remove WITHOUT it,
+// shifting elements down in a buffer the other thread may just have freed
+// (neo/renderer/Image_init.cpp, RenderSystem.cpp in the port's public source).
+// On device, 2026-10-06 and 2026-10-08: fourteen crash reports with that
+// message, all at the first frames of a level, each preceded by the back end's
+// "CAN NOT LOAD IMAGE FROM BIND" (its own AddAllocList calls).
+//
+// So a guest that asks for it gets the quarantine it was tested with: free()
+// parks the block and really frees the oldest ones once the park is over its
+// budget. The race is still the guest's — an entry can be lost exactly as on a
+// Quest — but the write lands in memory that is still allocated.
+//
+// KL_FREE_QUARANTINE_MB sets the budget (0 = plain free). OFF BY DEFAULT, for
+// every target, and for Doom3Quest in particular: it does stop that crash, and
+// on device it also broke the game's collision — invisible walls, a player who
+// could jump through ceilings, normal only while crouched (owner, 2026-10-08:
+// broken with the park, normal with KL_FREE_QUARANTINE_MB=0 on the same build,
+// still broken with the parked blocks zeroed). Why delaying reuse does that is
+// not known. What the default does instead for that guest is take the second
+// thread away (kl_gles3jni.c, r_multithread). The knob stays as an instrument.
+// Not a default to widen blindly either way: an IL2CPP guest stops its threads
+// by signal, and a thread stopped inside the lock below would hang the collector
+// (see kl_env.c for the same hazard).
+// Blocks over KLQ_MAX_BLOCK are freed at once: the park is for the small
+// buffers threads race over, not for a level's worth of image data.
+//
+// A parked block is zeroed, as Darwin's free() clears a small block it frees:
+// the park is meant to change WHEN a block becomes reusable and nothing else.
+#include <os/lock.h>
+extern const char *kl_driver_target_name(void);
+#define KLQ_SLOTS     (1u << 16)
+#define KLQ_MAX_BLOCK ((size_t)256 << 10)
+static void           *g_klq_ptr[KLQ_SLOTS];
+static uint32_t        g_klq_size[KLQ_SLOTS];
+static unsigned        g_klq_head, g_klq_n;
+static size_t          g_klq_bytes, g_klq_budget;
+static os_unfair_lock  g_klq_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic int     g_klq_on = -1;
+static uint64_t        g_klq_parked, g_klq_passed;
+
+static int klq_init(void) {
+    const char *t = kl_driver_target_name();
+    (void)t;
+    int mb = kl_env_int("KL_FREE_QUARANTINE_MB", 0);
+    if (mb < 0) mb = 0;
+    if (mb > 1024) mb = 1024;
+    g_klq_budget = (size_t)mb << 20;
+    if (mb)
+        fprintf(stderr, "  [libc] free() quarantine: %d MiB, blocks up to %zu KiB "
+                        "(KL_FREE_QUARANTINE_MB=0 for plain free)\n", mb, KLQ_MAX_BLOCK >> 10);
+    atomic_store(&g_klq_on, mb ? 1 : 0);
+    return mb ? 1 : 0;
+}
+
+static void klb_free(void *p) {
+    if (!p) return;
+    int on = atomic_load(&g_klq_on);
+    if (on < 0) on = klq_init();
+    size_t sz = on ? malloc_size(p) : 0;
+    if (!on || sz == 0 || sz > KLQ_MAX_BLOCK) {
+        if (on) g_klq_passed++;
+        free(p);
+        return;
+    }
+    memset(p, 0, sz);       // what free() would have done to it — see above
+    for (;;) {
+        void *out[16];
+        int nout = 0, parked = 0;
+        os_unfair_lock_lock(&g_klq_lock);
+        if (p && g_klq_n < KLQ_SLOTS) {
+            unsigned at = (g_klq_head + g_klq_n) % KLQ_SLOTS;
+            g_klq_ptr[at] = p;
+            g_klq_size[at] = (uint32_t)sz;
+            g_klq_n++;
+            g_klq_bytes += sz;
+            g_klq_parked++;
+            parked = 1;
+        }
+        while (nout < 16 && g_klq_n &&
+               (g_klq_bytes > g_klq_budget || g_klq_n == KLQ_SLOTS)) {
+            out[nout++] = g_klq_ptr[g_klq_head];
+            g_klq_bytes -= g_klq_size[g_klq_head];
+            g_klq_head = (g_klq_head + 1) % KLQ_SLOTS;
+            g_klq_n--;
+        }
+        int more = g_klq_n && g_klq_bytes > g_klq_budget;
+        os_unfair_lock_unlock(&g_klq_lock);
+        if (parked) p = NULL;
+        // Outside the lock: the host's free takes locks of its own.
+        for (int i = 0; i < nout; i++) free(out[i]);
+        if (!p && !more) return;
+    }
+}
+
+void kl_libc_free_report(FILE *f) {
+    if (atomic_load(&g_klq_on) <= 0) return;
+    fprintf(f, "  free() quarantine: %llu block(s) parked, %llu passed straight through; "
+               "holding %u block(s), %zu KiB\n",
+            (unsigned long long)g_klq_parked, (unsigned long long)g_klq_passed,
+            g_klq_n, g_klq_bytes >> 10);
+}
+
 // ---------- table ----------
 typedef struct { const char *name; void *fn; } kl_entry;
 #define E(n, f)   { n, (void *)(f) }
@@ -2032,12 +2149,15 @@ static const kl_entry g_shim[] = {
     E("sysconf", klb_sysconf),
     E("fopen", klb_fopen), E("access", klb_access),
     E("mkdir", klb_mkdir), E("unlink", klb_unlink), E("rename", klb_rename),
+    E("link", klb_link),
     E("opendir", klb_opendir), E("readdir", klb_readdir), E("closedir", klb_closedir),
     E("scandir", klb_scandir), E("alphasort", klb_alphasort),
     E("lseek64", klb_lseek64), E("__ctype_get_mb_cur_max", klb_ctype_mb_cur_max),
     E("getpwuid", klb_getpwuid), E("getpwuid_r", klb_getpwuid_r),
     E("prctl", klb_prctl),
     E("memrchr", klb_memrchr), E("memalign", klb_memalign),
+    // Not a plain forward: see klb_free.
+    E("free", klb_free),
     // Beat Saber 1.40: getrandom is Linux-only and getentropy is NOT a drop-in
     // (no flags, 256-byte cap, 0/-1 rather than a count); isnan is a macro on
     // Darwin, so there is no symbol to forward. Both in kl_libc.c.

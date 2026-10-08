@@ -15,10 +15,12 @@ RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
-# RUNTIME_SHIP — everything that links the runtime needs them.
-LDLIBS  := -lz -framework AudioToolbox \
+# RUNTIME_SHIP — everything that links the runtime needs them. Metal likewise,
+# for kl_mtl_foveate.m, which makes descriptors of its own.
+LDLIBS  := -lz -framework AudioToolbox -framework CoreAudio \
            -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-           -framework CoreFoundation -framework AVFoundation -framework Foundation
+           -framework CoreFoundation -framework AVFoundation -framework Foundation \
+           -framework Metal
 # The host/ship split is a source-list boundary, not a runtime getenv.
 #
 # RUNTIME_SHIP is everything that goes into the visionOS app bundle. It is the
@@ -44,7 +46,18 @@ RUNTIME_JNI := runtime/kl_jni.c \
            runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
            runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c
 
-RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
+# The Linux process runtime (runtime/linux/) and its door. Part of what ships:
+# a Linux guest in the visionOS app is the same code as build/m_linux.
+LX_SRC  := runtime/linux/kl_lx_exec.c runtime/linux/kl_lx_syscall.c runtime/linux/kl_lx_svc.S \
+           runtime/linux/kl_lx_vfs.c runtime/linux/kl_lx_mm.c runtime/linux/kl_lx_thread.c \
+           runtime/linux/kl_lx_proc.c runtime/linux/kl_lx_signal.c runtime/linux/kl_lx_event.c \
+           runtime/linux/kl_lx_hostlib.c runtime/linux/kl_lx_vulkan.c runtime/linux/kl_lx_steam.c \
+           runtime/linux/kl_lx_steam_net.c runtime/linux/kl_lx_openxr.c \
+           runtime/linux/kl_lx_diag.c runtime/linux/kl_lx_audio.c \
+           runtime/linux/kl_lx_interstitial.c
+
+RUNTIME_SHIP := $(LX_SRC) runtime/guest/kl_linuxproc.c \
+           runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
            runtime/libc/kl_va_handlers.c runtime/libc/kl_va_thunks.S \
            runtime/libc/kl_libc.c runtime/libc/kl_libc_slink.c runtime/libc/kl_pthread.c runtime/kl_dl.c \
            runtime/guest/kl_ndk.c runtime/kl_x18.c runtime/kl_target.c \
@@ -52,7 +65,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/gfx/kl_egl.c runtime/media/kl_opensl.c runtime/media/kl_audio.c runtime/xr/kl_ovrp.c \
            runtime/xr/kl_ovrp_sret.S runtime/gfx/kl_reproject.c runtime/gfx/kl_present.c \
            runtime/xr/kl_ovrplat.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
-           runtime/gfx/kl_vulkan.c \
+           runtime/gfx/kl_vulkan.c runtime/gfx/kl_mtl_foveate.m \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
            runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_sdl2.c \
            runtime/guest/kl_gles3jni.c runtime/guest/kl_driver.c \
@@ -62,7 +75,8 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \
            runtime/media/kl_menu_font.S \
-           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c
+           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c runtime/diag/kl_stall.c \
+           runtime/guest/kl_songs.c
 RUNTIME_DIAG := runtime/diag/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
@@ -449,6 +463,48 @@ build/t_ctr: tests/t_ctr.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 ctr: build/t_ctr
 	./build/t_ctr
 
+# The Linux ABI's veneers (thread pointer and svc), EXECUTED, on the same terms.
+build/t_lx: tests/t_lx.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_lx.c runtime/kl_x18.c runtime/kl_env.c
+
+.PHONY: lx
+lx: build/t_lx
+	./build/t_lx
+
+# CASP with x18:x19 as one of its register pairs, EXECUTED (KLX_HZ_PAIR).
+build/t_casp: tests/t_casp.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_casp.c runtime/kl_x18.c runtime/kl_env.c
+
+.PHONY: casp
+casp: build/t_casp
+	./build/t_casp
+
+# ---- the Linux process runtime (runtime/linux/) ----
+# A glibc guest's own loader and libc, translated and run. LX_RT is the sysroot
+# they come from — Valve's Steam Linux Runtime, unpacked beside this checkout.
+LX_RT   ?= ../steamrt/root/files/lib/aarch64-linux-gnu
+# The guest's root: the runtime tarball's `files` is its /usr, and /lib, /bin and
+# /etc are the usual merged-usr aliases of it.
+LX_ROOT ?= ../steamrt/root/files
+LX_RUN   = ./build/m_linux --mount /usr=$(LX_ROOT) --mount /lib=$(LX_ROOT)/lib \
+           --mount /bin=$(LX_ROOT)/bin --mount /etc=$(LX_ROOT)/etc --dylibs build/lx
+
+build/m_linux: mains/m_linux.c runtime/linux/kl_lx.h $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ mains/m_linux.c $(RUNTIME) $(LDLIBS)
+
+# The whole sysroot, ad-hoc signed — Apple silicon maps no unsigned code even on
+# the host. A few hundred libraries; tools/lx_translate.sh runs them in parallel.
+.PHONY: lx-rt lx-boot
+lx-rt: build/klepton-ld
+	@tools/lx_translate.sh build/lx $(LX_RT)
+
+# The first rung: glibc's own dynamic loader, run as a program.
+lx-boot: build/m_linux lx-rt
+	$(LX_RUN) /lib/ld-linux-aarch64.so.1 --version
+
 # The broadcast fan-out, driven through the shim's own sendto and aimed
 # at loopback, so it exercises the discovery path without putting 254 datagrams
 # on anyone's network. The path is otherwise reachable only from a live Qt
@@ -805,14 +861,14 @@ build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
 	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
+	   -framework CoreFoundation -framework AVFoundation -framework Foundation -framework Metal \
 	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
 	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
+	   -framework CoreFoundation -framework AVFoundation -framework Foundation -framework Metal \
 	   -install_name @rpath/libklepton.dylib
 
 xros-device: build/xros/libklepton.dylib
@@ -859,12 +915,23 @@ build/Klepton.xcframework: $(XROS_LIBS) $(RUNTIME_ALL_HDRS) build/.xcframework-s
 # LC_BUILD_VERSION afterwards. Confirmed prior art (ALVR ships a Rust dylib this
 # way). ANGLE emits ios_framework_bundle on iOS, so the output is already the
 # .framework packaging the app bundle wants.
+# Extra gn args for all three slices. The pinned toolchain's lld cannot read an
+# Xcode 27 SDK — its .tbd files name an arm64e.x1 target that this LLVM's TAPI
+# reader rejects as "unknown target", so nothing links against libSystem. There,
+# use_lld=false links with Apple's ld instead.
+#
+# Detected rather than passed by hand, because visionos/run.sh re-runs
+# `make angle-xros angle-xrsim` on every device build: a flag given once to
+# `make angle-all` is gone on the next gn gen, and the relink fails.
+ANGLE_GN_EXTRA ?= $(shell grep -qs 'arm64e\.x1' \
+                    "$$(xcrun --sdk macosx --show-sdk-path)/usr/lib/libSystem.tbd" \
+                    && echo use_lld=false)
 .PHONY: angle-ios angle-ios-sim angle-xros
 angle-ios: angle-fetch
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
 	  gn gen out/ios --args='is_debug=false target_os="ios" target_cpu="arm64" \
 	    target_environment="device" ios_enable_code_signing=false \
-	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
+	    angle_enable_vulkan=false angle_enable_swiftshader=false use_lld=false use_custom_libcxx=false use_custom_libcxx_for_host=false treat_warnings_as_errors=false $(ANGLE_GN_EXTRA)' && \
 	  autoninja -C out/ios libEGL libGLESv2
 
 # The simulator slice. Same trick one platform over: an iOS *simulator* build
@@ -876,7 +943,7 @@ angle-ios-sim: angle-fetch
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
 	  gn gen out/ios-sim --args='is_debug=false target_os="ios" target_cpu="arm64" \
 	    target_environment="simulator" ios_enable_code_signing=false \
-	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
+	    angle_enable_vulkan=false angle_enable_swiftshader=false use_thin_archive=false $(ANGLE_GN_EXTRA)' && \
 	  autoninja -C out/ios-sim libEGL libGLESv2
 
 # The retarget itself is a script (tools/angle_retarget.sh) — it rewrites the
@@ -992,9 +1059,10 @@ ovrpabi:
 # checkout ~12 GB, build ~30-60 min.
 .PHONY: angle-debug
 angle-debug: angle-fetch
+	cd vendor && if [ ! -f depot_tools/python3_bin_reldir.txt ]; then cd depot_tools && ./update_depot_tools && cd ..; fi
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
-	  gn gen out/Debug --args='is_debug=true target_cpu="arm64"' && \
-	  autoninja -C out/Debug libEGL libGLESv2
+		gn gen out/Debug --args='is_debug=true target_cpu="arm64" use_lld=false $(ANGLE_GN_EXTRA)' && \
+		autoninja -C out/Debug libEGL libGLESv2
 
 # ---- vendor/ — the ANGLE checkout, which we MODIFY ----
 #

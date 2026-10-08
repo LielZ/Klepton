@@ -1119,6 +1119,20 @@ final class KleptonControllers {
             st.stick = stick2()
 
             var bits: UInt32 = 0, touch: UInt32 = 0
+            // **A thumb on the stick**, which nothing reported until Half-Life:
+            // Alyx needed it. SteamVR's Touch bindings put teleport and snap
+            // turn on the stick as a dpad with `sub_mode: touch` — a direction
+            // counts only while the stick is being TOUCHED — and with this bit
+            // never set every direction was permanently off: the hands tracked,
+            // the buttons worked, and the player could neither turn nor move
+            // (xrizer's dpad activation, bound to thumbstick/touch: 0 fired in
+            // a whole session). The element's own capacitive reading where the
+            // controller gives one, and otherwise the plain fact that a stick
+            // cannot be off-centre without a thumb on it.
+            if touched("Thumbstick Button")
+                || st.stick.x * st.stick.x + st.stick.y * st.stick.y > 0.1 * 0.1 {
+                touch |= hand == 0 ? OVRPRawButton.lThumbstick : OVRPRawButton.rThumbstick
+            }
             if hand == 0 {
                 // The Sense controllers name their face buttons A and B on both
                 // hands; the guest's left hand calls them X and Y.
@@ -1153,7 +1167,17 @@ final class KleptonControllers {
                 // (oculustouch_right_system_click where Steam Input offers it).
                 // Delivered as this hand's own system bit; what it does is
                 // whatever the user binds to it on the PC.
-                if menuish { bits |= OVRPRawButton.back }
+                //
+                // ...and START as well, so the Options pill is a menu button in
+                // its own right, the way Create is on the left. An OVRPlugin
+                // guest (Walkabout, Beat Saber) reads Start for its pause/menu
+                // and never looks at the system bit, so with `back` alone the
+                // right pill did nothing there. The Touch profile has no
+                // menu/click on the right hand, so on the OpenXR path this bit
+                // still has no binding to land on and Steam Link is unchanged;
+                // fill_controller_state (kl_ovrp.c) folds it into the left
+                // hand's word for a guest that polls the hands separately.
+                if menuish { bits |= OVRPRawButton.start | OVRPRawButton.back }
                 if homeish { bits |= OVRPRawButton.back }
             }
             // The guest reads stick *direction* bits as well as the axes — and
@@ -1629,6 +1653,14 @@ final class KleptonControllers {
     /// Debounced press state for the *fallback* pinch trigger, per hand.
     private var pinchHeld = [false, false]
 
+    /// Whether a hand is currently NOT hand-tracked because the other one holds
+    /// a controller (see `update`). Only for the one-line transition log.
+    private var handSuppressed = [false, false]
+    /// KL_HANDS_WITH_CONTROLLER=1 — keep hand tracking on a hand with no
+    /// controller even while the other hand has one (the old behaviour).
+    private static let handsWithController =
+        ProcessInfo.processInfo.environment["KL_HANDS_WITH_CONTROLLER"] == "1"
+
     // MARK: - The system pinch
 
     /// Whether the system says each hand is currently pinching, and whether it
@@ -1697,16 +1729,50 @@ final class KleptonControllers {
                 at presentationTime: TimeInterval) {
         pollButtons()
 
+        // **Hands are the fallback for NO controllers, not for a missing one.**
+        // With a single Sense controller in use (Walkabout is played one-handed)
+        // the empty hand used to fall through to hand tracking, and its pinch
+        // is a trigger press on the other Touch controller — which the guest
+        // reads as "the player switched hands", over and over. So once either
+        // hand has a controller, a hand without one is not tracked at all.
+        // KL_HANDS_WITH_CONTROLLER=1 restores the per-hand fallback.
+        let sense = [sensePose(hand: 0, at: presentationTime),
+                     sensePose(hand: 1, at: presentationTime)]
+        lock.lock()
+        let wired = [state[0].fromController, state[1].fromController]
+        lock.unlock()
+        let anyController = !Self.handsWithController
+            && (wired[0] || wired[1] || sense[0] != nil || sense[1] != nil)
+
         for hand in 0...1 {
             lock.lock()
             var st = state[hand]
             lock.unlock()
 
-            let accPose = sensePose(hand: hand, at: presentationTime)
+            let accPose = sense[hand]
             if let accPose {
+                handSuppressed[hand] = false
                 st.position = accPose.0; st.orientation = accPose.1
                 st.linearVelocity = accPose.2; st.angularVelocity = accPose.3
+            } else if anyController && !st.fromController {
+                // Released and parked, once, on the way in: whatever the pinch
+                // last held must not stay held, and a hand frozen where
+                // tracking left it (or kl_ovrp's synthesised one in front of
+                // the face) would be a second hand hanging in the picture. Ten
+                // metres under the floor is out of every view.
+                if !handSuppressed[hand] {
+                    handSuppressed[hand] = true
+                    NSLog("[ctrl] hand \(hand == 0 ? "L" : "R"): a controller is "
+                          + "connected on the other hand — hand tracking for this "
+                          + "one is off (KL_HANDS_WITH_CONTROLLER=1 restores it)")
+                }
+                pinchHeld[hand] = false
+                kl_ovrp_set_hand_motion(Int32(hand), 0, -10, 0, 0, 0, 0, 1,
+                                        0, 0, 0, 0, 0, 0)
+                kl_ovrp_set_controller_input(Int32(hand), 0, 0, 0, 0, 0, 0)
+                continue
             } else if let anchor = (hand == 0 ? leftHand : rightHand) {
+                handSuppressed[hand] = false
                 let (p, q) = gripPose(anchor, hand: hand)
                 st.position = p; st.orientation = q
                 // pollButtons() has already cleared this hand's bits (no Sense

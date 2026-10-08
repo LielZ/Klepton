@@ -49,6 +49,9 @@ size_t kl_audio_write(const void *pcm, size_t bytes);
 // VR client opens two output streams at once; each passes its stream pointer as
 // `src`. kl_audio_write(pcm,bytes) is exactly this with src == NULL (one source).
 size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes);
+// The producer keyed `src` is gone (its stream or player was destroyed). Its
+// slot in the mix is given back.
+void kl_audio_src_release(const void *src);
 
 // True once a device is open and running, i.e. kl_audio_write is the clock.
 int  kl_audio_active(void);

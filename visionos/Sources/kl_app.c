@@ -76,6 +76,10 @@ int kl_app_target_is_steamlink(void) {
 static int target_is_jkxr(void) {
     return g_target && g_target->kind == KL_GUEST_JKXR;
 }
+// A whole Linux process (kl_linuxproc): no APK, no assets, no Android at all.
+static int target_is_linux(void) {
+    return g_target && g_target->kind == KL_GUEST_LINUX;
+}
 int kl_app_target_wants_full(void) {
     // In-world VR titles render their MENU as a full stereo scene too, so .mixed
     // leaves it a flat window floating in passthrough (a jagged quad) until gameplay
@@ -84,6 +88,7 @@ int kl_app_target_wants_full(void) {
     // cs1/hl2/portal (SDL2). KL_FULL=0 forces .mixed back for development.
     return g_target && (g_target->kind == KL_GUEST_NATIVE ||
                         g_target->kind == KL_GUEST_GLES3JNI ||
+                        g_target->kind == KL_GUEST_LINUX ||
                         g_target->kind == KL_GUEST_SDL2);
 }
 int kl_app_target_owns_frame_loop(void) {
@@ -183,6 +188,37 @@ int kl_app_configure(const char *resources, const char *container) {
     // "Frameworks/libunity.framework/libunity" before touching the disk. The ELF
     // tree is therefore not in the bundle — 80 MB that would buy only an A/B
     // against the mmap loader the translations replace.
+    //
+    // A Linux process is neither: its libraries are frameworks named by content
+    // (runtime/linux/kl_lx_name.h), found one at a time as its own ld.so opens
+    // them, and what has to exist up front is the staged tree — which
+    // kl_linuxproc_configure checks, by name, at boot.
+    if (target_is_linux()) {
+        char root[1200];
+        snprintf(root, sizeof root, "%s/lx", container);
+        setenv("KL_LX_ROOT", root, 0);
+        setenv("KL_LX_DYLIBS", g_dylibs, 0);
+        // <container>/lx/env.txt: KEY=VALUE lines, applied to this process's
+        // environment. A launch from the Home View carries no environment at
+        // all, so without this every setting a run.sh launch can pass (the
+        // command line in KL_LX_ARGS, the frame budget, the eye texture
+        // ceiling) is fixed at build time for exactly the launches a person
+        // makes by hand. An explicit launch environment still wins.
+        char envfile[1300];
+        snprintf(envfile, sizeof envfile, "%s/env.txt", root);
+        FILE *ef = fopen(envfile, "r");
+        if (ef) {
+            char line[1024];
+            while (fgets(line, sizeof line, ef)) {
+                char *nl = strpbrk(line, "\r\n"), *eq = strchr(line, '=');
+                if (nl) *nl = 0;
+                if (line[0] == '#' || !eq || eq == line) continue;
+                *eq = 0;
+                setenv(line, eq + 1, 0);
+            }
+            fclose(ef);
+        }
+    } else
     if (!have_translations() && !have(g_libdir))
         return missing("guest libraries (neither translations nor an ELF tree)", g_libdir);
     // Assets and the APK are required only for an engine that reads its data out
@@ -195,6 +231,7 @@ int kl_app_configure(const char *resources, const char *container) {
     // APK/asset path); only the existence check is skipped.
     int folder_fed = g_target->kind == KL_GUEST_NATIVE   ||
                      g_target->kind == KL_GUEST_GLES3JNI ||
+                     g_target->kind == KL_GUEST_LINUX    ||
                      g_target->kind == KL_GUEST_SDL2;
     if (!folder_fed && !have(g_assets))
         return missing("staged assets (run stage_assets.sh)", g_assets);
@@ -296,7 +333,7 @@ int kl_app_configure(const char *resources, const char *container) {
     // text RWX from a file the bundle does not own, which is the shape AMFI
     // exists to refuse. A translation that is present and fails is an error,
     // not a fallback (kl_load_auto).
-    if (have_translations()) setenv("KL_DYLIB_DIR", g_dylibs, 1);
+    if (!target_is_linux() && have_translations()) setenv("KL_DYLIB_DIR", g_dylibs, 1);
 
     // ANGLE rides in the same Frameworks/ directory, so the app can answer
     // "where is ANGLE" itself rather than have the launcher guess at a path
@@ -709,12 +746,16 @@ int kl_app_boot(void) {
                kl_env_str("KL_SLINK_SARGS", NULL) ? "carried" : "UNSET",
                kl_env_on("KL_SLINK_VR", 0) ? "on" : "off",
                kl_env_on("KL_SLINK_SHELL", 0) ? "ON, which overrides the others" : "off");
+    if (target_is_linux()) {
+        printf("  frameworks: %s\n\n", g_dylibs);
+    } else {
     printf("  libraries : %s\n", g_libdir);
     printf("  dylibs    : %s%s\n", g_dylibs,
            have_translations() ? "" : "  (none embedded — falling back to the mmap ELF loader)");
     printf("  assets    : %s\n", g_assets);
     printf("  apk       : %s\n", g_apk);
     printf("  files     : %s\n\n", g_files);
+    }
     fflush(NULL);
 
     // Before the chain runs, so nothing it starts reads a default we meant to
@@ -744,6 +785,7 @@ int kl_app_boot(void) {
         snprintf(g_status, sizeof g_status, "%s",
                  g_target->kind == KL_GUEST_UE4  ? "the Unreal chain initialised"
                  : target_is_jkxr()              ? "the OpenJK chain initialised"
+                 : target_is_linux()             ? "the Linux process is ready to start"
                                                  : "initJni completed");
     }
     app_phase("boot report");
@@ -843,6 +885,8 @@ void kl_app_lifecycle_report(void) {
         snprintf(g_status, sizeof g_status, "the Unreal run ended");
     else if (target_is_jkxr())
         snprintf(g_status, sizeof g_status, "the OpenJK run ended");
+    else if (target_is_linux())
+        snprintf(g_status, sizeof g_status, "the Linux process run ended");
     else
         snprintf(g_status, sizeof g_status, "lifecycle ran, %u frames",
                  kl_driver_frames());
@@ -1061,7 +1105,8 @@ int kl_app_guest_start(void) {
     // door it came through — Steam Link and JKXR are both OpenXR, RE4 is
     // OVRPlugin, and pairing a door with the wrong one is a guest that blocks
     // forever on a pose nobody publishes to it.
-    if (kl_app_target_is_steamlink() || target_is_jkxr())
+    // ...and a Linux process reaching OpenXR through xrizer is the same again.
+    if (kl_app_target_is_steamlink() || target_is_jkxr() || target_is_linux())
         kl_openxr_set_frame_pacer(guest_pace_wait);
     // ...and the same clock on the OVRPlugin side, for the other guest that
     // owns its loop. ovrp_WaitToBeginFrame is this API's xrWaitFrame. It is

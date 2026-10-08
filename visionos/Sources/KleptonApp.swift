@@ -1,6 +1,7 @@
 import SwiftUI
 import Foundation
 import CompositorServices
+import UIKit
 
 // The visionOS host app (Swift for the platform layer).
 //
@@ -217,6 +218,39 @@ enum Paths {
     }
 }
 
+/// What outlives the start window of an installed game.
+///
+/// A product build closes its window when the guest's picture is up
+/// (`BootView.productStart`), and a window that is opened again later — tapping
+/// the app in the Home View does that — is a NEW view with fresh state. So the
+/// two things the window used to be the keeper of live here instead: whether the
+/// guest has been started (it boots once per process), and the poll that raises
+/// a keyboard when the guest asks for text.
+@MainActor
+final class KLRun: ObservableObject {
+    static let shared = KLRun()
+    @Published var started = false
+    @Published var up = false
+    private var openWindow: OpenWindowAction?
+    private var keyboard: Task<Void, Never>?
+
+    /// The guest's text-entry requests, served without the start window: the
+    /// dedicated entry window is opened in front of the viewer instead.
+    func watchKeyboard(_ open: OpenWindowAction) {
+        openWindow = open
+        guard keyboard == nil else { return }
+        keyboard = Task { @MainActor in
+            while !Task.isCancelled {
+                if kl_mono_text_input_wanted() != 0 {
+                    kl_mono_set_text_input(0)
+                    if !KbState.shared.open { self.openWindow?(id: "kbentry") }
+                }
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+    }
+}
+
 // Coordinates the on-demand keyboard window. It is a separate Scene from BootView
 // and cannot share @State, so a shared singleton carries the one bit BootView
 // needs — is it already open — to avoid opening a second copy on the next request.
@@ -273,6 +307,9 @@ struct BootView: View {
     @State private var finished = false
     @State private var succeeded = false
     @State private var openedSpace = false
+    /// The guest's data is not in the container yet: show the data panel
+    /// instead of booting into Unity's "not enough storage" three layers up.
+    @State private var needsData = false
     // The flat guest's picture, and the handoff that ends it. Polled rather
     // than pushed: both are C state written by a guest thread, and a callback
     // out of one into SwiftUI would be a main-actor hop from a thread that is
@@ -289,12 +326,32 @@ struct BootView: View {
     @FocusState private var kbFocused: Bool
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    // The start screen of an installed game — see `startScreen`.
+    // KL_START_SETTINGS=1 opens it on the settings page, so a scripted
+    // launch can photograph the settings without a hand to tap the button.
+    @State private var showSettings = klEnvOn("KL_START_SETTINGS", default: false)
+    @ObservedObject private var run = KLRun.shared
+    /// Whether this build fronts as a game (a picture, its name, Start and
+    /// Settings) rather than as the boot report. Asked for by whoever built it
+    /// (gen_xcodeproj.py, KLEPTON_START_SCREEN) and not by the target: the same
+    /// guest is a product when an installer put it there and a subject of
+    /// measurement when a developer did.
+    static let productStart: Bool =
+        (Bundle.main.object(forInfoDictionaryKey: "KLStartScreen") as? String) == "1"
+    private static var productTitle: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+            ?? klLauncherTitle() ?? klTargetName()
+    }
     // The game-facing builds (hl1/hl2/portal) show a launcher: a chosen game
     // folder plus per-title options, and boot on a button rather than on their own.
     // Observe the active files object so the Start button tracks file readiness;
     // the fallback is inert (no such bookmark) for the runtime-debugging targets.
     @ObservedObject private var files = klActiveFiles() ?? LauncherFiles(bookmarkKey: "none", expected: "")
     private var isLauncher: Bool { klIsLauncher() }
+    /// Whether this target boots as soon as the window is up. See the `.task`.
+    private static let targetAutoBoot: Bool =
+        (Bundle.main.object(forInfoDictionaryKey: "KLAutoBootDefault") as? String) != "0"
     // The microphone dial only appears where voice is actually used: Steam Link's
     // stream and the Xash titles that name a local server. Every other build hides it.
     private var showMic: Bool {
@@ -303,7 +360,9 @@ struct BootView: View {
 
     var body: some View {
         Group {
-            if showShell { ShellWindow() } else { bootReport }
+            if showShell { ShellWindow() }
+            else if Self.productStart { startScreen }
+            else { bootReport }
         }
         .task { await watchPresentation() }
     }
@@ -378,6 +437,143 @@ struct BootView: View {
         kl_mono_key(0, code)
     }
 
+    /// The front of an installed game: its picture, its name, Start, Settings.
+    ///
+    /// Everything the boot report shows is still here — the same state, the same
+    /// `boot()` — but behind the Settings button, because none of it is what a
+    /// person who tapped a game wants to read. Two rules differ from the report:
+    ///
+    ///  - **It never starts by itself.** Every game waits for Start, so the
+    ///    settings that are read once at the start of a run can always be
+    ///    changed first. (`KL_AUTOBOOT=1` on a scripted launch still boots.)
+    ///  - **The window goes away once the picture is up** — see where
+    ///    `openImmersiveSpace` returns. It stays if the start fails, because
+    ///    then it is the only place the reason can be read.
+    private var startScreen: some View {
+        Group {
+            // In the window rather than over it: a sheet on visionOS is a
+            // fixed, narrow card, and the dials in it were unreadably small.
+            if showSettings { settingsPage } else { startFront }
+        }
+        .task {
+            // Scripted launches only — see the comment above.
+            if !isLauncher, klEnvOn("KL_AUTOBOOT", default: false) { boot() }
+        }
+    }
+
+    private var startFront: some View {
+        ZStack(alignment: .bottom) {
+            if let hero = UIImage(named: "StartHero") {
+                Image(uiImage: hero)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+                    .overlay(LinearGradient(colors: [.clear, .black.opacity(0.8)],
+                                            startPoint: .center, endPoint: .bottom))
+            }
+            VStack(spacing: 22) {
+                Spacer()
+                Text(Self.productTitle)
+                    .font(.extraLargeTitle.bold())
+                    .shadow(radius: 10)
+                // Only when there is something to say: a start that failed, or
+                // files that are not on the device.
+                if finished, !succeeded {
+                    // The sentence, not `status`: that is a path or an error
+                    // code, as wide as the window and no use to a player. It
+                    // is under Diagnostics, where the log beside it explains it.
+                    Label("The game could not be started.",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.headline)
+                        .foregroundStyle(.yellow)
+                    Text("Settings → Diagnostics has the details. Close the app and open it again to retry.")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                if needsData, let files = KLGameFiles.current {
+                    GameDataView(files: files) {
+                        needsData = false
+                        boot()
+                    }
+                }
+                HStack(spacing: 18) {
+                    // A window opened again while the guest runs has fresh state,
+                    // so "already started" is asked of the process, not of it.
+                    let started = running || finished || run.started
+                    Button {
+                        if isLauncher, !klLauncherApply() { return }
+                        boot()
+                    } label: {
+                        let failed = finished && !succeeded
+                        Label(run.up ? "Running" : failed ? "Not started" : (started ? "Starting…" : "Start"),
+                              systemImage: run.up ? "checkmark.circle.fill" : failed ? "xmark" : "play.fill")
+                            .frame(minWidth: 180)
+                            .foregroundStyle(started ? Color.secondary : Color.black)
+                    }
+                    // White, whatever the picture behind it: the one button
+                    // that has to be found first on every game's art.
+                    .buttonStyle(.borderedProminent)
+                    .tint(.white)
+                    .controlSize(.extraLarge)
+                    .disabled(started || (isLauncher && !files.canLaunch))
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                    .controlSize(.extraLarge)
+                    if running { ProgressView() }
+                }
+                if run.up {
+                    Button("Close this window") { dismissWindow() }
+                        .font(.callout)
+                }
+            }
+            .padding(40)
+        }
+    }
+
+    /// What Settings opens: the dials that matter to a player first, the
+    /// instruments after them, and the report last.
+    private var settingsPage: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if isLauncher { LauncherPanel() }
+                    if klIsAlyx() { AlyxPanel(started: running || finished || run.started) }
+                    GroupBox("Picture") { RenderingView() }
+                    DisclosureGroup("Your hands over the game") { ChromaView() }
+                    DisclosureGroup("Controller alignment") { TuningView() }
+                    if showMic {
+                        DisclosureGroup("Microphone") { MicView() }
+                    }
+                    DisclosureGroup("Diagnostics") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(status).font(.footnote).foregroundStyle(.secondary)
+                            if !log.isEmpty {
+                                ShareLink(item: log) {
+                                    Label("Export log", systemImage: "square.and.arrow.up")
+                                }
+                            }
+                            Text(log.isEmpty ? "Nothing has been logged yet." : String(log.suffix(6000)))
+                                .font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(.horizontal, 40).padding(.vertical, 24)
+            }
+            .navigationTitle(Self.productTitle)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showSettings = false }
+                }
+            }
+        }
+    }
+
     private var bootReport: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -394,14 +590,23 @@ struct BootView: View {
                 }
                 Spacer()
                 if finished {
-                    Label(succeeded ? "initJni completed" : status,
+                    Label(succeeded ? (klIsAlyx() ? "started" : "initJni completed") : status,
                           systemImage: succeeded ? "checkmark.circle.fill" : "xmark.octagon.fill")
                         .foregroundStyle(succeeded ? .green : .red)
                 }
             }
 
+            if needsData, let files = KLGameFiles.current {
+                GameDataView(files: files) {
+                    needsData = false
+                    boot()
+                }
+                Divider()
+            }
+
             ScrollView {
-                Text(log.isEmpty ? "Press Boot to load the guest chain." : log)
+                Text(log.isEmpty ? (klIsAlyx() ? "Choose a picture setting, then press Start."
+                                               : "Press Boot to load the guest chain.") : log)
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -412,6 +617,10 @@ struct BootView: View {
             // options (hl1's Xash panel; hl2/portal's thinner one). See
             // KleptonLauncher.swift / KleptonHL1.swift.
             if isLauncher { LauncherPanel() }
+
+            // Half-Life: Alyx's picture-against-smoothness choice, above the Start
+            // button because it is read once, when the run starts.
+            if klIsAlyx() { AlyxPanel(started: running || finished) }
 
             // The controller-alignment sliders, in THIS window because it stays
             // open beside the immersive space — so the guest keeps rendering
@@ -426,6 +635,11 @@ struct BootView: View {
             DisclosureGroup("Matting") { ChromaView() }
                 .font(.callout)
 
+            // ...and foveated rendering, which is a preference rather than a
+            // dial: off unless turned on, and read once at boot.
+            DisclosureGroup("Rendering") { RenderingView() }
+                .font(.callout)
+
             // ...and the microphone opt-in, same window, collapsed by default.
             // Off unless a person turns it on: it is the one dial that opens a
             // privacy surface and changes the audio session out from under the
@@ -438,7 +652,7 @@ struct BootView: View {
             }
 
             HStack(spacing: 16) {
-                Button(running ? "Running…" : "Boot") {
+                Button(running ? "Running…" : ((Self.targetAutoBoot && !klIsAlyx()) ? "Boot" : "Start")) {
                     // A game build gathers its settings first: fold them into env
                     // (+ commandline.txt for hl1), and only boot if the chosen
                     // folder is ready.
@@ -496,7 +710,15 @@ struct BootView: View {
             // KL_AUTOBOOT=1 for scripted launches — because it must let the player
             // choose the game folder, set options, and press "Boot" first.
             // Only the runtime-debugging targets honour KL_AUTOBOOT (default on).
-            if !isLauncher, klEnvOn("KL_AUTOBOOT", default: true) {
+            // ...and a target can ask for the same (targets.py "autoboot",
+            // baked into Info.plist as KLAutoBootDefault): anything but "0"
+            // boots by itself, as every build did before the key existed.
+            //
+            // Half-Life: Alyx waits for the button too when nobody asked otherwise:
+            // its window has a setting that is read at the start of the run, and a
+            // launch from the Home View that booted on its own would never let it
+            // be changed. The scripts say KL_AUTOBOOT=1 and are unaffected.
+            if !isLauncher, klEnvOn("KL_AUTOBOOT", default: Self.targetAutoBoot && !klIsAlyx()) {
                 boot()
             }
         }
@@ -510,7 +732,20 @@ struct BootView: View {
         // while running is not enough: the run *finishes*, and the obvious
         // next thing to do with a finished run is press Boot again.
         guard !running, !finished else { return }
+        // Before configure rather than out of its failure: configure only
+        // checks the APK and assets/, and a split-binary guest without its OBB
+        // would pass it and then fail far away.
+        if !isLauncher, let files = KLGameFiles.current, !files.complete {
+            needsData = true
+            status = "game data missing"
+            log = "The game's files are not on this device yet. Use the panel above."
+            return
+        }
         running = true; log = ""
+        KLRun.shared.started = true
+        // Before configure, which is where the runtime starts reading its
+        // environment.
+        klAlyxApply()
 
         // Off the main thread: the guest blocks — Unity's Baselib waits on
         // futexes, IL2CPP's GC suspends the world — and a blocked main thread
@@ -561,6 +796,7 @@ struct BootView: View {
             }
             RunLoop.current.add(poll, forMode: .common)
 
+            KleptonRendering.shared.apply()
             var result = kl_app_boot()
 
             // The audio session, and the placement is deliberate on both sides.
@@ -645,9 +881,30 @@ struct BootView: View {
                     // compositor, which is indistinguishable in the log from a
                     // compositor that came up and died — and those want
                     // completely different next moves.
+                    // `.error` is retried, because it is not always final: a
+                    // launch that follows a reinstall over a running instance
+                    // got it once, nine seconds in, and the very next launch
+                    // of the same binary opened. Left alone, that is an app
+                    // sitting in its boot window with a booted guest and no
+                    // way to show it. `.userCancelled` is an answer, not a
+                    // failure, and is not asked again.
                     Task {
-                        let r = await openImmersiveSpace(id: Immersive.id)
-                        NSLog("[cp] openImmersiveSpace -> \(r)")
+                        for attempt in 1...3 {
+                            let r = await openImmersiveSpace(id: Immersive.id)
+                            NSLog("[cp] openImmersiveSpace -> \(r)"
+                                  + (attempt > 1 ? " (attempt \(attempt))" : ""))
+                            // An installed game's window has done its job once
+                            // the picture is up: hand the keyboard poll to
+                            // something that outlives it, and go.
+                            if case .opened = r, Self.productStart {
+                                KLRun.shared.up = true
+                                KLRun.shared.watchKeyboard(openWindow)
+                                showSettings = false
+                                dismissWindow()
+                            }
+                            guard case .error = r, attempt < 3 else { break }
+                            try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        }
                     }
                 }
             }

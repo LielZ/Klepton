@@ -18,12 +18,14 @@
 #include "kl_sdl2.h"
 #include "kl_gles3jni.h"
 #include "kl_jni.h"
+#include "kl_linuxproc.h"
 #include "kl_mediandk.h"
 #include "kl_opensl.h"
 #include "kl_openxr.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
 #include "kl_mprobe.h"
+#include "kl_songs.h"
 #include "kl_sample.h"
 #include "kl_slink.h"
 #include "kl_ue4.h"
@@ -113,6 +115,54 @@ static void kl_driver_env_defaults(const kl_target *t) {
         setenv("KL_XASH_CVARS",
                "vr_smoothturn 1; vr_turn_angle 5; vr_height_adjust -1.5", 0);
     }
+    else if (!strcmp(t->name, "alyx")) {
+        // Half-Life: Alyx. The eye texture the display is offered at decides how
+        // large the engine's render targets are ALLOCATED — it rounds the offer
+        // up by ~1.18 and its automatic fidelity level then renders into a part
+        // of that, so the offer is a memory ceiling rather than a picture size.
+        // At the default cap of 3072 the first level sat at a 6.9 GB footprint
+        // with 1.3 GB left and the system reporting critical memory pressure
+        // (Vision Pro M5, 2026-10-06), while the fidelity level it settled on
+        // was drawing 2304x1920 of the 3648x2880 it had allocated. 2800 leaves
+        // room above what it draws and came to ~0.5 GB less.
+        setenv("KL_OVRP_EYE_MAX", "2800", 0);
+        // The display rate the engine is told is its FRAME BUDGET: its fidelity
+        // controller picks the largest picture whose measured frame time fits one
+        // refresh (the measurement is xrizer's, patched to be real —
+        // guestbuild/xrizer-frame-timing.py). Told the panel's own 100 Hz it has
+        // 10 ms, cannot make it at any size, and sits at its smallest picture.
+        // Frames reach the compositor on a 10 ms grid and are reprojected from
+        // there, so the engine is given a budget it can meet instead: at 60 it
+        // settles where a frame takes ~15 ms and lands every other refresh, a
+        // steady 50 a second. Lower buys resolution with frame rate, and the
+        // other way round; Documents/lx/env.txt changes it without a build.
+        setenv("KL_DISPLAY_HZ", "60", 0);
+        // Two things MoltenVK does to the engine's multisampled scene pass that
+        // cost it every sample of that pass, written to memory and read back,
+        // each frame — and that the Vulkan side can prevent (kl_vulkan.c has
+        // both stories): the pass is split in two at a barrier the engine
+        // records inside it, and it is loaded and stored instead of cleared and
+        // discarded because its render area is a few percent smaller than its
+        // attachments. Mac, first level, 2x: 17.1 -> 14.9 ms of GPU a frame.
+        setenv("KL_VK_PASS_BARRIERS", "0", 0);
+        setenv("KL_VK_WIDEN_AREA", "1", 0);
+        // MoltenVK without MTLHeaps. With them the engine's pooled device memory
+        // is one large heap per allocation whether or not it is filled, and the
+        // textures MoltenVK cannot place in a heap (every depth target) are
+        // paid for a second time beside it. The session with heaps off was the
+        // first to stay well under the app's memory limit: 2.5 GB of Metal
+        // allocations instead of ~4.5, 5.96 GB footprint, 13-14 ms of GPU a
+        // frame in a level (Vision Pro M5, 2026-10-06; not a controlled A/B).
+        setenv("MVK_CONFIG_USE_MTLHEAP", "0", 0);
+        // "It hangs for a moment now and then" — say what each such moment was
+        // (kl_stall.c). A quarter of a second is what a player notices.
+        setenv("KL_STALL_MS", "250", 0);
+        // The engine compiles each pipeline at the draw that first needs it, and
+        // the frame waits: 300-600 ms the first time a shader is seen on a
+        // device, the stalls a player meets on entering a new place. Compiled
+        // behind the frame instead (kl_vulkan.c, KL_VK_ASYNC_PIPES).
+        setenv("KL_VK_ASYNC_PIPES", "1", 0);
+    }
     else if (!strcmp(t->name, "wrath2")) {
         // wrath2's world never appears because the GAME thread grinds through FMOD
         // Studio bank loading (UEngine::LoadMap -> LoadBanksForMap -> loadBankFile),
@@ -153,6 +203,7 @@ int kl_driver_owns_frame_loop(void) {
     case KL_GUEST_JKXR:
     case KL_GUEST_NATIVE:
     case KL_GUEST_SDL2:
+    case KL_GUEST_LINUX:
     case KL_GUEST_GLES3JNI: return 1;
     default:            return 0;
     }
@@ -403,6 +454,20 @@ static int boot_gles3jni(FILE *out) {
     return 0;
 }
 
+// The Linux process door. "Boot" is where its world is put together — mounts,
+// links, environment — and stops short of starting it, like every other door's.
+// KL_LX_ROOT is the staged tree and KL_LX_DYLIBS where the translations are; the
+// app sets both from its own bundle and container.
+static int boot_linux(FILE *out) {
+    phase("linux configure");
+    if (kl_linuxproc_configure(kl_env_str("KL_LX_ROOT", NULL), kl_env_str("KL_LX_DYLIBS", NULL),
+                               out) != 0)
+        return fail(kl_linuxproc_error());
+    if (g_gap_only) return 0;
+    P(out, "\n=== EXIT CRITERION MET: the Linux process is described and its tree is staged ===\n");
+    return 0;
+}
+
 int kl_driver_boot(FILE *out) {
     if (!g_target) return fail("kl_driver_init was not called");
     g_gap_only = kl_env_on("KL_GAP_ONLY", 0);
@@ -413,6 +478,7 @@ int kl_driver_boot(FILE *out) {
     case KL_GUEST_JKXR:      rc = boot_jkxr(out);      break;
     case KL_GUEST_NATIVE:    rc = boot_native(out);    break;
     case KL_GUEST_SDL2:      rc = boot_sdl2(out);      break;
+    case KL_GUEST_LINUX:     rc = boot_linux(out);     break;
     case KL_GUEST_GLES3JNI:  rc = boot_gles3jni(out);  break;
     default:                 rc = boot_unity(out);     break;
     }
@@ -617,6 +683,15 @@ static int begin_native(FILE *out) {
     return 0;
 }
 
+static int begin_linux(FILE *out) {
+    phase("linux exec");
+    P(out, "\n=== starting the Linux process ===\n");
+    if (kl_linuxproc_begin(out) != 0) return fail(kl_linuxproc_error());
+    sample_start_if_asked();
+    phase("linux process");
+    return 0;
+}
+
 int kl_driver_lifecycle_begin(FILE *out) {
     if (!g_target) return fail("kl_driver_init was not called");
     switch (kl_driver_kind()) {
@@ -625,6 +700,7 @@ int kl_driver_lifecycle_begin(FILE *out) {
     case KL_GUEST_JKXR:      return begin_jkxr(out);
     case KL_GUEST_NATIVE:    return begin_native(out);
     case KL_GUEST_SDL2:      return begin_sdl2(out);
+    case KL_GUEST_LINUX:     return begin_linux(out);
     case KL_GUEST_GLES3JNI:  return begin_gles3jni(out);
     default:                 return begin_unity(out);
     }
@@ -657,6 +733,9 @@ int kl_driver_frame(void) {
     // pump). Between frames on the thread that just ran one, which is where
     // managed calls are safe.
     kl_mprobe_tick(g_frames);
+    // Custom levels, from the same seat and for the same reason. Self-gated on a
+    // CustomLevels directory existing, so every other guest pays one stat().
+    kl_songs_tick(g_frames);
     if (g_alarm) alarm(0);
     g_frames++;
     return r;
@@ -671,6 +750,7 @@ double kl_driver_pump(double seconds, const volatile int *quit) {
     case KL_GUEST_JKXR: return kl_jkxr_pump(seconds, quit);
     case KL_GUEST_NATIVE: return kl_native_pump(seconds, quit);
     case KL_GUEST_SDL2: return kl_sdl2_pump(seconds, quit);
+    case KL_GUEST_LINUX: return kl_linuxproc_pump(seconds, quit);
     case KL_GUEST_GLES3JNI: return kl_gles3jni_pump(seconds, quit);
     default:            return 0.0;
     }
@@ -691,6 +771,10 @@ double kl_driver_pump_default(void) {
     case KL_GUEST_SDL2:
     case KL_GUEST_GLES3JNI:  return kl_env_str("KL_NATIVE_WAIT", NULL)
                                   ? strtod(getenv("KL_NATIVE_WAIT"), NULL) : 5.0;
+    // A minute: long enough for a small program to finish and for an engine to
+    // say how far it gets without a compositor.
+    case KL_GUEST_LINUX:     return kl_env_str("KL_LX_WAIT", NULL)
+                                  ? strtod(getenv("KL_LX_WAIT"), NULL) : 60.0;
     default:                 return 0.0;
     }
 }
@@ -720,6 +804,10 @@ void kl_driver_report(FILE *out) {
     case KL_GUEST_SDL2:
         fprintf(out, "\n=== the SDL2 run ===\n");
         kl_sdl2_report(out);
+        return;
+    case KL_GUEST_LINUX:
+        fprintf(out, "\n=== the Linux process run ===\n");
+        kl_linuxproc_report(out);
         return;
     case KL_GUEST_GLES3JNI:
         fprintf(out, "\n=== the GLES3JNILib run ===\n");

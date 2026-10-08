@@ -1,0 +1,400 @@
+// Half-Life: Alyx's launch-time choices: how large a picture it draws, how many
+// samples a pixel of it has, how wide a cone each eye is drawn with, and whether
+// the edge of that cone is shaded as densely as its middle.
+//
+// The engine has a ladder of fidelity levels, each a picture size, and a
+// controller that walks it to fit the frame time. On this hardware that
+// controller sat at the bottom of the ladder whatever it was told — a frame costs
+// more than any budget at the larger sizes — and the result was a picture its
+// player called pixelated at 50 frames a second, with no way to choose otherwise.
+// So the controller is switched off and the level is chosen here:
+//
+//   +vr_fidelity_level_auto 0 +vr_fidelity_level <n>
+//
+// handed to the game through KL_LX_ARGS_EXTRA. Measured sizes, as a fraction of
+// the eye texture the display is offered at: level 0 = 0.75, 3 = 0.875,
+// 5 = 0.97, 8 = 1.19 (the largest; higher numbers clamp to it).
+//
+// What the larger sizes cost is frame rate, not smoothness of the view: the
+// compositor reprojects the last picture to the head's rotation at the panel's
+// rate whatever the game manages. Hands, objects and walking move at the game's
+// own rate.
+//
+// A launch that names KL_LX_ARGS_EXTRA itself (visionos/run.sh, lx_launch.sh)
+// keeps what it named.
+//
+// The second choice is how many samples a pixel of that picture has. The eye
+// targets are multisampled and on a GPU that is fill-bound, as this one is, the
+// sample count is the largest single factor in a frame's cost. There is a convar
+// for it, vr_msaa, and setting it does nothing useful: the ladder is a table,
+// vr_fidelity_levels_deckard.csv inside the game's archive, and each of its rows
+// names its own vr_msaa — 2 for level 0 and 4 for every other — which the engine
+// applies with the level. (`+vr_msaa 2` on top of a level above 0 leaves targets
+// of one shape and a viewport of another, and the compositor is handed bounds
+// beyond 1.0: no picture at all.) What the engine does offer is a file of that
+// shape named vr_fidelity_levels_override.csv in the game's own directory, read
+// in preference to the archive's (libvr.so+0xb1df8). So the table is written
+// here at every start, with the sample count chosen below in every row.
+//
+// Every row also carries the SAME scale, the chosen picture's. The engine
+// allocates its eye targets — two multisampled and five resolved, all two layers
+// deep — for the largest level its table holds, whichever level it draws: with
+// Valve's ladder (0.78 to 1.2) a picture at scale 1.0 sat in targets 1.44 times
+// its area, and the smallest picture in targets 2.4 times its area. On a device
+// where the app is ended at 8.2 GB and a level reaches that, those are hundreds
+// of megabytes of targets nothing is drawn into (Mac, first level, 2x: 3625 MB
+// of GPU memory with the ladder, 3365 MB with one scale).
+//
+// The third is how wide a cone each eye is drawn with. A rendered picture is
+// uniform in tangent, so its outermost degrees are its most expensive, and on
+// this display they are also the least seen: the eight degrees from 52 to 60 on
+// the temporal side are a sixth of the picture's width and land where the
+// panel's own foveation shows an eighth of its central density. "Trimmed" caps
+// the cone at 52 degrees (KL_OVRP_EYE_TAN_MAX=1.3, runtime/xr/kl_ovrp.c) and
+// narrows the eye texture with it, so a sixth of the pixels are not drawn; the
+// price is that the far edge of view is dark.
+//
+// The fourth is foveation proper: the scene is shaded at full density straight
+// ahead and progressively coarser toward the edge of each eye's cone. The
+// engine's own foveated rendering wants a fragment density map, which MoltenVK
+// does not have; runtime/gfx/kl_mtl_foveate.m does it underneath MoltenVK
+// instead, with a Metal rasterization rate map on the scene pass and an unwarp
+// of its result before the engine's post-processing reads it. The fovea is
+// fixed, not gaze-tracked — an app is not told where the eyes look — so the
+// softness is at the edge of the picture, wherever one looks.
+import SwiftUI
+import Foundation
+
+func klIsAlyx() -> Bool { klTargetName() == "alyx" }
+
+enum AlyxQuality: Int, CaseIterable, Identifiable {
+    case smooth, balanced, sharp, maximum
+
+    static let storageKey = "alyx.quality"
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .smooth:   return "Smooth"
+        case .balanced: return "Balanced"
+        case .sharp:    return "Sharp"
+        case .maximum:  return "Maximum"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .smooth:
+            return "The smallest picture and the highest frame rate (about 50 a second)."
+        case .balanced:
+            return "A larger picture at a lower frame rate."
+        case .sharp:
+            return "Close to the display's own size. Hands and objects move visibly "
+                 + "less smoothly; looking around stays smooth."
+        case .maximum:
+            return "The largest picture the game draws, at the lowest frame rate. "
+                 + "Distant textures are coarser to make room for it, and the system "
+                 + "may still close the app in big scenes."
+        }
+    }
+
+    /// The render target scale for this choice, as the table spells it: the
+    /// scales of Valve's levels 0, 3, 5 and 8. 1 is the size the runtime
+    /// recommends for the display.
+    var scale: String {
+        switch self {
+        case .smooth:   return "0.78"
+        case .balanced: return "0.9"
+        case .sharp:    return "1"
+        case .maximum:  return "1.2"
+        }
+    }
+
+    /// The engine's texture pool for this choice, in MB (+r_texture_pool_size).
+    ///
+    /// The pool is what the texture streamer may fill, and it fills it: left at
+    /// the engine's default (2816 MB) a level's textures grew from 0.5 GB to
+    /// 2.2 GB within a minute and a half and were still growing when the app
+    /// reached the 8.19 GB at which the system ends it (2026-10-06, twice). The
+    /// eye targets take the more memory the larger the picture — about 0.5 GB
+    /// at the smallest and 1.2 GB at the largest — so the pool is what is left
+    /// of a fixed sum: a larger picture is paid for with coarser distant
+    /// textures rather than with the session.
+    var texturePoolMB: Int {
+        switch self {
+        case .smooth:   return 1536
+        case .balanced: return 1408
+        case .sharp:    return 1152
+        case .maximum:  return 768
+        }
+    }
+
+    /// The engine's fidelity level for this choice — what selects the size when
+    /// the table below could not be written and Valve's own applies.
+    var fidelityLevel: Int {
+        switch self {
+        case .smooth:   return 0
+        case .balanced: return 3
+        case .sharp:    return 5
+        case .maximum:  return 8
+        }
+    }
+
+    static var stored: AlyxQuality {
+        // `object(forKey:)` rather than `integer(forKey:)`: a key that was never
+        // written reads as 0, which is Smooth, not the default.
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let q = AlyxQuality(rawValue: n) else { return .balanced }
+        return q
+    }
+}
+
+enum AlyxEdges: Int, CaseIterable, Identifiable {
+    case two = 2, four = 4
+
+    static let storageKey = "alyx.msaa"
+    var id: Int { rawValue }
+
+    var title: String { self == .two ? "2x" : "4x" }
+
+    var detail: String {
+        switch self {
+        case .two:
+            return "Edges are smoothed with two samples a pixel: faster, and what "
+                 + "the larger pictures need to stay playable."
+        case .four:
+            return "Edges are smoothed with four samples a pixel, as the game "
+                 + "ships: the cleanest edges at the highest cost."
+        }
+    }
+
+    static var stored: AlyxEdges {
+        // A launch can name it (KL_ALYX_MSAA=2|4), which is how the two are
+        // measured against each other without touching the window.
+        if let e = getenv("KL_ALYX_MSAA"), let v = AlyxEdges(rawValue: Int(atoi(e))) { return v }
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let v = AlyxEdges(rawValue: n) else { return .two }
+        return v
+    }
+}
+
+enum AlyxView: Int, CaseIterable, Identifiable {
+    case full, trimmed
+
+    static let storageKey = "alyx.view"
+    var id: Int { rawValue }
+
+    var title: String { self == .full ? "Full" : "Trimmed" }
+
+    var detail: String {
+        switch self {
+        case .full:
+            return "Each eye is drawn as wide as the display reaches."
+        case .trimmed:
+            return "The outermost edge of view is left dark and not drawn — a "
+                 + "sixth fewer pixels a frame at the same sharpness."
+        }
+    }
+
+    static var stored: AlyxView {
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let v = AlyxView(rawValue: n) else { return .full }
+        return v
+    }
+}
+
+enum AlyxFoveation: Int, CaseIterable, Identifiable {
+    case off, on, strong
+
+    static let storageKey = "alyx.foveation"
+    /// What a fresh install runs with: the level that was not visible in play
+    /// and saves about a third of the shading.
+    static let standard = AlyxFoveation.on
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .off:    return "Off"
+        case .on:     return "Mild"
+        case .strong: return "Strong"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .off:
+            return "The whole picture is drawn at one density."
+        case .on:
+            return "Full density straight ahead, coarser toward the edge of view "
+                 + "(about a third fewer pixels shaded). Not visible in a first test."
+        case .strong:
+            return "The same with a smaller sharp centre and a coarser edge (about "
+                 + "half the pixels shaded). The edge is softer when looked at."
+        }
+    }
+
+    /// KL_VK_FOVEATE and KL_VK_FOVEATE_INNER: the rate at the widest edge of
+    /// the cone, and the tangent out to which the rate stays 1.
+    var knobs: (edge: String, inner: String)? {
+        switch self {
+        case .off:    return nil
+        case .on:     return ("0.3", "0.30")
+        case .strong: return ("0.15", "0.20")
+        }
+    }
+
+    static var stored: AlyxFoveation {
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let v = AlyxFoveation(rawValue: n) else { return .standard }
+        return v
+    }
+}
+
+/// Write the fidelity table the game reads in preference to its own: nine
+/// levels, all of them the chosen scale and sample count. Returns false when the
+/// game's directory is not there yet (nothing staged), which is a start that
+/// fails for that reason and not this one.
+@discardableResult
+private func klAlyxWriteLadder(scale: String, samples: Int) -> Bool {
+    guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+    else { return false }
+    let dir = docs.appendingPathComponent("lx/game/hlvr")
+    guard FileManager.default.fileExists(atPath: dir.path) else { return false }
+    var t = "hlvr,default,vr_msaa,vr_render_target_scale,min_gpu_memory,min_width,min_height,\n"
+    for level in 0...8 {
+        t += "\(level),\(level == 5 ? "1" : ""),\(samples),\(scale),,,,\n"
+    }
+    t += "end,,,,,,,\n"
+    do {
+        try t.write(to: dir.appendingPathComponent("vr_fidelity_levels_override.csv"),
+                    atomically: true, encoding: .utf8)
+        return true
+    } catch {
+        NSLog("[app] Alyx: could not write the fidelity table: \(error)")
+        return false
+    }
+}
+
+/// Say what the system thinks of the device's temperature, now and whenever it
+/// changes. In a level every render pass of a frame — the compositor's and a
+/// fixed post-processing pass among them — was measured getting slower together
+/// by 40-50% over ninety seconds (KL_MTL_PROFILE, 2026-10-06), which is the GPU
+/// being slowed and not the scene getting heavier; this is the line that says
+/// whether heat is why.
+private var klThermalObserver: NSObjectProtocol?
+private func klThermalName(_ s: ProcessInfo.ThermalState) -> String {
+    switch s {
+    case .nominal:  return "nominal"
+    case .fair:     return "fair"
+    case .serious:  return "serious"
+    case .critical: return "critical"
+    @unknown default: return "unknown"
+    }
+}
+func klWatchThermalState() {
+    guard klThermalObserver == nil else { return }
+    NSLog("[app] thermal state: \(klThermalName(ProcessInfo.processInfo.thermalState))")
+    klThermalObserver = NotificationCenter.default.addObserver(
+        forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: nil) { _ in
+        NSLog("[app] thermal state -> \(klThermalName(ProcessInfo.processInfo.thermalState))")
+    }
+}
+
+/// Put the chosen preset where the runtime reads it. Called at the start of a
+/// boot, before kl_app_configure — the values are read once, later.
+///
+/// Overwrite 0: a variable the launch itself carried wins, so a scripted run
+/// measures what it asked for whatever the window last showed. It also means
+/// this is ahead of Documents/lx/env.txt, which is applied the same way after it:
+/// a switch in the window that a file silently overrode would be a switch that
+/// does nothing.
+let klAlyxLoadingKey = "klepton.alyx.loadingScreens"
+func klAlyxLoadingScreens() -> Bool {
+    UserDefaults.standard.object(forKey: klAlyxLoadingKey) as? Bool ?? true
+}
+
+func klAlyxApply() {
+    guard klIsAlyx() else { return }
+    klWatchThermalState()
+    let q = AlyxQuality.stored
+    // The game's loading screen, where it waits for the trigger once a level
+    // is ready. Off, the game is told to go on by itself.
+    let loading = klAlyxLoadingScreens()
+    setenv("KL_LX_ARGS_EXTRA",
+           "+vr_fidelity_level_auto 0 +vr_fidelity_level \(q.fidelityLevel) "
+           + "+r_texture_pool_size \(q.texturePoolMB)"
+           + (loading ? "" : " +hlvr_auto_dismiss_loading 1"), 0)
+    // The ceiling on the eye texture the game is offered. With the level fixed
+    // the game allocates only what the level draws, so this no longer has to be
+    // held down to protect memory at the small sizes.
+    setenv("KL_OVRP_EYE_MAX", "3072", 0)
+    let view = AlyxView.stored
+    if view == .trimmed { setenv("KL_OVRP_EYE_TAN_MAX", "1.3", 0) }
+    let fov = AlyxFoveation.stored
+    if let k = fov.knobs {
+        setenv("KL_VK_FOVEATE", k.edge, 0)
+        setenv("KL_VK_FOVEATE_INNER", k.inner, 0)
+    }
+    let edges = AlyxEdges.stored
+    let wrote = klAlyxWriteLadder(scale: q.scale, samples: edges.rawValue)
+    NSLog("[app] Alyx picture: \(q.title), edges \(edges.title), view \(view.title), foveation \(fov.title)\(wrote ? "" : " (table NOT written)") — KL_LX_ARGS_EXTRA=\(String(cString: getenv("KL_LX_ARGS_EXTRA")))")
+}
+
+struct AlyxPanel: View {
+    @AppStorage(AlyxQuality.storageKey) private var quality = AlyxQuality.balanced.rawValue
+    @AppStorage(AlyxEdges.storageKey) private var edges = AlyxEdges.two.rawValue
+    @AppStorage(AlyxView.storageKey) private var view = AlyxView.full.rawValue
+    @AppStorage(AlyxFoveation.storageKey) private var foveation = AlyxFoveation.standard.rawValue
+    @AppStorage(klAlyxLoadingKey) private var loadingScreens = true
+    /// True once a run has started: the values were read at its start, so the
+    /// control then describes the NEXT launch and says so.
+    let started: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker("Picture", selection: $quality) {
+                ForEach(AlyxQuality.allCases) { q in
+                    Text(q.title).tag(q.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+            Text((AlyxQuality(rawValue: quality) ?? .balanced).detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Picker("Edges", selection: $edges) {
+                ForEach(AlyxEdges.allCases) { e in
+                    Text(e.title).tag(e.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+            Text((AlyxEdges(rawValue: edges) ?? .two).detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Picker("View", selection: $view) {
+                ForEach(AlyxView.allCases) { v in
+                    Text(v.title).tag(v.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+            Text((AlyxView(rawValue: view) ?? .full).detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Picker("Foveation", selection: $foveation) {
+                ForEach(AlyxFoveation.allCases) { f in
+                    Text(f.title).tag(f.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+            Text((AlyxFoveation(rawValue: foveation) ?? .standard).detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Toggle("Loading screens", isOn: $loadingScreens)
+            Text((loadingScreens
+                  ? "The game shows its loading card and waits for a trigger pull when a level is ready."
+                  : "The game continues by itself as soon as a level is ready.")
+                 + (started ? "  All of these take effect the next time the game is started." : ""))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+}

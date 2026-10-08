@@ -1020,6 +1020,56 @@ puts the camera on the ground with its hands underneath it.
   back full width, and the only instrument left is a person in the headset.
   Pairs with `KL_VIEW_EYE=1`. Read on the same path as the union below, so it
   overrides the compositor on device too.
+- `KL_STALL_MS=<ms>` — the stall watch (`runtime/diag/kl_stall.c`): when an
+  OpenXR guest submits no frame for that long, every thread is sampled while the
+  gap lasts and, when frames resume, the gap's length and the stacks of the
+  threads that were not waiting are printed. Off unless set; 250 for `alyx`.
+- `KL_OVRP_HEAD=x,y,z[,yaw]` — a head pose for a run with no frontend (metres,
+  yaw in degrees). Without it an OpenXR guest's head is on the floor at the
+  origin, which Half-Life: Alyx answers with its orange out-of-bounds fade.
+- `KL_VK_ASYNC_PIPES=0|1|2` — graphics pipelines are compiled on worker threads
+  instead of in the call that creates them (default 1 for `alyx`, else 0). The
+  creating call waits at most `KL_VK_ASYNC_WAIT_MS` (default 8, and a tenth of
+  elapsed time across all creations); a compile that takes longer is answered
+  with a handle of the layer's own, a bind of it binds nothing until the
+  pipeline is there, and the draws that follow on that command buffer are
+  dropped. 1 = only pipelines that render with a depth attachment (views of the
+  scene and shadow maps, redrawn every frame); 2 = every graphics pipeline (test
+  only: an interface panel rendered once would keep the hole).
+  `KL_VK_ASYNC_DELAY_MS=<ms>` makes every compile that much slower, to see the
+  cold case on a machine whose Metal shader cache is warm.
+- `KL_VK_PIPE_REC=<file>` — one line per graphics pipeline the guest creates:
+  FNV hash of each stage's SPIR-V, sample count, attachment formats, view mask,
+  compile time. (How it was established that the game's shipped
+  `vulkan_shader_cache.foz` holds none of this build's shaders.)
+- `KL_VK_PASS_BARRIERS=0|1|2` — what happens to a `vkCmdPipelineBarrier`
+  recorded INSIDE a dynamic-rendering pass that only makes colour attachments
+  readable as input attachments. MoltenVK answers one by ending the Metal pass
+  and opening another (store everything, load everything). `1` keeps it
+  (default). `0` drops it and stores the pass's multisampled colour as the pass
+  ends, so that whatever reads it reads the previous frame (`alyx`: its
+  exposure meter). `2` holds it back until a pipeline that reads a subpass input
+  is bound. `KL_VK_SUBPASS_DUMP=<dir>` writes the SPIR-V of every shader that
+  reads one.
+- `KL_VK_WIDEN_AREA=1` — give a multisampled pass that loads nothing its whole
+  attachments as render area, so MoltenVK can clear and discard instead of load
+  and store. Default 0, 1 for `alyx`. `KL_VK_WIDEN_TRACE=1` says what it saw.
+- `KL_VK_FOVEATE=<edge>` — foveate a Vulkan guest's multisampled scene pass
+  underneath MoltenVK (`kl_mtl_foveate.m`): a rasterization rate map on that
+  pass, and an unwarp of its resolve target as it ends. `<edge>` is the rate at
+  the widest edge of the cone; `KL_VK_FOVEATE_INNER=<tan>` (default 0.30) is how
+  far out the rate stays 1. `KL_VK_FOVEATE_TRACE=1` prints the candidate passes,
+  and, some frames into a level, every Metal encoder of two frames with the call
+  stack that ended the scene pass. Off unless set.
+- `KL_VK_HEAP_MB=<n>` — tell the guest the GPU has at most `n` MB (heap size and
+  `VK_EXT_memory_budget`), instead of MoltenVK's figure, which on a headset is
+  more than the app may use in total. Off unless set.
+- `KL_VK_NO_QUERY=1` — drop `vkCmdBeginQuery`/`vkCmdEndQuery`. A diagnostic.
+- `KL_OVRP_EYE_TAN_MAX=<t>` — tell no eye a cone wider than tangent `t` in any
+  direction (Vision Pro's temporal side is 1.73 = 60 degrees; `1.3` is 52). The
+  eye texture is narrowed in proportion, so density is kept and the far
+  periphery's pixels are not drawn; beyond the picture the composite shows its
+  clear colour. Ignored while `KL_OVRP_UNIFY_FRUSTUM` is on.
 - `KL_OVRP_UNIFY_FRUSTUM=1` — tell **both** eyes the union of the two cones.
   **Default 0 as of 2026-08-13**; it used to default to on for a multiview
   guest, which was the stopgap for BONELAB's warped right eye. That is now

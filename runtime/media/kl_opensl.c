@@ -35,6 +35,7 @@
 #include "klepton.h"
 #include "kl_env.h"
 #include "kl_audio.h"
+#include "kl_aaudio.h"
 #include "kl_opensl.h"
 
 typedef uint32_t SLuint32;
@@ -412,7 +413,12 @@ static SLresult obj_Realize(SLObjectItf self, SLboolean async) {
         // mismatched-rate player does NOT feed kl_audio; it paces with usleep and
         // stays silent to the device, which is correct when it is the secondary,
         // near-silent output (UE4's here). Same-rate players mix as before.
-        if (g_audio_users == 0) {
+        if (g_audio_users == 0 && kl_aaudio_output_rate()) {
+            // The device already belongs to an AAudio stream (see
+            // kl_opensl_yield_device): join it at its rate or stay silent.
+            g_device_rate = kl_aaudio_output_rate();
+            p->mixes = (p->rate == g_device_rate);
+        } else if (g_audio_users == 0) {
             kl_audio_open(p->rate, p->channels, p->bits);
             g_device_rate = p->rate;
             p->mixes = 1;
@@ -598,8 +604,11 @@ static void player_stop(kl_sl_player *p) {
     // others remain, un-pause it so their feeders resume (the pause above hit
     // every feeder, not just this one's).
     if (g_audio_users > 0) g_audio_users--;
-    if (g_audio_users == 0) kl_audio_close();   // only after the join: feeder is the producer
-    else if (any_player_playing()) kl_audio_play();
+    kl_audio_src_release(p);
+    // Only after the join: the feeder is the producer. And not while an AAudio
+    // stream is playing through the same device.
+    if (g_audio_users == 0 && !kl_aaudio_output_rate()) kl_audio_close();
+    else if (g_audio_users && any_player_playing()) kl_audio_play();
     pthread_mutex_destroy(&p->lock);
     pthread_cond_destroy(&p->wake);
     pthread_cond_destroy(&p->cb_done);
@@ -1084,4 +1093,35 @@ void kl_opensl_report(FILE *f) {
     kl_audio_report(f);
     for (unsigned i = 0; i < g_nsl; i++)
         fprintf(f, "    unimplemented: %-32s x%u\n", g_sl[i].name, g_sl[i].calls);
+}
+
+// --- two APIs, one device ---------------------------------------------------
+//
+// kl_audio is ONE output at ONE input rate. Within OpenSL that is arbitrated
+// above (the first player fixes the rate, a later mismatched one paces
+// silently). Across APIs nothing arbitrated it, and Moss needs it: Unreal's own
+// audio device opens an OpenSL player at 44.1 kHz that only ever carries
+// silence, and THEN Wwise opens an AAudio stream at 48 kHz for everything the
+// game actually plays. The AAudio open re-created the device at 48 kHz under
+// the OpenSL feeder, which went on writing 44.1 kHz frames into it as a second
+// mix source; Wwise's stream starved, and Wwise answered by closing and
+// reopening it for ever — each close pulling the device from under OpenSL in
+// turn. On device: no sound at all.
+//
+// The later, real stream wins. When AAudio takes the device, every OpenSL
+// player at another rate stops feeding it (it keeps its own clock, exactly as
+// a mismatched second OpenSL player already does).
+int kl_opensl_audio_users(void) { return g_audio_users; }
+void kl_opensl_yield_device(unsigned rate) {
+    if (!g_audio_users || !rate) return;
+    g_device_rate = rate;
+    for (unsigned i = 0; i < sizeof g_players / sizeof g_players[0]; i++) {
+        kl_sl_player *p = &g_players[i];
+        if (!p->started || !p->mixes || p->rate == rate) continue;
+        p->mixes = 0;
+        kl_audio_src_release(p);
+        fprintf(stderr, "  [sl] player #%u at %u Hz yields the device to an AAudio "
+                        "stream at %u Hz — pacing silently from here\n",
+                i, p->rate, rate);
+    }
 }

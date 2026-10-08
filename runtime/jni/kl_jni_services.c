@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/mount.h>   // statfs, for android.os.StatFs
 #include "klepton.h"
 #include "kl_mediaplayer.h"
 #include "kl_jni.h"
@@ -653,6 +654,19 @@ static klj_val klj_Locale_toLanguageTag(void *env, void *self, const klj_val *a,
     if (*country) snprintf(tag, sizeof tag, "%s-%s", lang, country);
     else          snprintf(tag, sizeof tag, "%s", lang);
     KLJ_LOG("Locale.toLanguageTag() -> %s", tag);
+    return (klj_val){.l = kl_jni_new_string(tag)};
+}
+
+// The pre-BCP-47 spelling of the same two parts: "en_US", underscore rather than
+// hyphen, and again no separator when there is no region. Walkabout's
+// localisation asks for this one (through Unity's AndroidJavaObject reflection).
+static klj_val klj_Locale_toString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    char lang[16], country[16], tag[40];
+    klj_locale_parts(lang, sizeof lang, country, sizeof country);
+    if (*country) snprintf(tag, sizeof tag, "%s_%s", lang, country);
+    else          snprintf(tag, sizeof tag, "%s", lang);
+    KLJ_LOG("Locale.toString() -> %s", tag);
     return (klj_val){.l = kl_jni_new_string(tag)};
 }
 
@@ -1687,6 +1701,87 @@ static klj_val klj_SDLActivity_getAssetsList(void *env, void *self, const klj_va
 static int klj_delim_whole_input(const char *d) {
     return strcmp(d, "\\A") == 0 || strcmp(d, "\\z") == 0 || strcmp(d, "\\Z") == 0;
 }
+// android.os.StatFs — how much room a directory's volume has. Walkabout asks
+// before it offers a course download (getExternalCacheDir -> StatFs), and the
+// honest answer is the host volume behind the same redirected path, which is
+// where a download would actually land. The snapshot is taken at construction,
+// as Android's is (restat() is the only thing that refreshes it).
+typedef struct { uint64_t bsize, blocks, bfree, bavail; } klj_statfs;
+
+static klj_val klj_StatFs_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *s = n > 0 ? klj_str(a[0].l) : NULL;
+    klj_statfs *st = calloc(1, sizeof *st);
+    char kp[1024];
+    struct statfs d;
+    if (s && statfs(kl_guest_path(s, kp, sizeof kp), &d) == 0) {
+        st->bsize = d.f_bsize; st->blocks = d.f_blocks;
+        st->bfree = d.f_bfree; st->bavail = d.f_bavail;
+    }
+    KLJ_LOG("StatFs(\"%s\") -> %llu MiB available", s ? s : "(null)",
+            (unsigned long long)(st->bavail * st->bsize >> 20));
+    void *obj = kl_jni_new_object("android/os/StatFs");
+    klj_as_object(obj)->data = st;
+    return (klj_val){.l = klj_own(obj, free)};
+}
+static klj_statfs *klj_statfs_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o ? o->data : NULL;
+}
+#define KLJ_STATFS(fn, expr) \
+    static klj_val fn(void *env, void *self, const klj_val *a, int n) { \
+        (void)env; (void)a; (void)n; \
+        klj_statfs *st = klj_statfs_of(self); \
+        return (klj_val){.j = st ? (uint64_t)(expr) : 0}; \
+    }
+KLJ_STATFS(klj_StatFs_getAvailableBytes,      st->bavail * st->bsize)
+KLJ_STATFS(klj_StatFs_getFreeBytes,           st->bfree * st->bsize)
+KLJ_STATFS(klj_StatFs_getTotalBytes,          st->blocks * st->bsize)
+KLJ_STATFS(klj_StatFs_getAvailableBlocksLong, st->bavail)
+KLJ_STATFS(klj_StatFs_getFreeBlocksLong,      st->bfree)
+KLJ_STATFS(klj_StatFs_getBlockCountLong,      st->blocks)
+KLJ_STATFS(klj_StatFs_getBlockSizeLong,       st->bsize)
+#undef KLJ_STATFS
+
+// com.exitgames.photon.audioinaec.AudioInAEC — Photon Voice's Android microphone
+// (an AudioRecord with echo cancellation, in the APK's own smali). Walkabout
+// constructs one the moment a multiplayer room exists, and an unimplemented
+// GetMinBufferSize was the whole of "the room appears for a second and the game
+// crashes".
+//
+// There is no capture behind it yet, so it answers the way the class itself does
+// when the device will not give it a microphone: a buffer size (Photon sizes its
+// frame from it before asking for anything), then Start() == false. Photon Voice
+// logs "AudioInAEC.Start returned false" and carries on with no local voice —
+// the room, the other players and their voices are a different path. Start is
+// the one place to hang a real recorder on later; nothing else here would move.
+static klj_val klj_AudioInAEC_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object("com/exitgames/photon/audioinaec/AudioInAEC")};
+}
+// AudioRecord.getMinBufferSize's shape: BYTES of 16-bit PCM, about 40 ms.
+static klj_val klj_AudioInAEC_GetMinBufferSize(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int rate = n > 0 ? (int)a[0].j : 48000, ch = n > 1 ? (int)a[1].j : 1;
+    if (rate <= 0) rate = 48000;
+    if (ch < 1 || ch > 2) ch = 1;
+    return (klj_val){.j = (uint64_t)(rate / 25 * ch * 2)};
+}
+static klj_val klj_AudioInAEC_Start(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AudioInAEC.Start -> false (no microphone capture behind Photon Voice "
+            "here; the guest continues without local voice)");
+    return (klj_val){.j = 0};
+}
+static klj_val klj_AudioInAEC_false(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_AudioInAEC_true(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};
+}
+
 typedef struct { klj_stream *st; char delim[32]; } klj_scanner;
 
 static klj_val klj_Scanner_init(void *env, void *clazz, const klj_val *a, int n) {
@@ -1814,6 +1909,7 @@ const klj_binding klj_bind_services[] = {
     {"java/util/Locale", "getLanguage", "()Ljava/lang/String;",   klj_Locale_getLanguage},
     {"java/util/Locale", "getCountry",  "()Ljava/lang/String;",   klj_Locale_getCountry},
     {"java/util/Locale", "toLanguageTag", "()Ljava/lang/String;", klj_Locale_toLanguageTag},
+    {"java/util/Locale", "toString",    "()Ljava/lang/String;",   klj_Locale_toString},
     {"android/media/MediaRouter$RouteInfo", "getPresentationDisplay", "()Landroid/view/Display;", klj_RouteInfo_getPresentationDisplay},
 
     {"android/app/AlertDialog$Builder", "<init>", "(Landroid/content/Context;)V", klj_AlertBuilder_init},
@@ -1931,6 +2027,32 @@ const klj_binding klj_bind_services[] = {
     {"android/os/Bundle", "getInt",     "(Ljava/lang/String;I)I", klj_Bundle_getInt},
     {"android/os/Bundle", "containsKey","(Ljava/lang/String;)Z",  klj_Bundle_containsKey},
 
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "<init>", "()V", klj_AudioInAEC_init},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "GetMinBufferSize", "(II)I", klj_AudioInAEC_GetMinBufferSize},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "Start",
+     "(Landroid/app/Activity;Lcom/exitgames/photon/audioinaec/AudioInAEC$DataCallback;IIIZZZ)Z",
+     klj_AudioInAEC_Start},
+    // ...and the spelling Unity's AndroidJavaObject reflection actually asks
+    // with: the CONCRETE argument classes, dotted (see kl_jni_display.c's
+    // hasUserAuthorizedPermission). The declared one above never matched it.
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "Start",
+     "(Lcom.unity3d.player.UnityPlayerActivity;Lcom.exitgames.photon.audioinaec.AudioInAEC$DataCallback;IIIZZZ)Z",
+     klj_AudioInAEC_Start},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "Stop",           "()Z",   klj_AudioInAEC_true},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "SetBuffer",      "([S)Z", klj_AudioInAEC_false},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "GetSampleRate",  "()I",   klj_AudioInAEC_false},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "AECIsAvailable", "()Z",   klj_AudioInAEC_false},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "AGCIsAvailable", "()Z",   klj_AudioInAEC_false},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "NSIsAvailable",  "()Z",   klj_AudioInAEC_false},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "Reset",          "()V",   klj_void_noop},
+    {"android/os/StatFs", "<init>",                 "(Ljava/lang/String;)V", klj_StatFs_init},
+    {"android/os/StatFs", "getAvailableBytes",      "()J", klj_StatFs_getAvailableBytes},
+    {"android/os/StatFs", "getFreeBytes",           "()J", klj_StatFs_getFreeBytes},
+    {"android/os/StatFs", "getTotalBytes",          "()J", klj_StatFs_getTotalBytes},
+    {"android/os/StatFs", "getAvailableBlocksLong", "()J", klj_StatFs_getAvailableBlocksLong},
+    {"android/os/StatFs", "getFreeBlocksLong",      "()J", klj_StatFs_getFreeBlocksLong},
+    {"android/os/StatFs", "getBlockCountLong",      "()J", klj_StatFs_getBlockCountLong},
+    {"android/os/StatFs", "getBlockSizeLong",       "()J", klj_StatFs_getBlockSizeLong},
     {"java/util/Scanner", "<init>",        "(Ljava/io/InputStream;Ljava/lang/String;)V", klj_Scanner_init},
     {"java/util/Scanner", "useDelimiter",  "(Ljava/lang/String;)Ljava/util/Scanner;",    klj_Scanner_useDelimiter},
     {"java/util/Scanner", "next",          "()Ljava/lang/String;",                       klj_Scanner_next},

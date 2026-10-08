@@ -1901,6 +1901,21 @@ int klb_rename(const char *a, const char *b) {
     kl_fs_trace("rename", a, b, r != 0);
     return r;
 }
+// link, for the same two-path reason as rename — and it was a plain forward
+// until a guest needed it. .NET's File.Replace backs the old file up with
+// link(dest, backup) before it swaps the new one in (FileSystem.LinkOrCopyFile),
+// so a guest that saves a settings file that way handed libSystem
+// "/sdcard/no_backup/settings.ini" untranslated, got ENOENT for a file that
+// exists, and threw FileNotFoundException out of its save: Beat Saber 1.40's
+// language screen clicked on Continue and went nowhere.
+int klb_link(const char *a, const char *b) {
+    char ka[1024], kb[1024];
+    const char *pa = kl_guest_path(a, ka, sizeof ka);
+    const char *pb = kl_guest_path(b, kb, sizeof kb);
+    int r = link(pa, pb);
+    kl_fs_trace("link", a, b, r != 0);
+    return r;
+}
 
 // ---------- struct dirent ----------
 typedef struct { uint64_t d_ino; int64_t d_off; uint16_t d_reclen;

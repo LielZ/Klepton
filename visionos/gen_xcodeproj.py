@@ -206,7 +206,63 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # always defined so expansion never leaves a literal
                         # "$(...)" in the bundle; the placeholder names no stack
                         # and behaves exactly like the old no-icon build.
-                        + f"\t\t\t\tKL_APPICON_NAME = \"{_icon_name if HAS_ICON else 'AppIcon'}\";\n")
+                        + f"\t\t\t\tKL_APPICON_NAME = \"{_icon_name if HAS_ICON else 'AppIcon'}\";\n"
+                        # Same route for the target's hand-matting default
+                        # (targets.py "hand_matting"): Info.plist's
+                        # KLHandMattingDefault is $(KL_HAND_MATTING_DEFAULT).
+                        + f"\t\t\t\tKL_HAND_MATTING_DEFAULT = {1 if KLT['hand_matting'] else 0};\n"
+                        # ...and its render-scale default (targets.py
+                        # "render_scale"), KLRenderScaleDefault in Info.plist.
+                        + f"\t\t\t\tKL_RENDER_SCALE_DEFAULT = {float(KLT['render_scale']):.2f};\n"
+                        # ...and whether in-game video is tried by default
+                        # (targets.py "video"), KLVideoDefault in Info.plist.
+                        + f"\t\t\t\tKL_VIDEO_DEFAULT = {1 if KLT['video'] else 0};\n"
+                        # ...whether the guest boots by itself or waits for the
+                        # Start button (targets.py "autoboot"), and what the
+                        # foveated-rendering setting starts at ("foveation").
+                        + f"\t\t\t\tKL_AUTOBOOT_DEFAULT = {1 if KLT['autoboot'] else 0};\n"
+                        + f"\t\t\t\tKL_FOVEATION_DEFAULT = {1 if KLT['foveation'] else 0};\n"
+                        # ...and which front the app shows: the boot report
+                        # this project was developed against, or the start
+                        # screen an installed game presents (KleptonApp.swift,
+                        # `productStart`). An installer asks for the second with
+                        # KLEPTON_START_SCREEN=1; KLStartScreen in Info.plist.
+                        + f"\t\t\t\tKL_START_SCREEN = {1 if os.environ.get('KLEPTON_START_SCREEN') == '1' else 0};\n"
+                        # ...and what KleptonGameData.swift reads: which files
+                        # this build's guest needs and the store ids to fetch
+                        # them by. KL_DATA_TREE is empty for a target without the
+                        # panel, which is how the app tells.
+                        + f"\t\t\t\tKL_DATA_TREE = \"{KLT['tree'] if KLT['data_panel'] else ''}\";\n"
+                        + f"\t\t\t\tKL_DATA_APK = \"{KLT['apk']}\";\n"
+                        + f"\t\t\t\tKL_DATA_OBB_REL = \"{KLT['obb']}\";\n"
+                        + f"\t\t\t\tKL_DATA_OBB_FILE = \"{KLT['obb_file']}\";\n"
+                        + f"\t\t\t\tKL_DATA_APK_ID = \"{KLT['meta_apk_id']}\";\n"
+                        + f"\t\t\t\tKL_DATA_OBB_ID = \"{KLT['meta_obb_id']}\";\n")
+
+# The privacy strings, as BUILD SETTINGS and from here.
+#
+# They used to live only in Info.plist, and that is not a safe place for them:
+# open the generated project in Xcode, touch the target's Info tab, and Xcode
+# MOVES every usage description it recognises out of the plist and into the
+# project file as INFOPLIST_KEY_* (it is consolidating them where
+# GENERATE_INFOPLIST_FILE reads them). The plist is left without them — and the
+# project file is rewritten by this script on the next build. So the strings
+# vanish from both, nothing fails, and the app is killed by TCC two seconds
+# after launch the moment it asks for accessory tracking (twice now: Beat Saber
+# 1.40, then batman). Emitted here, they are in every project this writes,
+# wherever else they do or do not survive. visionos/run.sh checks the product.
+USAGE_DESCRIPTIONS = {
+    "NSMicrophoneUsageDescription": "Klepton uses the microphone only when you turn on the Microphone toggle, so a running app (such as Steam Link voice chat) can hear you.",
+    "NSWorldSensingUsageDescription": "Klepton reads the headset's own pose, which is the head pose the guest renders from.",
+    "NSHandsTrackingUsageDescription": "Klepton maps your hands onto the guest's two Touch controllers.",
+    "NSAccessoryTrackingUsageDescription": "Klepton maps PSVR2 Sense controllers onto the guest's two Touch controllers.",
+    "NSBluetoothAlwaysUsageDescription": "Klepton connects to spatial controllers that are not visible to the system as standard game controllers.",
+    "NSLocalNetworkUsageDescription": "Steam Link finds the PCs on your network by broadcasting to them, and streams from the one you pair with.",
+}
+_usage_settings = "".join(
+    '\t\t\t\tINFOPLIST_KEY_%s = "%s";\n' % (k, v.replace("\\", "\\\\").replace('"', '\\"'))
+    for k, v in USAGE_DESCRIPTIONS.items())
+ASSETCATALOG_SETTING += _usage_settings
 
 # Trim the asset catalog to THIS target. The shared Assets.xcassets holds one icon
 # stack per target (~26), and actool compiles ALL of them into the app's Assets.car
@@ -229,6 +285,30 @@ for _stack in (_icon_base, f"{_icon_base}-launcher"):
     _s = _os.path.join(_assets_dir, _stack + ".solidimagestack")
     if _os.path.isdir(_s):
         _shutil.copytree(_s, _os.path.join(_cat_abs, _stack + ".solidimagestack"))
+# The start screen's picture, if an installer left one for this target
+# (StartHero-<target>.imageset). It goes into the app under ONE name, so the
+# Swift side asks for "StartHero" whatever the guest is.
+_hero = _os.path.join(_assets_dir, f"StartHero-{KLT['name']}.imageset")
+if _os.path.isdir(_hero):
+    _shutil.copytree(_hero, _os.path.join(_cat_abs, "StartHero.imageset"))
+
+# The two files apktool decodes out of the APK and a headset cannot (the
+# manifest is binary XML in the archive): carried as data assets, so the in-app
+# data panel can put them beside the assets it unpacks. They describe exactly
+# the APK this build's libraries came from, which is why they may ride along.
+if KLT['data_panel']:
+    _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    for _asset, _file in (("KLMeta-apktool", "apktool.yml"),
+                          ("KLMeta-manifest", "AndroidManifest.xml")):
+        _src = _os.path.join(_root, KLT['tree'], _file)
+        if not _os.path.isfile(_src):
+            continue
+        _ds = _os.path.join(_cat_abs, _asset + ".dataset")
+        _os.makedirs(_ds, exist_ok=True)
+        _shutil.copy(_src, _os.path.join(_ds, _file))
+        open(_os.path.join(_ds, "Contents.json"), "w").write(
+            '{\n  "info" : { "author" : "xcode", "version" : 1 },\n'
+            '  "data" : [ { "filename" : "%s", "idiom" : "universal" } ]\n}\n' % _file)
 
 # The Swift half of the language split: the App/UI, and the Compositor Services
 # renderer adds. A list rather than an id pair each, for the same reason
@@ -236,7 +316,8 @@ for _stack in (_icon_base, f"{_icon_base}-launcher"):
 SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
          "KleptonChroma.swift", "KleptonMic.swift",
-         "KleptonLauncher.swift", "KleptonHL1.swift"]
+         "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonGameData.swift",
+         "KleptonAlyx.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(
@@ -290,10 +371,23 @@ _display = (_launcher_display.get(KLT['name'], KLT['display']) if _launcher_on
 LAUNCHER_COND = ('\t\t\t\tSWIFT_ACTIVE_COMPILATION_CONDITIONS = "KL_CUSTOM_LAUNCHER $(inherited)";\n'
                  if _launcher_on else "")
 
+# What the installed app says about itself: CFBundleShortVersionString and
+# CFBundleVersion. An installer sets these (KLEPTON_APP_VERSION — the guest's own
+# version — and KLEPTON_APP_BUILD — which build of it this is), because the app
+# list of a headset is the only place a Mac can ask what is installed, and "1.0
+# (1)" for every guest answers nothing. Up to three dot-separated integers each,
+# which is all the two keys take; anything else keeps the old constant.
+import re as _re
+def _plist_version(env, dflt):
+    v = os.environ.get(env, "")
+    return v if _re.fullmatch(r"\d{1,9}(\.\d{1,9}){0,2}", v) else dflt
+APP_VERSION = _plist_version("KLEPTON_APP_VERSION", "1.0")
+APP_BUILD = _plist_version("KLEPTON_APP_BUILD", "1")
+
 COMMON = f"""
 				CLANG_ENABLE_MODULES = YES;
 {ENTITLEMENTS_SETTING}				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = {APP_BUILD};
 				DEVELOPMENT_TEAM = {TEAM};
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -349,7 +443,7 @@ COMMON = f"""
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = {APP_VERSION};
 				// VideoToolbox/CoreMedia/CoreVideo are kl_vtdec's, and
 				// they were missing here for the whole of the Steam Link arc:
 				// kl_vtdec joined RUNTIME_SHIP, `make xros` kept passing because

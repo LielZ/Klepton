@@ -10,6 +10,7 @@
 #   KLEPTON_TEAM=<teamid>   override signing team
 #   KLEPTON_BUNDLE_ID=...   override bundle id
 #   KL_SKIP_STAGE=1         never stage, even on a target that has never had it
+#   KL_SKIP_LAUNCH=1        device: build, install and stage, but do not launch
 #   KL_STAGE=1              always stage, whatever the stamp says
 #
 # Everything downstream of the target — the product name, and with it the
@@ -127,7 +128,7 @@ stage_if_needed() {
 # it, the app never did, and the run took the window path while looking like the
 # compositor had failed to come up. A knob that is set and not delivered is worse
 # than one that does not exist, so the default is now "forward it".
-FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
+FORWARD_SKIP="KL_LX_PHASE KL_LX_SYSROOT KL_LX_GAME KL_LX_XRIZER KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_SKIP_LAUNCH KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
 FORWARD=""
 for K in $(env | sed -n -e 's/^\(KL_[A-Za-z0-9_]*\)=.*/\1/p' \
                         -e 's/^\(MTL_[A-Za-z0-9_]*\)=.*/\1/p' \
@@ -199,6 +200,13 @@ print(phys[0]["identifier"])
   APP="build/dd-device-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xros/$PRODUCT.app"
   [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
   [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
+  # A product without this string does not fail to build, sign or install: it
+  # launches, asks for accessory tracking, and is killed by TCC with nothing in
+  # its own log but a signal 6. Stop here instead, where the cause can be named.
+  plutil -extract NSAccessoryTrackingUsageDescription raw "$APP/Info.plist" >/dev/null 2>&1 || {
+    echo "!! $APP has no NSAccessoryTrackingUsageDescription — it would be killed at launch."
+    echo "!! (Xcode moves the usage descriptions out of Info.plist; gen_xcodeproj.py emits them.)"
+    exit 1; }
 
   if [ -n "${KL_SKIP_INSTALL:-}" ]; then
     # Every install observed on this device ROTATES the data container, which
@@ -215,6 +223,13 @@ print(phys[0]["identifier"])
   # Installing can rotate the data container, so assets are staged *after*.
   stage_if_needed "$DEVID" "$DEVID"
 
+  # Install-only: the app and its assets are on the device and nothing is
+  # started — for a headset someone is wearing, or a target that is not the one
+  # being worked on.
+  if [ -n "${KL_SKIP_LAUNCH:-}" ]; then
+    echo "[5/5] launch skipped (KL_SKIP_LAUNCH=1)"
+    exit 0
+  fi
   echo "[5/5] launching (report also renders on-screen)…"
   # KL_FRAMES carries the app past the initJni gate into the Android lifecycle
   # — which is where libil2cpp and its 3,083 veneers first load under
@@ -396,7 +411,9 @@ fi
 # nothing — silently, right after "[2/5] project…", before the message below
 # ever prints. Cost a "build crash" report that was really a missing `device`
 # argument on a machine with no simulator booted.
-UDID=$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1 || true)
+# KLEPTON_SIM_UDID names the simulator outright: "the first booted one" is an
+# iPhone as soon as somebody has one open for another project.
+UDID="${KLEPTON_SIM_UDID:-$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1 || true)}"
 [ -n "$UDID" ] || { echo "!! no booted visionOS simulator (did you mean ./run.sh device ?)"; exit 1; }
 
 echo "[3/5] building for the simulator…"

@@ -51,6 +51,8 @@ import ARKit
 import AVFoundation
 import CoreVideo
 import QuartzCore
+import UIKit
+import CoreText
 
 // What the drawable costs, and therefore how much of the display we can afford
 // to actually use. Three settings here decide that, and they are entangled:
@@ -477,6 +479,16 @@ final class KleptonCompositor {
     private var cmdCommitted = 0
     private let cmdLock = NSLock()
     private var cmdCompleted = 0
+    // Where a composite buffer's time on the GPU goes, under cmdLock. "0 past
+    // deadline" only says the ENCODE was on time; a buffer that then sits
+    // behind the guest's rendering on a GPU that does not preempt reaches the
+    // display late all the same, and the system answers by showing every frame
+    // twice (cadence 2.00). `queued` is commit -> the GPU starting it, `ran` is
+    // the pass itself: a long queue with a short run is the guest's load, a
+    // long run is this pass's own cost. Reported with the cadence.
+    private var gpuTimedN = 0
+    private var gpuQueuedSum = 0.0, gpuQueuedMax = 0.0
+    private var gpuRanSum = 0.0, gpuRanMax = 0.0
     private var cmdError: Error?
     // Startup diagnostics for the signal-9 wall: what the last renderFrame saw,
     // surfaced into the alive report, plus a short per-frame trace of the first
@@ -1050,6 +1062,28 @@ final class KleptonCompositor {
             }
         }
         guard sampled > 0 else { return }
+        // ...and the envelope's valleys are filled. The two eyes' dense regions
+        // sit inboard of centre, mirrored, so their per-zone maximum has TWO
+        // peaks with a dip between them — 1.00 either side and 0.83 in the two
+        // middle zones, measured on device — and that dip is in the exact centre
+        // of the guest's picture, where both eyes look. It read as a vertical
+        // crease down the middle of the view, like the fold of a folding screen
+        // (owner, Doom 3, 2026-10-08). Nothing wants fewer samples there: it is
+        // an artefact of combining two curves, not either display's request. So
+        // each zone takes the lower of "the most seen so far from the left" and
+        // "from the right", which leaves a single plateau and only ever adds
+        // samples.
+        func filled(_ q: [Float]) -> [Float] {
+            guard q.count > 2 else { return q }
+            var fromLeft = q, fromRight = q
+            for i in 1..<q.count { fromLeft[i] = max(fromLeft[i - 1], q[i]) }
+            for i in stride(from: q.count - 2, through: 0, by: -1) {
+                fromRight[i] = max(fromRight[i + 1], q[i])
+            }
+            return zip(fromLeft, fromRight).map { min($0, $1) }
+        }
+        qx = filled(qx)
+        qy = filled(qy)
         displayQualityX = qx
         displayQualityY = qy
         // BOTH curves, and y is not decoration: the horizontal one is an
@@ -1102,7 +1136,12 @@ final class KleptonCompositor {
         guard kl_glfb_foveation_wanted(&zones, &edge) != 0 else { return }
         if guestRateMap != nil, guestRateW == w, guestRateH == h { return }
         guard !guestRateRefused else { return }
-        guard device.supportsRasterizationRateMap(layerCount: 1) else {
+        // One layer per slice the guest rasterizes in a pass: a mirrored guest
+        // that draws both eyes at once (OVR_multiview, a layered pass) needs two.
+        // They are the same curve — the compositor unwarps both eyes through
+        // layer 0, so a second layer shaped differently would be unwarped wrong.
+        let layers = max(1, Int(kl_glfb_rate_map_layers()))
+        guard device.supportsRasterizationRateMap(layerCount: layers) else {
             // Said once: this is a property of the GPU, so it will not become
             // true later in the run.
             guestRateRefused = true
@@ -1121,17 +1160,19 @@ final class KleptonCompositor {
         }
         // `__sampleCount:` is the pointer-taking initializer as Swift imports
         // it; the array-taking spelling does not exist here.
-        let layer = qx.withUnsafeBufferPointer { hp in
-            qy.withUnsafeBufferPointer { vp in
-                MTLRasterizationRateLayerDescriptor(
-                    __sampleCount: MTLSize(width: qx.count, height: qy.count, depth: 0),
-                    horizontal: hp.baseAddress!, vertical: vp.baseAddress!)
+        func makeLayer() -> MTLRasterizationRateLayerDescriptor {
+            qx.withUnsafeBufferPointer { hp in
+                qy.withUnsafeBufferPointer { vp in
+                    MTLRasterizationRateLayerDescriptor(
+                        __sampleCount: MTLSize(width: qx.count, height: qy.count, depth: 0),
+                        horizontal: hp.baseAddress!, vertical: vp.baseAddress!)
+                }
             }
         }
         let desc = MTLRasterizationRateMapDescriptor()
         desc.screenSize = MTLSize(width: w, height: h, depth: 0)
         desc.label = "klepton guest foveation"
-        desc.setLayer(layer, at: 0)
+        for i in 0..<layers { desc.setLayer(makeLayer(), at: i) }
         guard let map = device.makeRasterizationRateMap(descriptor: desc) else {
             guestRateRefused = true
             NSLog("[cp] makeRasterizationRateMap \(w)x\(h) failed — KL_VRR ignored")
@@ -1145,7 +1186,7 @@ final class KleptonCompositor {
         NSLog("%@", "[cp] guest foveation: screen \(w)x\(h) -> physical "
               + "\(phys.width)x\(phys.height) "
               + "(\(String(format: "%.1f", 100.0 * Double(phys.width * phys.height) / Double(w * h)))% "
-              + "of the fragments, \(qx.count)x\(qy.count) zones, \(source))")
+              + "of the fragments, \(qx.count)x\(qy.count) zones, \(layers) layer(s), \(source))")
         // Held by this property, which is what keeps it alive: kl_glfb takes an
         // unmanaged pointer and never retains, exactly as it does not retain the
         // eye textures.
@@ -2032,10 +2073,20 @@ final class KleptonCompositor {
         // here. Counted, with the first error printed, because "committed but
         // never completed" is otherwise indistinguishable from "completed and
         // drew black".
+        // When this buffer was handed to Metal, on the clock gpuStartTime and
+        // gpuEndTime are expressed in — see gpuQueuedSum.
+        let committedAt = CACurrentMediaTime()
         cmd.addCompletedHandler { [weak self] b in
             guard let self else { return }
             self.cmdLock.lock()
             self.cmdCompleted += 1
+            if b.gpuEndTime > 0 && b.gpuStartTime >= committedAt {
+                let queued = b.gpuStartTime - committedAt
+                let ran = b.gpuEndTime - b.gpuStartTime
+                self.gpuTimedN += 1
+                self.gpuQueuedSum += queued; self.gpuQueuedMax = max(self.gpuQueuedMax, queued)
+                self.gpuRanSum += ran;       self.gpuRanMax = max(self.gpuRanMax, ran)
+            }
             let n = self.cmdCompleted
             let first = self.cmdError == nil && b.error != nil
             if first { self.cmdError = b.error }
@@ -2500,7 +2551,6 @@ final class KleptonCompositor {
                                   originFromHead: simd_float4x4,
                                   count: Int) -> Int {
         guard let pipeline, let sampler else { return 0 }
-        let grid = identityGrid()
         var drawn = 0
         for i in 0..<min(count, projLayers.count) {
             let pl = projLayers[i]
@@ -2565,6 +2615,28 @@ final class KleptonCompositor {
             if let d = drawn == 0 ? depthState : depthPassState {
                 enc.setDepthStencilState(d)
             }
+            // ...unless the layer's picture was rasterized through a rate map.
+            // A mirrored guest's eyes can be (kl_glfb.c, klfb_mirror_vrr): the
+            // guest then draws into the PHYSICAL part of its swapchain image, the
+            // copy brings that across texel for texel, and this pass has to undo
+            // the squeeze exactly as the eye pass does — or the picture is a
+            // small warped rectangle in one corner of a black view (on device,
+            // 2026-10-08). The map says which textures: only one of its own
+            // screen size was drawn through it. A layer that is also cropped is
+            // not handled here; none of the mirrored guests does both.
+            var foveated = false
+            if let mp = kl_glfb_eye_rate_map(),
+               let rm = Unmanaged<AnyObject>.fromOpaque(mp).takeUnretainedValue()
+                   as? MTLRasterizationRateMap {
+                foveated = rm.screenSize.width == bind0.width
+                    && rm.screenSize.height == bind0.height
+            }
+            // The unwarp grid is ONE block shared by both eyes, where this pass's
+            // uniforms were built for the layer grid's block per eye: left as it
+            // was, eye 1 indexes past the end of the grid and draws nothing.
+            if foveated {
+                for n in uniforms.indices { uniforms[n].grid_eye = 0 }
+            }
             enc.setRenderPipelineState(pipeline)
             enc.setFragmentTexture(bind0, index: 0)
             enc.setFragmentTexture(bind1, index: 1)
@@ -2572,9 +2644,40 @@ final class KleptonCompositor {
             uniforms.withUnsafeBytes { buf in
                 enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
             }
-            enc.setVertexBuffer(grid, offset: 0, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0,
-                               vertexCount: Int(kl_reproject_grid_vertices(1, 1)))
+            // The layer's own grid, not the identity: the picture may be only
+            // part of the texture (kl_ovrp_proj_layer.rect — Source 2's dynamic
+            // resolution), and each eye's part is a block of its own.
+            var layerGrid = [SIMD2<Float>](repeating: .zero,
+                                           count: Int(KL_PROJ_LAYER_GRID_ENTRIES))
+            withUnsafePointer(to: pl) { p in
+                layerGrid.withUnsafeMutableBufferPointer { kl_proj_layer_grid(p, $0.baseAddress) }
+            }
+            if foveated {
+                let (gridBuf, gridVerts, _) =
+                    unwarpGrid(bind0, viewport0: .zero, viewport1: .zero, viewportOf: .zero)
+                // Said once per size: what the grid actually holds, because "the
+                // unwarp ran" and "the unwarp did something" are different claims.
+                if let gridBuf, loggedLayerUnwarp != bind0.width {
+                    loggedLayerUnwarp = bind0.width
+                    let g = gridBuf.contents().bindMemory(to: SIMD2<Float>.self,
+                                                          capacity: gridBuf.length / 8)
+                    let nx = Int(g[0].x), ny = Int(g[0].y)
+                    func at(_ x: Int, _ y: Int) -> SIMD2<Float> { g[1 + y * (nx + 1) + x] }
+                    NSLog("%@", "[cp] layer unwarp: grid \(nx)x\(ny), \(gridVerts) vertices, "
+                          + "uv(0,0)=\(at(0, 0)) uv(mid)=\(at(nx / 2, ny / 2)) "
+                          + "uv(max)=\(at(nx, ny)); texture \(bind0.width)x\(bind0.height) "
+                          + "slices \(bind0.arrayLength); grid_eye "
+                          + "\(uniforms.map { $0.grid_eye }), visible \(uniforms.map { $0.visible })")
+                }
+                enc.setVertexBuffer(gridBuf, offset: 0, index: 1)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
+            } else {
+                layerGrid.withUnsafeBytes { buf in
+                    enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 1)
+                }
+                enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: Int(kl_reproject_grid_vertices(1, 1)))
+            }
             drawn += 1
         }
         // What each layer is ACTUALLY being placed with, said when it CHANGES —
@@ -2616,6 +2719,7 @@ final class KleptonCompositor {
     private var projLayerCount = 0
     nonisolated(unsafe) static var headLockTraceN = 0
     private var identityGridBuffer: MTLBuffer?
+    private var loggedLayerUnwarp = -1
     private var loggedProjMiss = Set<Int>()
     private var lastProjShape = ""
 
@@ -2669,7 +2773,6 @@ final class KleptonCompositor {
         // buffer is where the panel actually is.
         if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
         let n = Int(kl_ovrp_overlay_count())
-        if n == 0 { return 0 }
         var drawn = 0
         var drewEquirect = false
         for i in 0..<n {
@@ -2784,7 +2887,171 @@ final class KleptonCompositor {
                       + (ov.head_locked != 0 ? ", HEAD-LOCKED" : ""))
             }
         }
+        drawn += encodeLoadingCard(enc, viewIndices: viewIndices, drawable: drawable,
+                                   originFromHead: originFromHead)
         return drawn
+    }
+
+    // The loading screen of a guest that says what it should show instead of
+    // drawing it — Half-Life: Alyx (runtime/linux/kl_lx_interstitial.c). The
+    // game's own is a web page of dioramas that SteamVR displays; this is the
+    // same words on a card: what is loading, a tip, and the line that says the
+    // level is ready and the trigger starts it.
+    private var cardTexture: MTLTexture?
+    private var cardGeneration: UInt32 = .max
+    private var cardWorldFromQuad: simd_float4x4?
+    private static let cardSize = SIMD2<Float>(1.8, 1.0)     // metres
+    private static let cardPixels = (w: 1800, h: 1000)
+    private static let cardEnabled = klEnvOn("KL_LOADING_CARD", default: true)
+
+    private func encodeLoadingCard(_ enc: MTLRenderCommandEncoder,
+                                   viewIndices: [Int],
+                                   drawable: LayerRenderer.Drawable,
+                                   originFromHead: simd_float4x4) -> Int {
+        guard Self.cardEnabled, let pipe = overlayPipeline else { return 0 }
+        var st = kl_interstitial()
+        _ = kl_interstitial_get(&st)
+        // Only while the guest shows no picture of its own: the card is what
+        // there is to look at instead, not something to lay over a level.
+        guard st.phase != 0, kl_ovrp_eye_layer_live() == 0 else {
+            cardWorldFromQuad = nil
+            return 0
+        }
+        if cardTexture == nil || cardGeneration != st.generation {
+            cardTexture = makeLoadingCard(&st) ?? cardTexture
+            cardGeneration = st.generation
+        }
+        guard let tex = cardTexture else { return 0 }
+
+        // Where: two metres ahead of where the head was looking when the card
+        // came up, upright, and put there again if the head has turned well
+        // away from it — a card fixed to the head is hard to read, one left
+        // behind is not read at all.
+        let headPos = SIMD3<Float>(originFromHead.columns.3.x, originFromHead.columns.3.y,
+                                   originFromHead.columns.3.z)
+        var fwd = SIMD3<Float>(-originFromHead.columns.2.x, 0, -originFromHead.columns.2.z)
+        fwd = simd_length(fwd) > 0.01 ? simd_normalize(fwd) : SIMD3<Float>(0, 0, -1)
+        var place = cardWorldFromQuad == nil
+        if let m = cardWorldFromQuad {
+            var to = SIMD3<Float>(m.columns.3.x - headPos.x, 0, m.columns.3.z - headPos.z)
+            let dist = simd_length(to)
+            to = dist > 0.01 ? to / dist : fwd
+            if simd_dot(to, fwd) < 0.5 || dist > 3.5 || dist < 1.0 { place = true }
+        }
+        if place {
+            let c = headPos + fwd * 2.0 + SIMD3<Float>(0, -0.05, 0)
+            // The quad's +z faces the viewer.
+            let z = -fwd, y = SIMD3<Float>(0, 1, 0), x = simd_cross(y, z)
+            cardWorldFromQuad = simd_float4x4(SIMD4<Float>(x, 0), SIMD4<Float>(y, 0),
+                                              SIMD4<Float>(z, 0), SIMD4<Float>(c, 1))
+        }
+        guard let m = cardWorldFromQuad else { return 0 }
+        let q = simd_quatf(m)
+        var ov = kl_ovrp_overlay()
+        ov.shape = 0
+        ov.tex_w = Int32(tex.width); ov.tex_h = Int32(tex.height)
+        ov.viewport.0 = (0, 0, Int32(tex.width), Int32(tex.height))
+        ov.viewport.1 = (0, 0, Int32(tex.width), Int32(tex.height))
+        ov.pose = (q.imag.x, q.imag.y, q.imag.z, q.real, m.columns.3.x, m.columns.3.y, m.columns.3.z)
+        ov.size = (Self.cardSize.x, Self.cardSize.y)
+        ov.origin_top_left = 1
+        var uniforms: [kl_overlay_uniforms] = []
+        for vi in viewIndices {
+            uniforms.append(kl_overlay_build(&ov, Int32(vi), originFromHead,
+                                             Self.headFromView(drawable.views[vi].transform,
+                                                               midpoint: eyeMidpointInDevice),
+                                             drawable.computeProjection(viewIndex: vi)))
+        }
+        guard uniforms.contains(where: { $0.visible != 0 }) else { return 0 }
+        if let depthState { enc.setDepthStencilState(depthState) }
+        enc.setRenderPipelineState(pipe)
+        enc.setFragmentTexture(tex, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        uniforms.withUnsafeBytes { buf in
+            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+        }
+        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        return 1
+    }
+
+    /// The game's own typeface, from the game's own files where they are staged.
+    private static let cardFontNames: [String: String] = {
+        var names: [String: String] = [:]
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        else { return names }
+        for weight in ["regular", "light", "semibold", "bold"] {
+            let url = docs.appendingPathComponent("lx/game/hlvr/webui/fonts/raju-\(weight).otf")
+            guard let provider = CGDataProvider(url: url as CFURL), let font = CGFont(provider)
+            else { continue }
+            CTFontManagerRegisterGraphicsFont(font, nil)
+            if let ps = font.postScriptName as String? { names[weight] = ps }
+        }
+        return names
+    }()
+    private static func cardFont(_ weight: String, _ size: CGFloat) -> UIFont {
+        if let ps = cardFontNames[weight], let f = UIFont(name: ps, size: size) { return f }
+        let w: UIFont.Weight = weight == "bold" ? .bold : weight == "semibold" ? .semibold
+                             : weight == "light" ? .light : .regular
+        return UIFont.systemFont(ofSize: size, weight: w)
+    }
+    private static func cardString<T>(_ field: inout T) -> String {
+        withUnsafeBytes(of: &field) { raw in
+            String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
+        }
+    }
+
+    private func makeLoadingCard(_ st: inout kl_interstitial) -> MTLTexture? {
+        let w = Self.cardPixels.w, h = Self.cardPixels.h
+        let loading = Self.cardString(&st.loading), message = Self.cardString(&st.message)
+        let chapter = Self.cardString(&st.chapter), map = Self.cardString(&st.map)
+        let tip = Self.cardString(&st.tip), description = Self.cardString(&st.description)
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: w * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        // UIKit's drawing has its origin at the top; the bitmap's first row is
+        // the top row either way, which is what origin_top_left says.
+        ctx.translateBy(x: 0, y: CGFloat(h)); ctx.scaleBy(x: 1, y: -1)
+        UIGraphicsPushContext(ctx)
+        let orange = UIColor(red: 1.0, green: 0.62, blue: 0.16, alpha: 1)
+        UIColor(red: 0.035, green: 0.04, blue: 0.05, alpha: 1).setFill()
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        orange.setFill()
+        ctx.fill(CGRect(x: 90, y: 86, width: 8, height: CGFloat(h) - 172))
+        let left: CGFloat = 140, width = CGFloat(w) - left - 110
+        var y: CGFloat = 86
+        func draw(_ text: String, _ font: UIFont, _ color: UIColor, gap: CGFloat, kern: CGFloat = 0) {
+            guard !text.isEmpty else { return }
+            let para = NSMutableParagraphStyle(); para.lineSpacing = font.pointSize * 0.18
+            let attr: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color,
+                                                       .paragraphStyle: para, .kern: kern]
+            let s = NSAttributedString(string: text, attributes: attr)
+            let box = s.boundingRect(with: CGSize(width: width, height: CGFloat(h)),
+                                     options: [.usesLineFragmentOrigin], context: nil)
+            s.draw(with: CGRect(x: left, y: y, width: width, height: ceil(box.height)),
+                   options: [.usesLineFragmentOrigin], context: nil)
+            y += ceil(box.height) + gap
+        }
+        let heading = [chapter, map].filter { !$0.isEmpty }.joined(separator: "  ·  ")
+        draw(heading.uppercased(), Self.cardFont("semibold", 40), orange, gap: 26, kern: 4)
+        if message.isEmpty {
+            draw(loading.isEmpty ? "LOADING" : loading, Self.cardFont("bold", 124), .white, gap: 44, kern: 10)
+        } else {
+            draw(message.uppercased(), Self.cardFont("bold", 96), orange, gap: 44, kern: 6)
+        }
+        draw(tip, Self.cardFont("regular", 46), UIColor(white: 0.92, alpha: 1), gap: 34)
+        draw(description, Self.cardFont("light", 38), UIColor(white: 0.62, alpha: 1), gap: 0)
+        UIGraphicsPopContext()
+        guard let data = ctx.data else { return nil }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w,
+                                                            height: h, mipmapped: false)
+        desc.usage = .shaderRead
+        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+        tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: data,
+                    bytesPerRow: w * 4)
+        NSLog("[cp] loading card drawn: \(message.isEmpty ? loading : message)")
+        return tex
     }
     /// Matches `struct KLEq` in kl_msl_equirect (kl_reproject.c) byte for byte:
     /// two float4x4 then four uint, 144 bytes, 16-aligned. One per amplified
@@ -2878,7 +3145,10 @@ final class KleptonCompositor {
             u.srgbDecode = Self.eqSrgbDecode ? 1 : 0
             u.visible = 1
             u.test = Self.eqTest
-            u.hscale = Self.eqHScale
+            // A layer that states how much of the turn it spans (an OpenXR
+            // equirect layer does) is drawn as stated; the default is for the
+            // ones that cannot say.
+            u.hscale = ov.eq_hscale > 0 ? ov.eq_hscale : Self.eqHScale
             uniforms.append(u)
         }
         enc.setRenderPipelineState(pipe)
@@ -3072,6 +3342,19 @@ final class KleptonCompositor {
     /// here that is known to print, on a wall clock, whatever else has failed.
     /// Reported there rather than on a sample count of its own so that "the
     /// cadence line is missing" can only ever mean "no frames were presented".
+    /// The composite buffers' GPU timing since the last report, and a reset.
+    private func gpuSummary() -> String {
+        cmdLock.lock()
+        let n = gpuTimedN
+        let q = gpuQueuedSum, qm = gpuQueuedMax, r = gpuRanSum, rm = gpuRanMax
+        gpuTimedN = 0; gpuQueuedSum = 0; gpuQueuedMax = 0; gpuRanSum = 0; gpuRanMax = 0
+        cmdLock.unlock()
+        guard n > 0 else { return "" }
+        return String(format: ", composite GPU queued %.1f ms mean / %.1f max, "
+                              + "ran %.1f / %.1f",
+                      q / Double(n) * 1000, qm * 1000, r / Double(n) * 1000, rm * 1000)
+    }
+
     private func cadenceSummary() -> String {
         guard cadenceN > 0 else { return "cadence n/a (no presents yet)" }
         let meanS = cadenceSum / Double(cadenceN)
@@ -3081,6 +3364,7 @@ final class KleptonCompositor {
             + (displayPeriod > 0 ? String(format: " = %.2f periods", periods) : "")
             + ", \(cadenceRepeats)/\(cadenceN) held >=1.5, "
             + "\(missedDeadline) past deadline"
+            + gpuSummary()
             // Only when it has happened: a permanently-zero clause on the one
             // line known to print is noise, and a NON-zero one here is the
             // tracker refusing the instant the composite asked about — which is

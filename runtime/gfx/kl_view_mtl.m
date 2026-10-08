@@ -333,8 +333,6 @@ static int klvm_draw_proj_layers(id<MTLRenderCommandEncoder> enc, int eye,
     float px, py, pz, qx, qy, qz, qw;
     kl_ovrp_get_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
     simd_float4x4 device = simd_matrix4x4(simd_quaternion(qx, qy, qz, qw));
-    id<MTLBuffer> gbuf = klvm_identity_grid();
-    uint32_t gverts = kl_reproject_grid_vertices(1, 1);
     int drawn = 0;
     for (int i = 0; i < n; i++) {
         kl_ovrp_proj_layer pl = list[i];
@@ -365,11 +363,16 @@ static int klvm_draw_proj_layers(id<MTLRenderCommandEncoder> enc, int eye,
         [enc setRenderPipelineState:g_pipe_rp];
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
-        [enc setVertexBuffer:gbuf offset:0 atIndex:1];
+        // The layer's own grid, not the identity: the picture may be only part
+        // of the texture (kl_ovrp_proj_layer.rect).
+        simd_float2 lgrid[KL_PROJ_LAYER_GRID_ENTRIES];
+        kl_proj_layer_grid(&pl, lgrid);
+        [enc setVertexBytes:lgrid length:sizeof lgrid atIndex:1];
         [enc setFragmentTexture:t atIndex:0];
         [enc setFragmentTexture:t atIndex:1];
         [enc setFragmentSamplerState:g_samp atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+                vertexCount:kl_reproject_grid_vertices(1, 1)];
         drawn++;
     }
     return drawn;

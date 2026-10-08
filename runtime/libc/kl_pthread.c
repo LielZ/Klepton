@@ -1392,8 +1392,10 @@ static int      g_sem_free[KL_MAX_SEMS];
 static int      g_sem_nfree;
 static pthread_mutex_t g_sem_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void sem_trace_prime(void);   // see klb_sem_post
 int klb_sem_init(int *s, int pshared, unsigned value) {
     (void)pshared;
+    sem_trace_prime();
     int i = 0;
     pthread_mutex_lock(&g_sem_lock);
     if (g_sem_nfree) i = g_sem_free[--g_sem_nfree];
@@ -1449,10 +1451,25 @@ int klb_sem_destroy(int *s) {
     return 0;
 }
 
+// sem_post is on POSIX's async-signal-safe list and guests hold it to that:
+// IL2CPP's GC suspends a thread by signalling it, and the handler's whole body is
+// a sem_post back to the collector. getenv is NOT on that list — it takes the
+// environ lock — so reading the trace knob here deadlocked the moment the signal
+// landed on a thread that was itself inside getenv (Walkabout, on device: a
+// threadpool worker in mktime -> tzset -> getenv, then "BUG IN CLIENT OF
+// LIBPLATFORM: Trying to recursively lock an os_unfair_lock" and SIGKILL). So the
+// knob is read where a semaphore is CREATED, which is never a signal handler,
+// and sem_post only loads the answer.
+static _Atomic int g_sem_trace = -1;
+static void sem_trace_prime(void) {
+    if (atomic_load(&g_sem_trace) < 0)
+        atomic_store(&g_sem_trace, kl_env_on("KL_TRACE_SIG", 0));
+}
+
 int klb_sem_post(int *s) {
     kl_sem *k = sem_of(s);
     if (!k) { errno = EINVAL; return -1; }
-    if (kl_env_on("KL_TRACE_SIG", 0)) {
+    if (atomic_load(&g_sem_trace) > 0) {
         static _Atomic int n;
         if (atomic_fetch_add(&n, 1) < 12)
             fprintf(stderr, "  [sig] sem_post slot %d (count now %d)\n",

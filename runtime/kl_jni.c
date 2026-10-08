@@ -122,6 +122,13 @@ static unsigned g_retired[KLJ_MAX_OBJECTS];
 static unsigned g_retired_head, g_retired_tail;   // ring; head = oldest
 static unsigned g_retired_n;
 static uint64_t g_stat_alloc, g_stat_delete, g_stat_pop_freed, g_stat_freed;
+// Frameless strings retired by age — see klj_loose_note.
+#define KLJ_LOOSE_MAX 16384
+static unsigned g_loose_slot[KLJ_LOOSE_MAX];
+static void    *g_loose_data[KLJ_LOOSE_MAX];
+static unsigned g_loose_head, g_loose_n;
+static int      g_loose_on;
+static uint64_t g_stat_loose;
 
 typedef struct klj_frame {
     struct klj_frame *parent;
@@ -360,6 +367,9 @@ void kl_jni_report(FILE *out) {
                 (unsigned long long)g_stat_delete,
                 (unsigned long long)g_stat_pop_freed,
                 g_nobjects - g_retired_n, g_retired_n);
+    if (g_loose_on)
+        fprintf(out, "  frameless strings: %llu retired by age (ring of %d, %u held)\n",
+                (unsigned long long)g_stat_loose, KLJ_LOOSE_MAX, g_loose_n);
     // What leaks: live objects by class, most common first. Built for the
     // per-frame leak hunt (swap-43582 pool exhaustion).
     {
@@ -674,9 +684,53 @@ static const char *klj_GetStringUTFChars(void *env, void *jstr, uint8_t *isCopy)
 static void klj_ReleaseStringUTFChars(void *env, void *jstr, const char *chars) {
     (void)env; (void)jstr; (void)chars;   // nothing was copied, so nothing to free
 }
+// Strings a guest makes on a thread with no local frame, and never deletes.
+//
+// A native thread that attached itself has no frame to pop: on Android its local
+// references live until it deletes them or detaches, and ART's table is large
+// enough that a guest can leak one per call for hours. The pool here is not.
+// Doom3Quest's haptics do exactly that — NewStringUTF for the event name on
+// every haptic_updateevent/stopevent, some 300 a second in a level, none ever
+// deleted (host run, 2026-10-08: 45423 live java/lang/String after 150 s) —
+// which walks KLJ_MAX_OBJECTS to "object pool exhausted" and an abort after
+// about seven minutes of play (device crash report 2026-10-06 19:15).
+//
+// So such strings are kept in a ring and the oldest is RETIRED when the ring is
+// full: KLJ_LOOSE_MAX strings later, and then through the usual quarantine
+// before its slot or its bytes are reused. A guest would have to come back to a
+// string it made tens of thousands of strings ago to notice. Only for a door
+// that asks (kl_jni_reclaim_frameless_strings) — where the host makes its calls
+// inside frames this ring would never fill, but a host-side cache of an
+// unpinned frameless string is not something to find out about this way.
+void kl_jni_reclaim_frameless_strings(int on) { g_loose_on = on; }
+
+static void klj_loose_note(klj_object *o) {
+    pthread_mutex_lock(&g_lock);
+    if (g_loose_n == KLJ_LOOSE_MAX) {
+        klj_object *old = &g_objects[g_loose_slot[g_loose_head]];
+        // Still the string that was noted? The slot may have been deleted and
+        // recycled since; its payload pointer says which occupant this is.
+        if (old->magic == KLJ_OBJ_MAGIC && !old->pinned &&
+            old->cls == KLJ_CLASS_STRING && old->data == g_loose_data[g_loose_head]) {
+            klj_retire_object_locked(old);
+            g_stat_loose++;
+        }
+        g_loose_head = (g_loose_head + 1) % KLJ_LOOSE_MAX;
+        g_loose_n--;
+    }
+    unsigned at = (g_loose_head + g_loose_n) % KLJ_LOOSE_MAX;
+    g_loose_slot[at] = (unsigned)(o - g_objects);
+    g_loose_data[at] = o->data;
+    g_loose_n++;
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void *klj_NewStringUTF(void *env, const char *s) {
     (void)env;
-    return s ? kl_jni_new_string(s) : NULL;
+    if (!s) return NULL;
+    void *o = kl_jni_new_string(s);
+    if (g_loose_on && !t_frame && o) klj_loose_note(o);
+    return o;
 }
 
 // GetStringChars is the other direction, and unlike GetStringUTFChars it cannot
