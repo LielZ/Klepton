@@ -300,6 +300,81 @@ struct KeyboardEntryView: View {
     }
 }
 
+/// The three things a player may want to change, in words that do not need the
+/// port explained: how the picture is rendered, how large, and whether their
+/// own hands show. All of it is read once when the game starts, which the page
+/// says once instead of under every control.
+struct PlayerSettingsView: View {
+    @ObservedObject private var rendering = KleptonRendering.shared
+    @ObservedObject private var chroma = KleptonChroma.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            GroupBox(klT("Picture", "Bild")) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(klT("Foveated rendering", "Foveated Rendering"), isOn: $rendering.foveation)
+                    Text(klT("Keeps the middle of the picture sharp and draws the edges more coarsely. Games run more smoothly with it.",
+                             "Hält die Bildmitte scharf und zeichnet die Ränder gröber. Spiele laufen damit flüssiger."))
+                        .font(.callout).foregroundStyle(.secondary)
+                    HStack {
+                        Text(klT("Resolution", "Auflösung"))
+                        Slider(value: $rendering.renderScale, in: 0.5...1.0, step: 0.05)
+                        Text(String(format: "%.0f%%", rendering.renderScale * 100))
+                            .monospacedDigit().frame(width: 60, alignment: .trailing)
+                    }
+                    Text(klT("How finely the game is drawn. Lower it if the picture stutters when you look around.",
+                             "Wie fein das Spiel gezeichnet wird. Verringern, wenn das Bild beim Umsehen ruckelt."))
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            // Alyx hides the player's arms whatever this says (see
+            // KleptonChroma.upperLimbVisibility), so the switch would be a lie there.
+            if !klIsAlyx() {
+                GroupBox(klT("Your hands", "Deine Hände")) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Toggle(klT("Show my real hands over the game", "Meine echten Hände über dem Spiel zeigen"),
+                               isOn: $chroma.settings.handMatting)
+                        Text(klT("Most games draw their own hands or controllers, so your real ones would be a second pair in the same place.",
+                                 "Die meisten Spiele zeichnen eigene Hände oder Controller – deine echten wären dann ein zweites Paar an derselben Stelle."))
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            GroupBox(klT("Game controller", "Gamecontroller")) {
+                // Looked up again every two seconds: a controller is paired and
+                // switched on while this page is open as often as before it.
+                TimelineView(.periodic(from: .now, by: 2)) { _ in
+                    VStack(alignment: .leading, spacing: 10) {
+                        if let name = KleptonControllers.connectedGamepadName() {
+                            Label(klT("\(name) is connected.", "\(name) ist verbunden."), systemImage: "gamecontroller.fill")
+                        } else {
+                            Label(klT("No game controller connected. Pair one under Settings › Bluetooth on the Vision Pro.",
+                                      "Kein Gamecontroller verbunden. Koppeln unter Einstellungen › Bluetooth auf der Vision Pro."),
+                                  systemImage: "gamecontroller")
+                                .foregroundStyle(.secondary)
+                        }
+                        // The four face buttons are read off this game's own
+                        // layout, so the sentence cannot say something the
+                        // controller does not do.
+                        let m = KleptonControllers.faceMap
+                        let faces = "✕ = \(m.cross.uppercased()), ○ = \(m.circle.uppercased()), □ = \(m.square.uppercased()), △ = \(m.triangle.uppercased())"
+                        Text(klT("An ordinary controller works together with your hands: your hands show the game where they are and pinch to grab, the controller adds the sticks and buttons. Both sticks work as they are. The buttons stand for those of the VR controllers: \(faces); L2 and R2 are the triggers, L1 and R1 the grip buttons, Options the menu.",
+                                 "Ein gewöhnlicher Controller arbeitet mit deinen Händen zusammen: Die Hände zeigen dem Spiel, wo sie sind, und greifen per Fingertipp; der Controller bringt Sticks und Tasten mit. Beide Sticks gelten unverändert. Die Tasten stehen für die der VR-Controller: \(faces); L2 und R2 sind die Trigger, L1 und R1 die Grifftasten, Options das Menü."))
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            Label(klT("Changes to the picture apply the next time you start the game.",
+                      "Änderungen am Bild gelten ab dem nächsten Start des Spiels."),
+                  systemImage: "info.circle")
+                .font(.callout).foregroundStyle(.secondary)
+        }
+    }
+}
+
 struct BootView: View {
     @State private var log = ""
     @State private var status = "idle"
@@ -483,11 +558,12 @@ struct BootView: View {
                     // The sentence, not `status`: that is a path or an error
                     // code, as wide as the window and no use to a player. It
                     // is under Diagnostics, where the log beside it explains it.
-                    Label("The game could not be started.",
+                    Label(klT("The game could not be started.", "Das Spiel konnte nicht gestartet werden."),
                           systemImage: "exclamationmark.triangle.fill")
                         .font(.headline)
                         .foregroundStyle(.yellow)
-                    Text("Settings → Diagnostics has the details. Close the app and open it again to retry.")
+                    Text(klT("Settings → Advanced → Diagnostics has the details. Close the app and open it again to retry.",
+                             "Unter Einstellungen → Erweitert → Diagnose stehen die Einzelheiten. Für einen neuen Versuch die App schließen und wieder öffnen."))
                         .font(.callout).foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
@@ -506,7 +582,8 @@ struct BootView: View {
                         boot()
                     } label: {
                         let failed = finished && !succeeded
-                        Label(run.up ? "Running" : failed ? "Not started" : (started ? "Starting…" : "Start"),
+                        Label(run.up ? klT("Running", "Läuft") : failed ? klT("Not started", "Nicht gestartet")
+                                  : (started ? klT("Starting…", "Startet …") : klT("Start", "Start")),
                               systemImage: run.up ? "checkmark.circle.fill" : failed ? "xmark" : "play.fill")
                             .frame(minWidth: 180)
                             .foregroundStyle(started ? Color.secondary : Color.black)
@@ -520,13 +597,13 @@ struct BootView: View {
                     Button {
                         showSettings = true
                     } label: {
-                        Label("Settings", systemImage: "gearshape")
+                        Label(klT("Settings", "Einstellungen"), systemImage: "gearshape")
                     }
                     .controlSize(.extraLarge)
                     if running { ProgressView() }
                 }
                 if run.up {
-                    Button("Close this window") { dismissWindow() }
+                    Button(klT("Close this window", "Dieses Fenster schließen")) { dismissWindow() }
                         .font(.callout)
                 }
             }
@@ -541,26 +618,34 @@ struct BootView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     if isLauncher { LauncherPanel() }
+                    PlayerSettingsView()
                     if klIsAlyx() { AlyxPanel(started: running || finished || run.started) }
-                    GroupBox("Picture") { RenderingView() }
-                    DisclosureGroup("Your hands over the game") { ChromaView() }
-                    DisclosureGroup("Controller alignment") { TuningView() }
-                    if showMic {
-                        DisclosureGroup("Microphone") { MicView() }
-                    }
-                    DisclosureGroup("Diagnostics") {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text(status).font(.footnote).foregroundStyle(.secondary)
-                            if !log.isEmpty {
-                                ShareLink(item: log) {
-                                    Label("Export log", systemImage: "square.and.arrow.up")
+                    // Everything a player does not need to understand to play: the
+                    // dials of the port itself, and the report of this run.
+                    DisclosureGroup(klT("Advanced", "Erweitert")) {
+                        VStack(alignment: .leading, spacing: 14) {
+                            GroupBox(klT("Picture, in detail", "Bild, im Einzelnen")) { RenderingView() }
+                            DisclosureGroup(klT("Passthrough and chroma key", "Durchsicht und Chroma-Key")) { ChromaView() }
+                            DisclosureGroup(klT("Controller alignment", "Ausrichtung der Controller")) { TuningView() }
+                            if showMic {
+                                DisclosureGroup(klT("Microphone", "Mikrofon")) { MicView() }
+                            }
+                            DisclosureGroup(klT("Diagnostics", "Diagnose")) {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text(status).font(.footnote).foregroundStyle(.secondary)
+                                    if !log.isEmpty {
+                                        ShareLink(item: log) {
+                                            Label(klT("Export log", "Protokoll weitergeben"), systemImage: "square.and.arrow.up")
+                                        }
+                                    }
+                                    Text(log.isEmpty ? klT("Nothing has been logged yet.", "Noch nichts protokolliert.") : String(log.suffix(6000)))
+                                        .font(.system(.caption2, design: .monospaced))
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
-                            Text(log.isEmpty ? "Nothing has been logged yet." : String(log.suffix(6000)))
-                                .font(.system(.caption2, design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
+                        .padding(.top, 10)
                     }
                 }
                 .padding(.horizontal, 40).padding(.vertical, 24)
@@ -568,7 +653,7 @@ struct BootView: View {
             .navigationTitle(Self.productTitle)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { showSettings = false }
+                    Button(klT("Done", "Fertig")) { showSettings = false }
                 }
             }
         }

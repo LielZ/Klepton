@@ -211,6 +211,10 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # (targets.py "hand_matting"): Info.plist's
                         # KLHandMattingDefault is $(KL_HAND_MATTING_DEFAULT).
                         + f"\t\t\t\tKL_HAND_MATTING_DEFAULT = {1 if KLT['hand_matting'] else 0};\n"
+                        # The target's gamepad face-button layout (targets.py
+                        # "gamepad_map"), KLGamepadMap in Info.plist. Quoted: the
+                        # value carries '=' and ','.
+                        + f"\t\t\t\tKL_GAMEPAD_MAP = \"{KLT['gamepad_map']}\";\n"
                         # ...and its render-scale default (targets.py
                         # "render_scale"), KLRenderScaleDefault in Info.plist.
                         + f"\t\t\t\tKL_RENDER_SCALE_DEFAULT = {float(KLT['render_scale']):.2f};\n"
@@ -317,7 +321,7 @@ SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swif
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
          "KleptonChroma.swift", "KleptonMic.swift",
          "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonGameData.swift",
-         "KleptonAlyx.swift"]
+         "KleptonAlyx.swift", "KleptonText.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(

@@ -923,6 +923,202 @@ final class KleptonControllers {
     private static var lStickDir = (up: false, down: false, left: false, right: false)
     private static var rStickDir = (up: false, down: false, left: false, right: false)
 
+    // MARK: - A plain gamepad, alongside the hands
+
+    /// What an ordinary game controller contributes to one Touch controller:
+    /// everything except a pose. See `pollGamepad`.
+    struct PadHalf {
+        var buttons: UInt32 = 0
+        var touches: UInt32 = 0
+        var indexTrigger: Float = 0
+        var handTrigger: Float = 0
+        var stick: SIMD2<Float> = .zero
+    }
+    private var pad = [PadHalf(), PadHalf()]
+    private var padName: String?
+    private var padDir = [(up: false, down: false, left: false, right: false),
+                          (up: false, down: false, left: false, right: false)]
+
+    /// KL_GAMEPAD=0 ignores a connected gamepad altogether.
+    private static let gamepadEnabled = klEnvOn("KL_GAMEPAD", default: true)
+    /// KL_GAMEPAD_PINCH=0 — with a gamepad connected, a pinch no longer pulls
+    /// the trigger. For a game where fingers curled round the controller keep
+    /// reading as pinches; the gamepad's own triggers still work.
+    private static let gamepadKeepsPinch = klEnvOn("KL_GAMEPAD_PINCH", default: true)
+
+    /// Which Touch face button each of the gamepad's four stands for.
+    ///
+    /// The default follows position: the lower right-hand button is A, the
+    /// upper one B, and so on. A game can ask for a different layout where
+    /// that puts an action under the wrong thumb on a pad — targets.py
+    /// "gamepad_map", baked into Info.plist as KLGamepadMap, e.g.
+    /// "square=b,circle=x". KL_GAMEPAD_MAP on a launch line overrides it. It
+    /// applies to a plain gamepad ONLY: Touch and Sense controllers have the
+    /// buttons the game was written for and keep them.
+    struct FaceMap: Equatable {
+        var cross = "a", circle = "b", square = "x", triangle = "y"
+
+        /// "square=b,circle=x" laid over the default. Unknown names and values
+        /// are ignored rather than guessed at.
+        static func parse(_ text: String) -> FaceMap {
+            var m = FaceMap()
+            for pair in text.lowercased().split(separator: ",") {
+                let kv = pair.split(separator: "=").map { $0.trimmingCharacters(in: .whitespaces) }
+                guard kv.count == 2, ["a", "b", "x", "y"].contains(kv[1]) else { continue }
+                switch kv[0] {
+                case "cross", "south":    m.cross = kv[1]
+                case "circle", "east":    m.circle = kv[1]
+                case "square", "west":    m.square = kv[1]
+                case "triangle", "north": m.triangle = kv[1]
+                default: break
+                }
+            }
+            return m
+        }
+    }
+    static let faceMap: FaceMap = FaceMap.parse(
+        ProcessInfo.processInfo.environment["KL_GAMEPAD_MAP"]
+            ?? (Bundle.main.object(forInfoDictionaryKey: "KLGamepadMap") as? String) ?? "")
+
+    /// The gamepad in use, for the settings page: its name, or nil.
+    static func connectedGamepadName() -> String? { connectedGamepad()?.vendorName ?? connectedGamepad().map { _ in "Game controller" } }
+
+    private static func connectedGamepad() -> GCController? {
+        GCController.controllers().first { c in
+            guard c.extendedGamepad != nil else { return false }
+            if #available(visionOS 26.0, *) { return c.productCategory != GCProductCategorySpatialController }
+            return true
+        }
+    }
+
+    /// Read an ordinary gamepad (DualSense, DualShock 4, Xbox, any MFi
+    /// extended gamepad) as the buttons, triggers and sticks of the two Touch
+    /// controllers the guest expects.
+    ///
+    /// **It supplies no pose, and that is the point.** The hands keep doing
+    /// what they do — where each controller is, and a pinch for its trigger —
+    /// and the gamepad adds what a hand has no way to express: two analog
+    /// sticks and the face buttons. That is the shape a game like Moss was
+    /// first made for (one controller in the lap for the character, and a
+    /// hand reaching into the world), and it needs no tracked controllers.
+    ///
+    /// The layout is the Touch one, read off the gamepad where each control
+    /// sits under the same finger:
+    ///
+    ///     left stick  / L3         -> left thumbstick / click
+    ///     right stick / R3         -> right thumbstick / click
+    ///     Cross  (A, south)        -> A   (right controller, lower)
+    ///     Circle (B, east)         -> B   (right controller, upper)
+    ///     Square (X, west)         -> X   (left controller, lower)
+    ///     Triangle (Y, north)      -> Y   (left controller, upper)
+    ///     L2 / R2                  -> index triggers
+    ///     L1 / R1                  -> hand triggers (grip)
+    ///     Options / Create (Menu / View) -> Start (the menu button)
+    ///     D-pad                    -> the left stick, while that is centred
+    ///
+    /// A Sense controller still wins for its hand (see `update`): this is
+    /// merged only into a hand no tracked controller is driving.
+    private func pollGamepad() {
+        guard Self.gamepadEnabled, let c = Self.connectedGamepad(), let g = c.extendedGamepad else {
+            if padName != nil {
+                NSLog("[ctrl] gamepad gone — its buttons are released")
+                padName = nil
+            }
+            pad = [PadHalf(), PadHalf()]
+            return
+        }
+        if padName == nil {
+            padName = c.vendorName ?? "gamepad"
+            let m = Self.faceMap
+            NSLog("[ctrl] gamepad: \(padName ?? "?") — sticks, face buttons, triggers and shoulders "
+                  + "are merged into the Touch controllers alongside the hands (KL_GAMEPAD=0 turns this off); "
+                  + "cross=\(m.cross) circle=\(m.circle) square=\(m.square) triangle=\(m.triangle)"
+                  + (m == FaceMap() ? "" : " (this game's own layout)"))
+        }
+
+        var l = PadHalf(), r = PadHalf()
+        l.stick = SIMD2(g.leftThumbstick.xAxis.value, g.leftThumbstick.yAxis.value)
+        r.stick = SIMD2(g.rightThumbstick.xAxis.value, g.rightThumbstick.yAxis.value)
+        // The D-pad has no counterpart on a Touch controller. Menus are walked
+        // with the left stick, so that is what it stands in for.
+        if simd_length_squared(l.stick) < 0.15 * 0.15 {
+            let d = SIMD2(g.dpad.xAxis.value, g.dpad.yAxis.value)
+            if simd_length_squared(d) > 0.25 { l.stick = d }
+        }
+        l.indexTrigger = g.leftTrigger.value;  r.indexTrigger = g.rightTrigger.value
+        l.handTrigger = g.leftShoulder.isPressed ? 1 : 0
+        r.handTrigger = g.rightShoulder.isPressed ? 1 : 0
+
+        // The four face buttons, through this game's layout (see FaceMap). A
+        // and B live in the right controller's word, X and Y in the left one.
+        func press(_ touch: String) {
+            switch touch {
+            case "a": r.buttons |= OVRPRawButton.a; r.touches |= OVRPRawButton.a
+            case "b": r.buttons |= OVRPRawButton.b; r.touches |= OVRPRawButton.b
+            case "x": l.buttons |= OVRPRawButton.x; l.touches |= OVRPRawButton.x
+            default:  l.buttons |= OVRPRawButton.y; l.touches |= OVRPRawButton.y
+            }
+        }
+        let map = Self.faceMap
+        if g.buttonA.isPressed { press(map.cross) }
+        if g.buttonB.isPressed { press(map.circle) }
+        if g.buttonX.isPressed { press(map.square) }
+        if g.buttonY.isPressed { press(map.triangle) }
+        if g.leftThumbstickButton?.isPressed == true  { l.buttons |= OVRPRawButton.lThumbstick }
+        if g.rightThumbstickButton?.isPressed == true { r.buttons |= OVRPRawButton.rThumbstick }
+        // A trigger that is merely rested on reads a few percent; the bit is
+        // the click, so it waits for a real pull. The analog value is passed on
+        // as it is.
+        if l.indexTrigger > 0.1 { l.buttons |= OVRPRawButton.lIndexTrigger; l.touches |= OVRPRawButton.lIndexTrigger }
+        if r.indexTrigger > 0.1 { r.buttons |= OVRPRawButton.rIndexTrigger; r.touches |= OVRPRawButton.rIndexTrigger }
+        if l.handTrigger > 0 { l.buttons |= OVRPRawButton.lHandTrigger }
+        if r.handTrigger > 0 { r.buttons |= OVRPRawButton.rHandTrigger }
+        // Start on the LEFT word, where an OVRPlugin guest looks for it and
+        // where the Touch profile has `menu/click`.
+        if g.buttonMenu.isPressed || g.buttonOptions?.isPressed == true { l.buttons |= OVRPRawButton.start }
+
+        // A thumb on the stick, and the direction bits snap turn and menus read
+        // — both synthesised from the analog position exactly as for the Sense
+        // pair, with their own latches so the two sources cannot fight.
+        let onT: Float = 0.5, offT: Float = 0.4
+        func dir(_ v: Float, _ prev: Bool) -> Bool { v >= (prev ? offT : onT) }
+        for (hand, half) in [(0, l), (1, r)] {
+            var h = half
+            if simd_length_squared(h.stick) > 0.1 * 0.1 {
+                h.touches |= hand == 0 ? OVRPRawButton.lThumbstick : OVRPRawButton.rThumbstick
+            }
+            let was = padDir[hand]
+            let now = (up: dir(h.stick.y, was.up), down: dir(-h.stick.y, was.down),
+                       left: dir(-h.stick.x, was.left), right: dir(h.stick.x, was.right))
+            padDir[hand] = now
+            if hand == 0 {
+                if now.up    { h.buttons |= OVRPRawButton.lThumbstickUp }
+                if now.down  { h.buttons |= OVRPRawButton.lThumbstickDown }
+                if now.left  { h.buttons |= OVRPRawButton.lThumbstickLeft }
+                if now.right { h.buttons |= OVRPRawButton.lThumbstickRight }
+            } else {
+                if now.up    { h.buttons |= OVRPRawButton.rThumbstickUp }
+                if now.down  { h.buttons |= OVRPRawButton.rThumbstickDown }
+                if now.left  { h.buttons |= OVRPRawButton.rThumbstickLeft }
+                if now.right { h.buttons |= OVRPRawButton.rThumbstickRight }
+            }
+            pad[hand] = h
+        }
+    }
+
+    /// Lay the gamepad's half over a hand's state: bits are OR'd, the triggers
+    /// take the stronger of pinch and pull, and the stick is the gamepad's
+    /// (a hand has none).
+    private func mergePad(into st: inout KleptonHandState, hand: Int) {
+        guard padName != nil else { return }
+        let h = pad[hand]
+        st.buttons |= h.buttons
+        st.touches |= h.touches
+        st.indexTrigger = max(st.indexTrigger, h.indexTrigger)
+        st.handTrigger = max(st.handTrigger, h.handTrigger)
+        st.stick = h.stick
+    }
+
     // MARK: - Polling
 
     /// Poll the Sense controllers' buttons. Called once per frame from the
@@ -1728,6 +1924,7 @@ final class KleptonControllers {
     func update(leftHand: HandAnchor?, rightHand: HandAnchor?,
                 at presentationTime: TimeInterval) {
         pollButtons()
+        pollGamepad()
 
         // **Hands are the fallback for NO controllers, not for a missing one.**
         // With a single Sense controller in use (Walkabout is played one-handed)
@@ -1802,7 +1999,10 @@ final class KleptonControllers {
                 let byDistance = Self.pinchSrc != .system
                     && (pinchHeld[hand] ? (t > 0.30) : (t > 0.55))
                 let bySystem = Self.pinchSrc != .distance && sysSeen && sysDown
-                let pressed = byDistance || bySystem
+                // With a gamepad in use the pinch can be switched off (see
+                // gamepadKeepsPinch): the hand then only says where it is.
+                let pinchAllowed = padName == nil || Self.gamepadKeepsPinch
+                let pressed = pinchAllowed && (byDistance || bySystem)
                 if bySystem { pinchFromSystem[hand] += 1 }
                 if byDistance { pinchFromDistance[hand] += 1 }
 
@@ -1810,7 +2010,7 @@ final class KleptonControllers {
                 // laser reacts to it and a trigger that snaps 0->1 loses that —
                 // but a press pins it to 1.0 so the axis can never disagree
                 // with the bit.
-                st.indexTrigger = pressed ? 1 : t
+                st.indexTrigger = pressed ? 1 : (pinchAllowed ? t : 0)
                 pinchHeld[hand] = pressed
                 if pressed {
                     pinchFires[hand] += 1
@@ -1818,6 +2018,8 @@ final class KleptonControllers {
                                         : OVRPRawButton.rIndexTrigger
                     st.buttons |= bit; st.touches |= bit
                 }
+                // The gamepad's sticks and buttons, on top of what the hand said.
+                mergePad(into: &st, hand: hand)
             } else {
                 // Nothing tracked this hand. Leave kl_ovrp's own synthesised
                 // head-relative hand alone rather than pushing a stale pose —
@@ -1830,7 +2032,16 @@ final class KleptonControllers {
                 // the input push - pollButtons() had the trigger, the guest
                 // never saw it, and a menu gated on "press trigger" waited
                 // forever. Push the buttons; only the pose stays synthesised.
-                if st.fromController {
+                //
+                // The same holds for a gamepad, and more often: two hands
+                // wrapped round a controller in the lap are exactly the hands
+                // the tracker loses. Its buttons must not wait for a hand to be
+                // seen again.
+                if !st.fromController, padName != nil {
+                    pinchHeld[hand] = false
+                    mergePad(into: &st, hand: hand)
+                }
+                if st.fromController || padName != nil {
                     kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
                                                  st.indexTrigger, st.handTrigger,
                                                  st.stick.x, st.stick.y)

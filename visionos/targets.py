@@ -609,6 +609,13 @@ TARGETS = {
         # MoltenVK's, so for Moss this is a stored preference with no effect on
         # the picture until a Vulkan path for it exists.
         "foveation": True,
+        # On an ordinary gamepad (see KleptonControllers.pollGamepad) Quill's
+        # attack belongs on Square, where the game's first release had it and
+        # where a thumb expects it. Moss reads attack from Touch B, which the
+        # default layout puts on Circle — right for the upper button of a Touch
+        # controller, wrong for a pad. So on a pad, and only there: Square is B
+        # and Circle takes Square's X. Touch and Sense controllers are untouched.
+        "gamepad_map": "square=b,circle=x",
     },
     # ---- JKXR: ONE APK, TWO GAMES, TWO ROWS ----
     #
@@ -915,6 +922,99 @@ TARGETS = {
 DEFAULT = "beatsaber"
 
 
+# ---- an experimental target for a game this table has never met ------------
+#
+# Every row above was written by someone who had the game in front of them. An
+# installer that lets people TRY a game nobody has ported yet has no such row to
+# point at, and inventing one per game by hand is exactly the work the attempt
+# is meant to find out is worth doing.
+#
+# So one more target can be named from outside, for one build:
+#
+#     KLEPTON_GENERIC_TARGET=x<store app id>     the row's name
+#     KLEPTON_GENERIC_DISPLAY=<title>            what the app is called
+#
+# Everything else is read off the unpacked APK, which the installer puts at
+# <root>/<name>/ before anything here runs: which engine it is decides the entry
+# library, the boot sequence and where the game looks for its OBB. That is all
+# a row holds — none of the per-game adjustments the rows above carry. A game
+# that needs one will not run until it has a row of its own; this only gets it
+# as far as it gets on the engine's common path, which is the thing to report.
+#
+# The name is `x` and digits and nothing else, so it can never collide with a
+# row above or be a path. It is also the tree, the APK name and — through
+# bundle_for() — the app identifier, which keeps two such games apart on the
+# device.
+GENERIC_ENV = "KLEPTON_GENERIC_TARGET"
+
+
+def _generic_row(name):
+    import os, re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    libdir = os.path.join(root, name, "lib", "arm64-v8a")
+    try:
+        libs = set(os.listdir(libdir))
+    except OSError:
+        libs = set()
+    package, native_lib = "", ""
+    try:
+        with open(os.path.join(root, name, "AndroidManifest.xml"), errors="replace") as f:
+            manifest = f.read(400_000)
+        m = re.search(r'<manifest[^>]*\spackage="([A-Za-z0-9_.]+)"', manifest)
+        package = m.group(1) if m else ""
+        m = re.search(r'android:name="android\.app\.lib_name"\s+android:value="([A-Za-z0-9_.+-]+)"', manifest)
+        native_lib = m.group(1) if m else ""
+    except OSError:
+        pass
+    android_obb = f"Android/obb/{package}" if package else "obb"
+    if "libUE4.so" in libs:
+        kind, entry, obb = "ue4", "libUE4", android_obb
+    elif "libUnreal.so" in libs:
+        kind, entry, obb = "ue4", "libUnreal", android_obb
+    elif libs & {"libil2cpp.so", "libunity.so", "libmono.so", "libmonobdwgc-2.0.so"}:
+        # Unity asks Java for its OBB directory and gets the app's own (see the
+        # note on "obb" at the superhot row).
+        kind, entry, obb = "unity", "libmain", "obb"
+    elif "libSDL2.so" in libs:
+        kind, entry, obb = "sdl2", "libmain", "obb"
+    else:
+        # A NativeActivity names its library in the manifest; without that there
+        # is nothing to go on, and libmain is the least surprising guess.
+        kind, entry, obb = "native", ("lib" + native_lib) if native_lib else "libmain", android_obb
+    display = os.environ.get("KLEPTON_GENERIC_DISPLAY", "") or name
+    display = "".join(c for c in display if c.isprintable())[:60].strip() or name
+    return {
+        "libs": None,
+        "srcdir": f"{name}/lib/arm64-v8a",
+        "tree": name,
+        "apk": f"{name}.apk",
+        "assets": f"{name}/assets",
+        "qtplugins": "",
+        "obb": obb,
+        "entry": entry,
+        "kind": kind,
+        "product": "Klepton" + name.upper(),
+        "display": display,
+        # Wait for Start, like every installed game; and say what this is.
+        "autoboot": False,
+        "generic": True,
+    }
+
+
+def _add_generic():
+    import os, re
+    name = os.environ.get(GENERIC_ENV, "")
+    if not name or name in TARGETS:
+        return
+    if not re.fullmatch(r"x[0-9]{5,24}", name):
+        print(f"!! {GENERIC_ENV}={name!r} is not a name of the form x<digits>", file=sys.stderr)
+        sys.exit(1)
+    TARGETS[name] = _generic_row(name)
+
+
+_add_generic()
+
+
         # `"libs": None` means "whatever this tree would translate for that srcdir",
         # which the Makefile already decides — the .so files that are really ELF, minus
 # the ones we REPLACE (libOVRPlugin, libovrplatformloader, libvrapi) and the
@@ -1023,6 +1123,11 @@ def resolve(name):
     t.setdefault("video", False)
     t.setdefault("autoboot", True)
     t.setdefault("foveation", True)
+    # How a plain gamepad's four face buttons are laid over Touch A/B/X/Y where
+    # the default (cross=a, circle=b, square=x, triangle=y) puts an action under
+    # the wrong thumb for this game. "" keeps the default.
+    t.setdefault("gamepad_map", "")
+    t.setdefault("generic", False)
     # Absent means "no data panel for this target" (obb_file) or "no download"
     # (the ids); a Unity target that wants the panel states obb_file, even "".
     for k in ("obb_file", "meta_apk_id", "meta_obb_id"):

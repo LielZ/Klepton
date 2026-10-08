@@ -20,6 +20,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 eval "$(python3 targets.py "${KLEPTON_TARGET:-}")"
 export KLEPTON_TARGET="$KLT_NAME"
+
+# The runtime's copy of the target table follows targets.py. For the targets in
+# the table that is the file as checked in, and nothing is written. An
+# experimental target (KLEPTON_GENERIC_TARGET) is not in the checked-in file:
+# its row is added for this build, and the next build of anything else writes
+# the table back. Written only when it differs, so an unchanged table does not
+# make every build recompile what includes it.
+python3 targets.py --c-table > ../runtime/kl_target_table.h.new
+if cmp -s ../runtime/kl_target_table.h.new ../runtime/kl_target_table.h; then
+  rm -f ../runtime/kl_target_table.h.new
+else
+  mv ../runtime/kl_target_table.h.new ../runtime/kl_target_table.h
+  echo "  target table: rewritten for $KLT_NAME"
+fi
 # Forward target-requested knobs into the runtime environment. Some targets
 # can request host-side behaviour (for example a guest that needs to JIT).
 # The target table emits KLT_ keys; export the corresponding KL_ env var so
