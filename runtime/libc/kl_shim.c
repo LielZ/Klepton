@@ -2085,6 +2085,31 @@ typedef struct { const char *name; void *fn; } kl_entry;
 #define E(n, f)   { n, (void *)(f) }
 #define KL_FWD(n) { #n, (void *)(n) },
 
+// sched_setscheduler: bionic has it, Darwin does not (sched_setaffinity, the
+// sibling libvrlink_scene also calls, is already stubbed in kl_libc.c). Steam
+// Link asks for real-time scheduling on its streaming threads; visionOS owns
+// scheduling and exposes no equivalent, so this is advisory and reports success
+// without applying anything — the same shape as the perf-settings no-op. Was an
+// unresolved-import abort in the stream-setup phase.
+static int klb_sched_setscheduler(int pid, int policy, const void *param) {
+    (void)param;
+    // SCHED_FIFO(1)/SCHED_RR(2) is a real-time request; SCHED_OTHER(0) and the
+    // rest are "normal" and need nothing. visionOS has no RT policy, but it has
+    // QoS: map an RT request to USER_INTERACTIVE for that thread, through the
+    // same door the XR thread hint and Process.setThreadPriority(AUDIO) use.
+    // Steam Link's UDP-receive / decode / submit and audio threads flag
+    // THEMSELVES here; left a pure no-op their default QoS is coalesced behind
+    // the compositor, which reads to the sender as jitter (shaky view, pose and
+    // input timing) and drops audio buffers. pid 0 or our own tid is the self
+    // case; another tid goes through the live-thread registry.
+    if (policy == 1 || policy == 2) {
+        uint64_t self_tid = 0; pthread_threadid_np(NULL, &self_tid);
+        kl_pthread_boost_qos((pid == 0 || pid == (int)self_tid) ? self_tid
+                                                                : (uint32_t)pid);
+    }
+    return 0;
+}
+
 static const kl_entry g_shim[] = {
 #include "kl_libc_table.h"
 
@@ -2323,6 +2348,11 @@ static const kl_entry g_shim[] = {
     E("pthread_kill", klb_pthread_kill), E("pthread_sigmask", klb_pthread_sigmask),
     E("sigprocmask", klb_sigprocmask),
     E("pthread_setname_np", klb_pthread_setname_np), E("pthread_atfork", klb_pthread_atfork),
+    // pthread_getname_np: same (pthread_t, char*, size_t) on Darwin and bionic
+    // (unlike the SETTER above), so a direct forward. sched_* below are stubs:
+    // Darwin lacks them and visionOS owns scheduling.
+    E("pthread_getname_np", pthread_getname_np),
+    E("sched_setscheduler", klb_sched_setscheduler),
     E("sem_init", klb_sem_init), E("sem_destroy", klb_sem_destroy),
     E("sem_post", klb_sem_post), E("sem_wait", klb_sem_wait),
     E("sem_timedwait", klb_sem_timedwait), E("sem_getvalue", klb_sem_getvalue),

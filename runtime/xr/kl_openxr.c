@@ -589,7 +589,7 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     X(xrSetAndroidApplicationThreadKHR)                                        \
     X(xrEnumerateColorSpacesFB) X(xrSetColorSpaceFB)                          \
     X(xrCreateFoveationProfileFB) X(xrDestroyFoveationProfileFB)               \
-    X(xrUpdateSwapchainFB)                                                     \
+    X(xrUpdateSwapchainFB) X(xrGetSwapchainStateFB)                            \
     X(xrCreatePassthroughFB) X(xrDestroyPassthroughFB)                         \
     X(xrPassthroughStartFB) X(xrPassthroughPauseFB)                            \
     X(xrCreatePassthroughLayerFB) X(xrDestroyPassthroughLayerFB)               \
@@ -1946,6 +1946,24 @@ static XrResult klxr_UpdateSwapchainFB(void *swapchain, const void *state) {
         fprintf(stderr, "  [xr] xrUpdateSwapchainFB: swapchain state (fixed "
                         "foveation) accepted and not applied — the guest's eye "
                         "images are rendered at full rate\n");
+    return KLXR_SUCCESS;
+}
+
+// The getter half of XR_FB_swapchain_update_state. The guest RESOLVES it (Steam
+// Link's XR UI init does), and, unlike most, calls the pointer without checking
+// that it resolved — so a missing one is not a tidy XR_ERROR, it is a call
+// through NULL: on device that is the CODESIGNING "Invalid Page at 0" SIGKILL
+// that ended Steam Link right after its swapchains were created. Serving it is
+// what turns that into a real call. There is no dynamic state to report (the
+// update side is a no-op above), so the caller's own state struct is left as it
+// set it and the call succeeds. `state` carries a `type`/`next` header this
+// does not need to read to say "nothing changed".
+static XrResult klxr_GetSwapchainStateFB(void *swapchain, void *state) {
+    (void)swapchain; (void)state;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [xr] xrGetSwapchainStateFB: no dynamic swapchain state "
+                        "here — returning success, state left unchanged\n");
     return KLXR_SUCCESS;
 }
 
@@ -6886,6 +6904,7 @@ static void klxr_install(void) {
         {"xrCreateFoveationProfileFB",  (void *)klxr_CreateFoveationProfileFB},
         {"xrDestroyFoveationProfileFB", (void *)klxr_DestroyFoveationProfileFB},
         {"xrUpdateSwapchainFB",         (void *)klxr_UpdateSwapchainFB},
+        {"xrGetSwapchainStateFB",       (void *)klxr_GetSwapchainStateFB},
         // XR_FB_passthrough (stubbed — see above)
         {"xrCreatePassthroughFB",       (void *)klxr_CreatePassthroughFB},
         {"xrDestroyPassthroughFB",      (void *)klxr_DestroyPassthroughFB},

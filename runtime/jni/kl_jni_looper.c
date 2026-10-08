@@ -645,9 +645,14 @@ static klj_val klj_Process_setThreadPriority(void *env, void *self, const klj_va
 // provides the clock, so the guest's feeder is a producer into a ring rather
 // than something with a deadline.
 static klj_val klj_SDLAM_audioSetThreadPriority(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
-    if (n > 1) KLJ_LOG("SDLAudioManager.audioSetThreadPriority(recording=%d, device=%d) "
-                       "— not applied on Darwin", (int)a[0].j, (int)a[1].j);
+    (void)env; (void)self; (void)a; (void)n;
+    // Called ON the SDL audio thread to raise its own priority. The Java
+    // Process.setThreadPriority(AUDIO) path already maps that to QoS; do the
+    // same for this thread, or its buffer refills are scheduled behind the
+    // compositor and underrun — the periodic half-second audio dropouts Steam
+    // Link shows. Self, so the boost is exact (no tid to map).
+    uint64_t self_tid = 0; pthread_threadid_np(NULL, &self_tid);
+    kl_pthread_boost_qos(self_tid);
     return (klj_val){0};
 }
 

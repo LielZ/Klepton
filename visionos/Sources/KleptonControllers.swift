@@ -401,13 +401,51 @@ struct KLSenseTune {
     /// overshoot goes but they visibly lag, because the PC's own prediction
     /// does not cover our pipeline.
     static let sensePredictMaxMs: Double = {
-        guard let v = ProcessInfo.processInfo.environment["KL_SENSE_PREDICT_MS"],
-              let f = Double(v) else { return 50.0 }
-        return max(0.0, f)
+        if let v = ProcessInfo.processInfo.environment["KL_SENSE_PREDICT_MS"],
+           let f = Double(v) { return max(0.0, f) }
+        // Steam Link re-predicts downstream (SteamVR, to the PC's photon time),
+        // so predicting the pose forward HERE as well applies it twice and the
+        // controllers overshoot/shake. Default to the raw measured pose for it
+        // and let SteamVR do the single prediction it would do for a native
+        // controller — the velocity is still real, so gravity-glove flicks and
+        // throws (which read velocity) keep working. Native guests do not
+        // re-predict and keep the 50 ms horizon.
+        return kl_app_target_is_steamlink() != 0 ? 0.0 : 50.0
     }()
 
     static let velocityIsLocal =
         ProcessInfo.processInfo.environment["KL_SENSE_VEL_FRAME"] != "world"
+
+    /// `KL_SENSE_VEL_GATE=<m/s>` / `KL_SENSE_VEL_GATE_ANG=<rad/s>` — a NOISE GATE
+    /// on the velocity we publish, not a low-pass. visionOS's accessory velocity
+    /// is a few cm/s of noise when the hand is still, invisible in the pose but
+    /// turned into jitter once SteamVR extrapolates the render pose from it. A
+    /// low-pass killed the jitter but also lagged the pose (it starves SteamVR's
+    /// prediction) and blunted the flick (a short flick IS a short velocity
+    /// spike). A gate instead leaves fast motion ALONE — above the threshold the
+    /// real velocity passes (minus the threshold, a few-percent trim on a flick),
+    /// below it goes to zero — so a still hand is steady while a flick and
+    /// SteamVR's own prediction keep the full signal. 0 disables it; the default
+    /// is on for Steam Link only. Values are deliberately small.
+    static let velGate: Float = {
+        if let v = ProcessInfo.processInfo.environment["KL_SENSE_VEL_GATE"],
+           let f = Float(v) { return max(0.0, f) }
+        return kl_app_target_is_steamlink() != 0 ? 0.06 : 0.0
+    }()
+    static let velGateAng: Float = {
+        if let v = ProcessInfo.processInfo.environment["KL_SENSE_VEL_GATE_ANG"],
+           let f = Float(v) { return max(0.0, f) }
+        return kl_app_target_is_steamlink() != 0 ? 0.35 : 0.0
+    }()
+
+    /// Soft magnitude gate: zero below `t`, and above it subtract `t` while
+    /// keeping direction — continuous at the threshold (no pop) and a only a
+    /// small constant trim on a large, deliberate motion.
+    static func gate(_ x: SIMD3<Float>, _ t: Float) -> SIMD3<Float> {
+        if t <= 0 { return x }
+        let m = simd_length(x)
+        return m <= t || m == 0 ? .zero : x * ((m - t) / m)
+    }
 }
 
 final class KleptonControllers {
@@ -738,6 +776,12 @@ final class KleptonControllers {
         // about the frame the tracker measured in.
         var v = a.velocity, w = a.angularVelocity
         if KLSenseTune.velocityIsLocal { v = raw.act(v); w = raw.act(w) }
+        // Gate the PUBLISHED velocity: still-hand noise -> 0 (no SteamVR
+        // extrapolation jitter), real motion passes nearly untouched (flick
+        // stays crisp, and SteamVR still gets the velocity it predicts from, so
+        // no added lag).
+        v = KLSenseTune.gate(v, KLSenseTune.velGate)
+        w = KLSenseTune.gate(w, KLSenseTune.velGateAng)
         return (p, q, v, w)
     }
 
