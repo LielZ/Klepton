@@ -142,7 +142,7 @@ stage_if_needed() {
 # it, the app never did, and the run took the window path while looking like the
 # compositor had failed to come up. A knob that is set and not delivered is worse
 # than one that does not exist, so the default is now "forward it".
-FORWARD_SKIP="KL_LX_PHASE KL_LX_SYSROOT KL_LX_GAME KL_LX_XRIZER KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_SKIP_LAUNCH KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
+FORWARD_SKIP="KL_LX_PHASE KL_LX_SYSROOT KL_LX_GAME KL_LX_XRIZER KL_LX_MIRROR KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_SKIP_LAUNCH KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
 FORWARD=""
 for K in $(env | sed -n -e 's/^\(KL_[A-Za-z0-9_]*\)=.*/\1/p' \
                         -e 's/^\(MTL_[A-Za-z0-9_]*\)=.*/\1/p' \

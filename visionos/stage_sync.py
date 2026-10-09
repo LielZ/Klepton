@@ -29,6 +29,13 @@ How:
     devicectl skips files that have not changed, which is the whole of the
     incremental part; a run that was interrupted is resumed by running it again.
 
+    A hard link cannot leave its volume. With the game on another disk than
+    this checkout every "link" is a copy — 70 GB of them, onto whichever disk
+    the checkout is on (a 2 TB system disk with 79 GB free was filled this way,
+    2026-10-09). KL_LX_MIRROR=<directory> puts the mirror somewhere else: a
+    directory of its own on the game's volume, which this script empties and
+    fills, and nothing else may live in.
+
   * No symbolic links are staged. A sysroot is full of them and devicectl
     copies a link as a link, pointing wherever it pointed on this Mac. They are
     written to links.tsv instead and the app makes them at boot.
@@ -80,10 +87,35 @@ GAME_SKIP = ("bin/linuxsteamrt64", "bin/win64", "hlvr/bin/linuxsteamrt64", "hlvr
 # this machine are whatever a host run last left there, and staging them would
 # replace the settings and save games the player made on the headset. The
 # fidelity table is the app's (KleptonAlyx.swift writes it at every start).
-GAME_OWN = re.compile(r"^hlvr/(cfg/(machine|user)[^/]*\.vcfg|cfg/deckard/.+|save/.+|console\.log"
+# Not the depot's own files among them: the *_default*.vcfg the engine builds
+# the player's settings from (without them it calls the content corrupt and
+# stops), and deckard/dummy.json, which is what makes that directory exist.
+GAME_OWN = re.compile(r"^hlvr/(cfg/(machine|user)(?![^/]*_default)[^/]*\.vcfg"
+                      r"|cfg/deckard/(?!dummy\.json$).+|save/.+|console\.log"
                       r"|vr_fidelity_levels_override\.csv)$")
 # What phase "start" holds back unless the recorded run opened it.
 LAZY = re.compile(r"^hlvr/(pak01_\d+\.vpk|maps/.+|hlvr_addons/.+)$")
+
+
+def launcher_links(game):
+    """The links the game's launch script makes in bin/linuxsteamrtarm64.
+
+    A Steam depot cannot carry links, so it ships zero-byte placeholders
+    (libpango-1.0.so and friends) and hlvr.sh replaces them at launch; nothing
+    runs that script here. A tree that went through tools/lx_alyx_prepare.sh has
+    the real links already; one fetched straight from Steam has only the
+    placeholders, and ld.so stops at them ("file too short"). Same list as
+    lx_alyx_prepare.sh: read out of hlvr.sh, so it follows the depot.
+    """
+    try:
+        text = (game / "hlvr.sh").read_text(errors="replace")
+    except OSError:
+        return {}
+    m = re.search(r"linuxsteamrtarm64\)(.*?);;", text, re.S)
+    if not m:
+        return {}
+    return {f"bin/linuxsteamrtarm64/{name}": target
+            for name, target in re.findall(r'"([^":]+):([^":]+)"', m.group(1))}
 
 
 def staged_path(guest):
@@ -169,6 +201,20 @@ def build_mirror(name, phase, mirror):
     shutil.rmtree(mirror, ignore_errors=True)
     mirror.mkdir(parents=True)
     links, stats = [], {}
+    # Placeholders and missing links of the launch script: links.tsv makes them.
+    # A target may itself be one of these links (libpango-1.0.so -> .so.0).
+    wanted = launcher_links(GAME)
+    placeholders = {}
+    for rel, target in wanted.items():
+        full = GAME / rel
+        if full.is_symlink():
+            continue                    # a prepared tree: walk() records it
+        if full.exists() and not (full.is_file() and full.stat().st_size == 0):
+            continue                    # something real is there
+        to = full.parent / target
+        if not (to.exists() or to.is_symlink() or f"{os.path.dirname(rel)}/{target}" in wanted):
+            continue
+        placeholders[rel] = target
 
     def want_sys(staged, rel, full):
         if is_elf(full) and staged not in loaded:
@@ -176,6 +222,8 @@ def build_mirror(name, phase, mirror):
         return True
 
     def want_game(staged, rel, full):
+        if rel in placeholders:
+            return "placeholders of the launch script, made as links"
         if is_elf(full) and staged not in loaded:
             return "ELF files nothing loads"
         if GAME_OWN.match(rel):
@@ -189,6 +237,7 @@ def build_mirror(name, phase, mirror):
     walk(SYSROOT, "sysroot", SYSROOT_SKIP, want_sys, mirror, links, stats)
     walk(GAME, "game", GAME_SKIP, want_game, mirror, links, stats)
     walk(XRIZER / "bin", "xrizer/bin", (), lambda *a: True, mirror, links, stats)
+    links += [(f"game/{rel}", target) for rel, target in placeholders.items()]
     with open(mirror / "links.tsv", "w") as f:
         for at, target in sorted(links):
             f.write(f"{at}\t{target}\n")
@@ -230,6 +279,8 @@ def main():
         return 1
     bundle = os.environ.get("KLEPTON_BUNDLE_ID", klt["bundle"])
     mirror = HERE / "build" / "lxstage" / klt["name"] / "lx"
+    if os.environ.get("KL_LX_MIRROR"):
+        mirror = pathlib.Path(os.environ["KL_LX_MIRROR"])
 
     stats, nlinks, missing = build_mirror(klt["name"], args.phase, mirror)
     print(f"[stage] phase {args.phase}: {stats.get('files', 0)} files, "

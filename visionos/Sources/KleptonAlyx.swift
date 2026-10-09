@@ -62,6 +62,36 @@
 // of its result before the engine's post-processing reads it. The fovea is
 // fixed, not gaze-tracked — an app is not told where the eyes look — so the
 // softness is at the edge of the picture, wherever one looks.
+//
+// The fifth is the language. The game takes it from Steam, and the Steam this
+// process is given (runtime/linux/kl_lx_steam.c) says "english"; `-language
+// <name>` on the command line comes before that answer, and with it the menus
+// and the subtitles are the game's own in that language — they ship with it.
+//
+// Voices do not: Valve recorded the game in English only. What exists is fan
+// work from the Steam Workshop, an archive of the same sound files under the
+// same names, and on a PC it is an add-on that Steam's client mounts and that
+// only a game started "with add-ons" hears. There is no Steam client here and
+// no need for one: the engine has a search path of its own for exactly this,
+//
+//   Game_Language   hlvr_*LANGUAGE*
+//
+// in gameinfo.gi's SearchPaths (the way Dota 2 ships its voices), which puts
+// game/hlvr_<language> in front of game/hlvr when that is the language — for
+// every game, saved ones included. Valve's gameinfo.gi for Alyx has no such
+// line, so it is added here at a start that wants it and taken out at one that
+// does not; the archive itself is staged as game/hlvr_<language>/pak01_dir.vpk
+// by whoever installed the game. Measured on a Mac (2026-10-09): without the
+// line hlvr_german is never looked at; with it every lookup tries it first, and
+// a sound file put into a one-part pak01_dir.vpk there was read from that
+// archive and no longer from hlvr's.
+//
+// Taking the voices off the device again is the installer's to ask for and
+// this app's to finish. Nothing can be deleted in an app's container from
+// outside, only written: an installer that no longer wants the archive there
+// overwrites it with an empty file, which gives the space back at once, and an
+// archive too short to have a header is treated here as none — and removed,
+// with its folder, at the next start.
 import SwiftUI
 import Foundation
 
@@ -250,6 +280,110 @@ enum AlyxFoveation: Int, CaseIterable, Identifiable {
     }
 }
 
+enum AlyxLanguage: Int, CaseIterable, Identifiable {
+    case english, german
+
+    static let storageKey = "alyx.language"
+    static let voicesKey = "alyx.voices"
+    var id: Int { rawValue }
+
+    var title: String { self == .english ? "English" : "Deutsch" }
+
+    /// The engine's name for it: `-language <name>`, closecaption_<name>.dat,
+    /// and the folder hlvr_<name> a voice archive is staged into.
+    var engineName: String { self == .english ? "english" : "german" }
+
+    /// Where a voice archive for this language is staged. English is the
+    /// game's own recording and has no such place.
+    private var voiceArchivePlace: URL? {
+        guard self != .english,
+              let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        else { return nil }
+        return docs.appendingPathComponent("lx/game/hlvr_\(engineName)/pak01_dir.vpk")
+    }
+
+    /// The staged voice archive for this language, if there is one. A file
+    /// shorter than an archive's header (28 bytes) is not one: it is what an
+    /// installer leaves when the voices are no longer wanted.
+    var voiceArchive: URL? {
+        guard let url = voiceArchivePlace,
+              let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber,
+              size.int64Value >= 28 else { return nil }
+        return url
+    }
+
+    /// Remove what an installer left of voices it took back: the emptied
+    /// archive, and its folder if nothing else is in it.
+    static func clearWithdrawnVoices() {
+        let fm = FileManager.default
+        for language in allCases {
+            guard let url = language.voiceArchivePlace, language.voiceArchive == nil,
+                  fm.fileExists(atPath: url.path) else { continue }
+            try? fm.removeItem(at: url)
+            let folder = url.deletingLastPathComponent()
+            if (try? fm.contentsOfDirectory(atPath: folder.path))?.isEmpty == true { try? fm.removeItem(at: folder) }
+            NSLog("[app] Alyx: \(language.title) voices were withdrawn — the emptied archive is removed")
+        }
+    }
+
+    /// What a device runs with before anyone has chosen: English, as before —
+    /// unless German voices were put on it, which is somebody asking for German.
+    static var standard: AlyxLanguage {
+        AlyxLanguage.german.voiceArchive != nil ? .german : .english
+    }
+
+    static var stored: AlyxLanguage {
+        // A launch can name it (KL_ALYX_LANGUAGE=english|german).
+        if let e = getenv("KL_ALYX_LANGUAGE"),
+           let v = allCases.first(where: { $0.engineName == String(cString: e) }) { return v }
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let v = AlyxLanguage(rawValue: n) else { return standard }
+        return v
+    }
+
+    /// Whether staged voices are to be heard. On unless switched off: they are
+    /// on the device because somebody wanted them.
+    static var voicesWanted: Bool {
+        UserDefaults.standard.object(forKey: voicesKey) as? Bool ?? true
+    }
+}
+
+/// Put the language search path into the game's gameinfo.gi, or take it out —
+/// the header has the story. Only the one line is touched and the file keeps
+/// its line endings; a file that does not look as expected is left alone, which
+/// is a start with English voices and not a failed one. Staging the game again
+/// brings Valve's file back, and the next start does this again.
+@discardableResult
+private func klAlyxSetVoicePath(_ wanted: Bool) -> Bool {
+    guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+    else { return false }
+    let file = docs.appendingPathComponent("lx/game/hlvr/gameinfo.gi")
+    guard let data = try? Data(contentsOf: file),
+          let text = String(data: data, encoding: .utf8) else { return false }
+    var lines = text.components(separatedBy: "\n")
+    let have = lines.contains { $0.contains("hlvr_*LANGUAGE*") }
+    if have == wanted { return true }
+    if wanted {
+        // "SearchPaths", then its opening brace on a line of its own.
+        guard let at = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "SearchPaths" }),
+              at + 1 < lines.count,
+              lines[at + 1].trimmingCharacters(in: .whitespacesAndNewlines) == "{" else {
+            NSLog("[app] Alyx: gameinfo.gi has no SearchPaths block where one is expected — voices stay English")
+            return false
+        }
+        lines.insert("\t\t\tGame_Language\t\thlvr_*LANGUAGE*" + (lines[at + 1].hasSuffix("\r") ? "\r" : ""), at: at + 2)
+    } else {
+        lines.removeAll { $0.contains("hlvr_*LANGUAGE*") }
+    }
+    do {
+        try lines.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+        return true
+    } catch {
+        NSLog("[app] Alyx: could not write gameinfo.gi: \(error)")
+        return false
+    }
+}
+
 /// Write the fidelity table the game reads in preference to its own: nine
 /// levels, all of them the chosen scale and sample count. Returns false when the
 /// game's directory is not there yet (nothing staged), which is a start that
@@ -320,10 +454,16 @@ func klAlyxApply() {
     // The game's loading screen, where it waits for the trigger once a level
     // is ready. Off, the game is told to go on by itself.
     let loading = klAlyxLoadingScreens()
+    // The language, and whether its voices come from a staged archive.
+    AlyxLanguage.clearWithdrawnVoices()
+    let language = AlyxLanguage.stored
+    let voices = language.voiceArchive != nil && AlyxLanguage.voicesWanted
+    let voicePath = klAlyxSetVoicePath(voices)
     setenv("KL_LX_ARGS_EXTRA",
            "+vr_fidelity_level_auto 0 +vr_fidelity_level \(q.fidelityLevel) "
            + "+r_texture_pool_size \(q.texturePoolMB)"
-           + (loading ? "" : " +hlvr_auto_dismiss_loading 1"), 0)
+           + (loading ? "" : " +hlvr_auto_dismiss_loading 1")
+           + (language == .english ? "" : " -language \(language.engineName)"), 0)
     // The ceiling on the eye texture the game is offered. With the level fixed
     // the game allocates only what the level draws, so this no longer has to be
     // held down to protect memory at the small sizes.
@@ -337,7 +477,7 @@ func klAlyxApply() {
     }
     let edges = AlyxEdges.stored
     let wrote = klAlyxWriteLadder(scale: q.scale, samples: edges.rawValue)
-    NSLog("[app] Alyx picture: \(q.title), edges \(edges.title), view \(view.title), foveation \(fov.title)\(wrote ? "" : " (table NOT written)") — KL_LX_ARGS_EXTRA=\(String(cString: getenv("KL_LX_ARGS_EXTRA")))")
+    NSLog("[app] Alyx picture: \(q.title), edges \(edges.title), view \(view.title), foveation \(fov.title)\(wrote ? "" : " (table NOT written)"), language \(language.title) with \(voices ? "staged" : "the game's own") voices\(voicePath ? "" : " (gameinfo.gi NOT written)") — KL_LX_ARGS_EXTRA=\(String(cString: getenv("KL_LX_ARGS_EXTRA")))")
 }
 
 struct AlyxPanel: View {
@@ -346,6 +486,8 @@ struct AlyxPanel: View {
     @AppStorage(AlyxView.storageKey) private var view = AlyxView.full.rawValue
     @AppStorage(AlyxFoveation.storageKey) private var foveation = AlyxFoveation.standard.rawValue
     @AppStorage(klAlyxLoadingKey) private var loadingScreens = true
+    @AppStorage(AlyxLanguage.storageKey) private var language = AlyxLanguage.standard.rawValue
+    @AppStorage(AlyxLanguage.voicesKey) private var voices = true
     /// True once a run has started: the values were read at its start, so the
     /// control then describes the NEXT launch and says so.
     let started: Bool
@@ -386,6 +528,26 @@ struct AlyxPanel: View {
             }
             .pickerStyle(.segmented)
             Text((AlyxFoveation(rawValue: foveation) ?? .standard).detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Picker("Language", selection: $language) {
+                ForEach(AlyxLanguage.allCases) { l in
+                    Text(l.title).tag(l.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+            let chosen = AlyxLanguage(rawValue: language) ?? .english
+            let staged = chosen.voiceArchive != nil
+            if staged {
+                Toggle("\(chosen.title) voices", isOn: $voices)
+            }
+            Text(chosen == .english
+                 ? "Menus, subtitles and voices are English, as the game was recorded."
+                 : staged
+                   ? (voices ? "Menus and subtitles are the game's own \(chosen.title); the voices are the fan-made voice-over that was installed with the game."
+                             : "Menus and subtitles are the game's own \(chosen.title); the voices stay English.")
+                   : "Menus and subtitles are the game's own \(chosen.title); the voices stay English. "
+                     + "A fan-made voice-over can be added when the game is installed from the Mac.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             Toggle("Loading screens", isOn: $loadingScreens)

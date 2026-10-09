@@ -108,9 +108,17 @@ static int apply_links(FILE *out) {
             continue;
         } else if (errno == EINVAL) {
             // Something real is where a link belongs: the trees disagree, and
-            // the real thing is the one somebody put there on purpose.
-            kept++;
-            continue;
+            // the real thing is the one somebody put there on purpose — unless
+            // it is empty. A Steam depot cannot carry links and ships zero-byte
+            // placeholders in their place (libpango-1.0.so and friends), which
+            // an earlier staging copied here; ld.so stops at those.
+            struct stat st;
+            if (lstat(at, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 0) {
+                unlink(at);
+            } else {
+                kept++;
+                continue;
+            }
         }
         char *slash = strrchr(at, '/');
         if (slash) { *slash = 0; mkdirs(at); *slash = '/'; }
