@@ -270,6 +270,11 @@ static kl_sl_recorder g_recorder;
 static kl_sl_player g_players[KL_SL_MAX_PLAYERS];
 static int          g_audio_users;     // players that opened kl_audio (refcount)
 static unsigned     g_device_rate;     // the rate the device was opened at (first player)
+
+// A silently paced player that turns out to be the one with sound takes the
+// device — defined with the rest of the device arbitration, near the end.
+static int  pcm_has_sound(const void *pcm, size_t bytes);
+static void take_device(kl_sl_player *p);
 static pthread_mutex_t g_players_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long g_buffers_consumed;
 
@@ -350,6 +355,12 @@ static void *feeder(void *arg) {
         // draining) leaves the remainder to be paced the old way. That keeps one
         // code path for both cases: with no audio, `played` is 0 and this is
         // byte-for-byte the usleep loop it replaced.
+        // ...unless this player is paced silently while it is the one with
+        // something to say. See take_device.
+        if (buf && !p->mixes && p->bits == 16 && kl_audio_peak() == 0 &&
+            !kl_aaudio_output_rate() && pcm_has_sound(buf, size))
+            take_device(p);
+
         size_t played = (buf && p->mixes) ? kl_audio_write_src(p, buf, size) : 0;
         if (played < size) {
             uint64_t rem = ((uint64_t)size - played) / frame;
@@ -1093,6 +1104,48 @@ void kl_opensl_report(FILE *f) {
     kl_audio_report(f);
     for (unsigned i = 0; i < g_nsl; i++)
         fprintf(f, "    unimplemented: %-32s x%u\n", g_sl[i].name, g_sl[i].calls);
+}
+
+// --- two players, one device: the one that is heard keeps it ----------------
+//
+// "The first player fixes the rate" is right when the first player is the real
+// one (vampire: FMOD at 48 kHz, then UE4's near-silent 44.1 kHz output). Marvel's
+// Deadpool VR has it the other way round, and within OpenSL: Unreal's own audio
+// device opens the first player at 44.1 kHz and only ever feeds it silence, and
+// THEN Wwise opens a second OpenSL player at 48 kHz for everything the game
+// plays. That second player was paced silently, so the game had no sound at all
+// (2026-10-09) — the same shape as Moss, where the real stream is AAudio and
+// kl_opensl_yield_device below settles it.
+//
+// Order cannot tell the two cases apart, and neither can the moment a player is
+// realized (nothing has played yet). What can is the PCM itself: when a silently
+// paced player hands over samples that are not silence while the device has
+// carried nothing but silence since it was opened, that player is the one to
+// hear. It takes the device at its own rate, and the players at another rate
+// stop feeding it — they keep their own clock, exactly as before. Once anything
+// audible has gone out, the device stays where it is.
+static int pcm_has_sound(const void *pcm, size_t bytes) {
+    const int16_t *s = (const int16_t *)pcm;
+    for (size_t i = 0, n = bytes / 2; i < n; i++)
+        if (s[i]) return 1;
+    return 0;
+}
+
+static void take_device(kl_sl_player *p) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (!p->mixes && kl_audio_peak() == 0) {
+        unsigned was = g_device_rate;
+        if (kl_audio_open(p->rate, p->channels, p->bits) == 0) {
+            kl_opensl_yield_device(p->rate);
+            p->mixes = 1;
+            kl_audio_play();
+            fprintf(stderr, "  [sl] player #%d at %u Hz is the one with sound; the device, "
+                            "opened at %u Hz, has carried only silence — it takes the "
+                            "device\n", (int)(p - g_players), p->rate, was);
+        }
+    }
+    pthread_mutex_unlock(&lock);
 }
 
 // --- two APIs, one device ---------------------------------------------------

@@ -1553,21 +1553,67 @@ final class KleptonControllers {
     /// The pull is a LEVEL — what the hand should be feeling right now — not an
     /// event to schedule. Draining it unconditionally, even with playback off,
     /// keeps the two sides in step.
+    ///
+    /// **The pull happens here, on the render thread; the playing does not.**
+    /// Everything CoreHaptics does is a synchronous message to a system service
+    /// (creating an engine goes through gamecontrollerd), and a synchronous
+    /// message waits for as long as the service takes. In Marvel's Deadpool VR —
+    /// heavy, constant haptics — that service ran into its own memory limit five
+    /// minutes into a session, the engine being re-created for one hand sat in
+    /// `xpc_connection_send_message_with_reply_sync` for over two seconds, and
+    /// because that call was made from here, inside `renderFrame`, the render
+    /// loop sat with it. visionOS ends an immersive app that stops presenting:
+    /// SIGKILL from wakeboard, every thread idle, nothing in our own log
+    /// (2026-10-09). So the levels are pulled here, which keeps the guest's queue
+    /// in step exactly as before, and handed to a queue of their own. While that
+    /// queue is still busy with an earlier frame, this frame's levels are dropped:
+    /// a buzz that arrives seconds late is worse than one that is missed, and the
+    /// picture must not wait for either.
     func pumpHaptics() {
         let now = ProcessInfo.processInfo.systemUptime
+        var levels: [(level: Float, seconds: Float)] = []
         for hand in 0...1 {
             var amplitude: Float = 0, seconds: Float = 0
             let live = kl_ovrp_haptics_pull(Int32(hand), &amplitude, &seconds) != 0
-            guard Self.hapticsEnabled else { continue }
-            let level = live ? min(max(amplitude * Self.gain, 0), 1) : 0
-            traceBurst(hand: hand, level: level, at: now)
-            if Self.pulseMode || hapticPulseMode[hand] {
-                if level > 0 { playPulse(hand: hand, level: level, seconds: seconds) }
-            } else {
-                drive(hand: hand, level: level, at: now)
+            levels.append((live ? min(max(amplitude * Self.gain, 0), 1) : 0, seconds))
+        }
+        guard Self.hapticsEnabled else { return }
+
+        hapticsGate.lock()
+        let busy = hapticsBusy
+        if busy { hapticsSkipped += 1 } else { hapticsBusy = true }
+        hapticsGate.unlock()
+        if busy { return }
+
+        hapticsQueue.async { [self] in
+            for hand in 0...1 {
+                let (level, seconds) = levels[hand]
+                traceBurst(hand: hand, level: level, at: now)
+                if Self.pulseMode || hapticPulseMode[hand] {
+                    if level > 0 { playPulse(hand: hand, level: level, seconds: seconds) }
+                } else {
+                    drive(hand: hand, level: level, at: now)
+                }
+            }
+            let took = ProcessInfo.processInfo.systemUptime - now
+            hapticsGate.lock()
+            let skipped = hapticsSkipped
+            hapticsSkipped = 0
+            hapticsBusy = false
+            hapticsGate.unlock()
+            if took > 0.25 {
+                NSLog("[cp] haptics: the haptics service took \(String(format: "%.2f", took)) s to answer — "
+                      + "\(skipped) frame(s) of haptics dropped, the render loop did not wait")
             }
         }
     }
+
+    /// Where the haptics calls run (see `pumpHaptics`), and whether a batch is
+    /// still in flight.
+    private let hapticsQueue = DispatchQueue(label: "klepton.haptics", qos: .userInitiated)
+    private let hapticsGate = NSLock()
+    private var hapticsBusy = false
+    private var hapticsSkipped = 0
 
     /// The continuous path: hold one looping player per hand and move its
     /// intensity. Starting it costs a `start`; every frame after that is one

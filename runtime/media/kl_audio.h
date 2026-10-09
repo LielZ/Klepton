@@ -85,6 +85,9 @@ void kl_audio_session_ready(double sample_rate);
 unsigned kl_audio_underruns(void);
 
 void kl_audio_report(FILE *f);
+// The loudest sample any guest has handed the device so far (0..32767). Zero
+// means everything written up to now was silence.
+int  kl_audio_peak(void);
 
 // Raise the fill-target floor (ms) for a guest whose audio arrives over a
 // jittery link (Steam Link's network stream), so a short stall is buffered

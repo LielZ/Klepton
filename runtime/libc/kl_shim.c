@@ -1909,6 +1909,7 @@ X(klb_sem_open) X(klb_sem_close)
 X(klb_pthread_getschedparam) X(klb_pthread_setschedparam)
 X(klb_dlopen) X(klb_dlsym) X(klb_dlclose) X(klb_dlerror) X(klb_dladdr)
 X(klb_clock_gettime) X(klb_clock_getres) X(klb_gettimeofday)
+X(klb_clock_nanosleep) X(klb___poll_chk)
 // kl_libc_slink.c — the surface Steam Link reaches for and Beat Saber does not.
 X(klb_getauxval)
 X(klb_fegetenv) X(klb_fesetenv) X(klb_feholdexcept) X(klb_feupdateenv)
@@ -2109,6 +2110,24 @@ static int klb_sched_setscheduler(int pid, int policy, const void *param) {
     }
     return 0;
 }
+
+// pthread_attr_setinheritsched: whether a new thread takes its scheduling from
+// the attr or from the thread that creates it. Marvel's Deadpool VR (UE4) sets it
+// on every thread it starts, and with no answer the game aborted in
+// GameActivity.onCreate — "called unresolved import" — before its first frame
+// (2026-10-09). The policy and priority in a guest attr are not applied here at
+// all: thread creation reads the stack size and the detach state out of it and
+// visionOS owns scheduling, so both values lead to the same thread. Accepted for
+// bionic's two values (0 explicit, 1 inherit), EINVAL otherwise, as bionic does.
+static int klb_pthread_attr_setinheritsched(void *attr, int inherit) {
+    (void)attr;
+    return (inherit == 0 || inherit == 1) ? 0 : EINVAL;
+}
+
+// sched_getscheduler: the getter of the pair above. No thread here is ever given
+// a real-time policy (a request for one becomes a QoS boost, see
+// klb_sched_setscheduler), so SCHED_OTHER (0) is what every thread has.
+static int klb_sched_getscheduler(int pid) { (void)pid; return 0; }
 
 static const kl_entry g_shim[] = {
 #include "kl_libc_table.h"
@@ -2353,6 +2372,13 @@ static const kl_entry g_shim[] = {
     // Darwin lacks them and visionOS owns scheduling.
     E("pthread_getname_np", pthread_getname_np),
     E("sched_setscheduler", klb_sched_setscheduler),
+    E("sched_getscheduler", klb_sched_getscheduler),
+    E("pthread_attr_setinheritsched", klb_pthread_attr_setinheritsched),
+    // Deadpool VR's other imports with a plain answer. fesetround: the rounding
+    // modes are FPCR bits and have the same values on both sides, so a direct
+    // forward. mkdtemp: forwarded like mkstemp next to it in the table.
+    E("clock_nanosleep", klb_clock_nanosleep), E("__poll_chk", klb___poll_chk),
+    E("fesetround", fesetround), E("mkdtemp", mkdtemp),
     E("sem_init", klb_sem_init), E("sem_destroy", klb_sem_destroy),
     E("sem_post", klb_sem_post), E("sem_wait", klb_sem_wait),
     E("sem_timedwait", klb_sem_timedwait), E("sem_getvalue", klb_sem_getvalue),

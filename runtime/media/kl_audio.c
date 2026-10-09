@@ -769,6 +769,8 @@ size_t kl_audio_write(const void *pcm, size_t bytes) {
     return kl_audio_write_src(NULL, pcm, bytes);
 }
 
+int kl_audio_peak(void) { return g_peak; }
+
 size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
     if (!g_open || !pcm || !bytes) return 0;
     unsigned in_frame = g_in_ch * 2;              // 16-bit, checked at open

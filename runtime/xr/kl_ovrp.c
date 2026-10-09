@@ -6937,6 +6937,28 @@ static uint64_t klovrp_GetEyeTrackingEnabled(int *out) {
     return 0;
 }
 
+// Body and face tracking: the same question as eye tracking, about the Quest's
+// own body estimate and face cameras. Neither exists here — the headset gives a
+// guest its head and its hands, nothing of the torso or the face — so "not
+// supported" and "not enabled" are the truthful answers, and with them the
+// guest has no reason to start either. (Deadpool VR reads the body state all the
+// same; that and the start/stop calls say UNSUPPORTED, see the shared list
+// further down.) Marvel's Deadpool VR asks
+// whether body tracking is supported once it has loaded, seven minutes in, and
+// with no entry point it stopped there (2026-10-09). Each takes an ovrpBool* out
+// and returns ovrpResult, exactly like the eye-tracking pair above.
+#define KLOVRP_TRACKING_ABSENT(fn)                                              \
+    static uint64_t klovrp_##fn(int *out) {                                     \
+        ovrp_hit("ovrp_" #fn);                                                  \
+        if (out) *out = 0;                                                      \
+        return 0;                                                               \
+    }
+KLOVRP_TRACKING_ABSENT(GetBodyTrackingSupported)
+KLOVRP_TRACKING_ABSENT(GetBodyTrackingEnabled)
+KLOVRP_TRACKING_ABSENT(GetFullBodyTrackingEnabled)
+KLOVRP_TRACKING_ABSENT(GetFaceTrackingSupported)
+KLOVRP_TRACKING_ABSENT(GetFaceTrackingEnabled)
+
 // Mixed-reality capture — the camera composite an Oculus device does for
 // spectators. It takes no arguments and returns `ovrpBool`, not `ovrpResult`, so
 // 0 is FALSE and is the intended answer — worth saying out loud, because the two
@@ -7254,6 +7276,11 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetDepthCompositingSupported", (void *)klovrp_GetDepthCompositingSupported},
     {"ovrp_GetEyeTrackingSupported", (void *)klovrp_GetEyeTrackingSupported},
     {"ovrp_GetEyeTrackingEnabled", (void *)klovrp_GetEyeTrackingEnabled},
+    {"ovrp_GetBodyTrackingSupported", (void *)klovrp_GetBodyTrackingSupported},
+    {"ovrp_GetBodyTrackingEnabled", (void *)klovrp_GetBodyTrackingEnabled},
+    {"ovrp_GetFullBodyTrackingEnabled", (void *)klovrp_GetFullBodyTrackingEnabled},
+    {"ovrp_GetFaceTrackingSupported", (void *)klovrp_GetFaceTrackingSupported},
+    {"ovrp_GetFaceTrackingEnabled", (void *)klovrp_GetFaceTrackingEnabled},
     {"ovrp_GetMixedRealityInitialized", (void *)klovrp_GetMixedRealityInitialized},
 };
 
@@ -7598,6 +7625,32 @@ static const char *const g_ovrp_result_unsupported[] = {
     // cannot fill. Flip this to success and wire the compositor if a target
     // turns out to REQUIRE passthrough.
     "ovrp_InitializeInsightPassthrough",
+    // Parametric haptics: a newer OVRPlugin's amplitude/frequency curves, next to
+    // the buffered and PCM paths answered further up. Marvel's Deadpool VR asks
+    // for the controller's parametric properties while it sets haptics up, and
+    // with no entry point the game stopped there, two seconds in (2026-10-09).
+    // Nothing here plays a parametric effect, so UNSUPPORTED with the out-struct
+    // untouched is the truthful answer — the one a headset without the feature
+    // gives — and the guest keeps to the haptics paths that are real.
+    "ovrp_GetControllerParametricProperties",
+    // Body and face tracking, the calls behind the supported/enabled questions
+    // answered above. Deadpool VR reads ovrp_GetBodyState4 every frame once it is
+    // in the game even though it was told body tracking is neither supported nor
+    // enabled, and with no entry point it stopped there (2026-10-09). The state
+    // struct is large and its layout is not something to guess at, so it is left
+    // untouched and the call says UNSUPPORTED — which Meta's Unreal plugin treats
+    // as "no body state this frame". (Not NOT_YET_IMPLEMENTED: that one trips an
+    // ensure in the same plugin.) Starting, stopping and tuning what does not
+    // exist get the same answer.
+    "ovrp_GetBodyState4",
+    "ovrp_StartBodyTracking2",
+    "ovrp_StopBodyTracking",
+    "ovrp_RequestBodyTrackingFidelity",
+    "ovrp_ResetBodyTrackingCalibration",
+    "ovrp_SuggestBodyTrackingCalibrationOverride",
+    "ovrp_GetFaceState",
+    "ovrp_StartFaceTracking",
+    "ovrp_StopFaceTracking",
 };
 
 static void *klovrp_shared(const char *name) {

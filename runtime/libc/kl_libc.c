@@ -8,6 +8,7 @@
 #include <strings.h>
 #include <errno.h>
 #include <time.h>
+#include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -2340,6 +2341,42 @@ int klb_clock_gettime(int clk, struct timespec *ts) {
                     (long long)ts->tv_sec, ts->tv_nsec);
     }
     return r;
+}
+
+// clock_nanosleep: bionic has it, Darwin does not. Marvel's Deadpool VR (UE4)
+// imports it for its frame pacing. A relative sleep is nanosleep; an absolute
+// one (TIMER_ABSTIME, flag 1) sleeps until the GUEST's clock reads the given
+// time, so the clock id goes through the same mapping clock_gettime uses and the
+// remainder is computed from that reading. Unlike nanosleep it RETURNS the error
+// instead of setting errno, and it does not write `rem` for an absolute sleep.
+int klb_clock_nanosleep(int clk, int flags, const struct timespec *req, struct timespec *rem) {
+    int dclk = kl_clock_to_darwin(clk);
+    if (dclk < 0 || !req || req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000L)
+        return EINVAL;
+    struct timespec d = *req;
+    if (flags & 1) {
+        struct timespec now;
+        if (clock_gettime(dclk, &now) != 0) return EINVAL;
+        d.tv_sec  = req->tv_sec  - now.tv_sec;
+        d.tv_nsec = req->tv_nsec - now.tv_nsec;
+        if (d.tv_nsec < 0) { d.tv_sec--; d.tv_nsec += 1000000000L; }
+        if (d.tv_sec < 0) return 0;          // that time has already passed
+        rem = NULL;
+    }
+    return nanosleep(&d, rem) == 0 ? 0 : errno;
+}
+
+// __poll_chk: the fortified poll — same call, plus the size of the caller's
+// array so an overrun is caught. `poll` itself is forwarded as it is (the two
+// pollfd layouts and the event bits the guests use agree), so this is that
+// forward behind the one check the name promises.
+int klb___poll_chk(struct pollfd *fds, nfds_t nfds, int timeout, size_t fds_size) {
+    if (fds_size != (size_t)-1 && fds_size / sizeof *fds < nfds) {
+        fprintf(stderr, "[klepton] fatal: __poll_chk: %u descriptors in a %zu-byte array\n",
+                (unsigned)nfds, fds_size);
+        abort();
+    }
+    return poll(fds, nfds, timeout);
 }
 
 // bionic struct timeval is { int64 sec; int64 usec }; Darwin's tv_usec is a

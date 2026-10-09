@@ -194,6 +194,21 @@ void kl_jni_set_guest_native_resolver(void *(*resolve)(const char *symbol)) {
 // back later, and here it runs on the caller. The engine's own code is what
 // runs either way, and running it late is the failure that has no symptom — the
 // module list is consumed by the very next thing the game thread does.
+// ---- UE4's GetIntentExtras* family ----
+// The extras of the Intent the activity was started with: getIntent().getExtras()
+// and then a typed read, each with a null check around it. A launcher starts a
+// game with no extras, and so do we, so these are the answers Android itself
+// computes for an absent key — false, false, 0 and null — not a refusal.
+// Marvel's Deadpool VR asks for a string extra in its main init, without first
+// asking whether the key exists, and with no answer it stopped in
+// GameActivity.onResume (2026-10-09). UE turns the null into an empty FString.
+static klj_val klj_GA_intentExtraAbsent(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *k = n > 0 ? klj_str(a[0].l) : NULL;
+    KLJ_LOG("intent extra \"%s\": the activity was started without extras", k ? k : "");
+    return (klj_val){.j = 0};
+}
+
 static klj_val klj_GA_initHMDs(void *env, void *self, const klj_val *a, int n) {
     (void)a; (void)n;
     // UE5 renamed the package and the exported-native prefix in the same release
@@ -925,6 +940,14 @@ const klj_binding klj_bind_ue4[] = {
      "(Ljava/lang/String;)F", klj_GA_getMetaDataFloat},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetMetaDataString",
      "(Ljava/lang/String;)Ljava/lang/String;", klj_GA_getMetaDataString},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_HasIntentExtrasKey",
+     "(Ljava/lang/String;)Z", klj_GA_intentExtraAbsent},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetIntentExtrasBoolean",
+     "(Ljava/lang/String;)Z", klj_GA_intentExtraAbsent},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetIntentExtrasInt",
+     "(Ljava/lang/String;)I", klj_GA_intentExtraAbsent},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetIntentExtrasString",
+     "(Ljava/lang/String;)Ljava/lang/String;", klj_GA_intentExtraAbsent},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_InitHMDs", "()V", klj_GA_initHMDs},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ForceQuit", "()V", klj_GA_forceQuit},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetDesiredViewSize", "(II)V",
