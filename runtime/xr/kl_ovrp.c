@@ -7788,9 +7788,26 @@ void *kl_ovrp_sym(const char *name) {
     return fn;
 }
 
+// Entry points this plugin reports as NOT EXPORTED rather than as named stubs.
+// Only for callers that probe by dlsym and have their own fallback for a NULL:
+// a stub there reads as "present", and the first call aborts.
+//
+// The Haptics SDK (1.0.0-beta.2, Cave Crave) resolves the parametric pair and,
+// if both load, prefers its parametric driver over PCM ("Capabilities of
+// OVRPlugin backend: Parametric: true, PCM: true"). Parametric streaming is
+// not implemented here; PCM is (SetControllerHapticsPcm above). With these
+// two absent it logs "Unable to load ..." and drives the controllers over PCM
+// — the same path Beat Saber's copy of the SDK takes.
+static const char *const g_ovrp_absent[] = {
+    "ovrp_SetControllerHapticsParametric",
+    "ovrp_GetControllerParametricStreamingTimingProperties",
+};
+
 static void *kl_ovrp_sym_inner(const char *name) {
     for (size_t i = 0; i < sizeof g_ovrp_impl / sizeof g_ovrp_impl[0]; i++)
         if (strcmp(g_ovrp_impl[i].name, name) == 0) return g_ovrp_impl[i].fn;
+    for (size_t i = 0; i < sizeof g_ovrp_absent / sizeof g_ovrp_absent[0]; i++)
+        if (strcmp(g_ovrp_absent[i], name) == 0) return NULL;
     void *shared = klovrp_shared(name);
     if (shared) return shared;
     return kl_named_stub(name, (void *)klovrp_called);

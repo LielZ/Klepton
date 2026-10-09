@@ -1609,6 +1609,27 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
         if (want == 'F' || want == 'D') return (klj_val){.d = f->dval};
         return (klj_val){.j = (uint64_t)f->ival};
     }
+    // Epic Online Services' enum constants (EOSOverlay$BrowserStatus.BEGIN_LOAD,
+    // EOSLog$Level.*, ...). libEOSSDK reads every constant of its Java enums
+    // at init and keeps them as global refs to hand back into its own Java
+    // half — which is not here, so nothing ever looks inside them. What does
+    // matter is that each constant is a distinct, stable, non-null object of
+    // its own class, so one per (class, name) jfieldID, pinned for the
+    // process. Narrowed to the EOS package and to the enum shape (a static
+    // field whose type is its own class) so nothing else is answered blindly.
+    if (w->kind == 'F' && want == 'L'
+        && strncmp(w->cls, "com/epicgames/mobile/eossdk/", 28) == 0
+        && w->sig[0] == 'L' && strncmp(w->sig + 1, w->cls, strlen(w->cls)) == 0
+        && strcmp(w->sig + 1 + strlen(w->cls), ";") == 0) {
+        static void *eos_consts[KLJ_MAX_WANTED];
+        size_t idx = (size_t)(w - g_wanted);
+        if (!eos_consts[idx]) {
+            eos_consts[idx] = kl_jni_new_object(w->cls);
+            klj_as_object(eos_consts[idx])->pinned = 1;
+            KLJ_LOG("EOS enum constant %s.%s -> fresh pinned object", w->cls, w->name);
+        }
+        return (klj_val){.l = eos_consts[idx]};
+    }
     KLJ_LOG("no host value for field %s.%s %s", w->cls, w->name, w->sig);
     if (!g_permissive) {
         fprintf(stderr, "[jni] this is a work item — add it to g_fields.\n");

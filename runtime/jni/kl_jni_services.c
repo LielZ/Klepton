@@ -245,6 +245,25 @@ static klj_val klj_Sentry_close(void *env, void *self, const klj_val *a, int n) 
     return (klj_val){0};
 }
 
+// ---- Virtuix Omni: a treadmill bridge with no treadmill app to bind ----
+//
+// Unity games with Virtuix Omni support (Cave Crave) ship the OmniConnectShared
+// plugin. Its Java start(activity) loads libOmniConnectShared and binds to the
+// separate "Omni Connect" app (com.virtuix.omniconnect/.SharedMemoryService),
+// which owns the treadmill's shared memory. On a Quest without that app the
+// bind simply fails and the plugin reports no Omni — the game falls back to
+// its normal locomotion. That app cannot exist here, so start() is answered as
+// that not-installed branch: nothing is bound, nothing is loaded. Without it
+// the static call aborted at boot ("no host implementation").
+static klj_val klj_Omni_start(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("OmniConnectSharedAndroid.start() — no Omni Connect service to "
+                "bind on this host; treadmill support stays off");
+    return (klj_val){0};
+}
+
 // ---- JavaBroadcastReceiver: a subscription to a bus with no publisher ----
 //
 // Unity's helper builds an IntentFilter out of the action names it is given,
@@ -1858,6 +1877,8 @@ const klj_binding klj_bind_services[] = {
     {"com/unity3d/player/UnityPlayer", "getNetworkConnectivity", "()I",
      klj_UnityPlayer_getNetworkConnectivity},
     {"io/sentry/Sentry", "close", "()V", klj_Sentry_close},
+    {"com/virtuix/omniconnectshared/OmniConnectSharedAndroid", "start",
+     "(Lcom/unity3d/player/UnityPlayerActivity;)V", klj_Omni_start},
     {"com/unity3d/player/JavaBroadcastReceiver", "setReceiver",
      "(Landroid/content/Context;Lcom/unity3d/player/JavaBroadcastReceiverInterface;"
      "[Ljava/lang/String;)V", klj_JavaBroadcastReceiver_setReceiver},

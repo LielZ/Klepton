@@ -200,16 +200,35 @@ print(phys[0]["identifier"])
 
   echo "[3/5] building for device ${DEVID}…"
   # generic/platform, not id= : the build must not depend on the device being awake
+  BUILD_LOG="$(mktemp)"
   set +e
   xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" -configuration Debug \
     -destination 'generic/platform=visionOS' -derivedDataPath "build/dd-device-$KLT_NAME$DD_SUFFIX" \
-    -allowProvisioningUpdates build 2>&1 | grep -E 'error:|Signing Identity|\*\* BUILD'
+    -allowProvisioningUpdates build 2>&1 | grep -E 'error:|Signing Identity|\*\* BUILD' | tee "$BUILD_LOG"
   # xcodebuild's status, through the pipe. Testing for the .app is NOT enough: a
   # failed *incremental* build leaves the previous, complete and perfectly valid
   # bundle in place, so the install and launch below both succeed and run the OLD
   # binary — and the log then reads as "the change had no effect", which is the
   # most expensive possible way to be told about a compile error.
   BUILD_RC=${PIPESTATUS[0]}
+  # A developer team that has never had a device cannot be given a profile at
+  # all ("Your team has no devices from which to generate a provisioning
+  # profile"), and a generic destination registers none — so a first-time
+  # owner's very first build stops here, before the install step below that
+  # knows how to register a headset is ever reached. Build once more FOR this
+  # device: that is the one form in which Xcode may register it with the team.
+  # It needs the headset awake and reachable, which the generic build does not.
+  if [ "$BUILD_RC" != 0 ] && grep -qiE 'no devices from which to generate a provisioning profile|no devices registered' "$BUILD_LOG"; then
+    echo "  the Apple team has no device registered yet — registering this headset and building again…"
+    xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" -configuration Debug \
+      -destination "id=$DEVID" -derivedDataPath "build/dd-device-$KLT_NAME$DD_SUFFIX" \
+      -allowProvisioningUpdates -allowProvisioningDeviceRegistration build 2>&1 | grep -E 'error:|Signing Identity|\*\* BUILD' | tee "$BUILD_LOG"
+    BUILD_RC=${PIPESTATUS[0]}
+    if [ "$BUILD_RC" != 0 ]; then
+      echo "!! signing: the Apple team has no registered device, and registering this Vision Pro did not work. Keep the headset on, unlocked and on the same Wi-Fi, then try again. If it still fails, add the headset by hand: its identifier is shown in Xcode › Window › Devices and Simulators, and it goes under Certificates, Identifiers & Profiles › Devices at developer.apple.com (the team's Admin or Account Holder can do that)."
+    fi
+  fi
+  rm -f "$BUILD_LOG"
   set -e
   APP="build/dd-device-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xros/$PRODUCT.app"
   [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }

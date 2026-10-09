@@ -917,6 +917,36 @@ TARGETS = {
         "product": "KleptonAlyx",
         "display": "Half-Life Alyx",
     },
+    "x7527722310622065": {
+        # Cave Crave 1.1.4 (com.rrrgames.CaveCrave, versionCode 739), Meta Store
+        # app 7527722310622065. Unity 6 + IL2CPP. Otherwise exactly the generic
+        # store row (_generic_row) — this row exists for ONE field:
+        #
+        # The game's Addressables content ships as separate store asset files
+        # (scenematerials_*.bundle, catalog_1.1.4.*) that land BESIDE the main
+        # OBB, in Android's own obb directory, and at boot the game looks for
+        # them in getObbDir() ("[ADD] Searching for new asset files in ...")
+        # before filing them under <obb>/Bundles/. With the generic Unity "obb"
+        # the main OBB is in <files>/obb but the asset files are staged into
+        # <files>/Android/obb/<package> — two directories where Android has
+        # one — so every bundle "doesn't exist", the game reports corrupted
+        # files and loads scenes without their materials. Android's layout puts
+        # @obb and the asset files in the same place, and Unity is told that
+        # place through getObbDirs().
+        "libs":    None,
+        "srcdir":  "x7527722310622065/lib/arm64-v8a",
+        "tree":    "x7527722310622065",
+        "apk":     "x7527722310622065.apk",
+        "assets":  "x7527722310622065/assets",
+        "qtplugins": "",
+        "obb":     "Android/obb/com.rrrgames.CaveCrave",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonX7527722310622065",
+        "display": "Cave Crave",
+        "autoboot": False,
+        "generic": True,
+    },
 }
 
 DEFAULT = "beatsaber"

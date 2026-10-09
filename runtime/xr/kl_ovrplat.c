@@ -336,6 +336,8 @@ static uint64_t klplat_called(const char *name) {
 #define KLPLAT_MSG_ACHIEVEMENT_DEFS 0x03D3458Du  // .Achievements_GetAllDefinitions (empty array)
 #define KLPLAT_MSG_LOGGED_IN_USER  0x436F345Du  // .User_GetLoggedInUser (Message<User>)
 #define KLPLAT_MSG_IAP_CHECKOUT    0x3F9B0D0Du  // .IAP_LaunchCheckoutFlow (KL_PROBE_ENUM, 1.28)
+#define KLPLAT_MSG_APP_CANCEL_DL   0x7C2060DEu  // .Application_CancelAppDownload (Cave Crave's
+                                                //   global-metadata, beside GetVersion's)
 // Walkabout's own Message.MessageType values, read from its global-metadata
 // default-value blob (the same encoding that reproduces the constants above).
 // Queued only for that title — another game's enum is not these numbers.
@@ -1674,6 +1676,16 @@ static uint64_t klplat_Application_GetVersion(void) {
     return klplat_request("ovr_Application_GetVersion", KLPLAT_MSG_APP_VERSION, 0);
 }
 
+// Cancel an in-progress update download. Cave Crave asks it right after the
+// version check above. GetVersion reports no update, so no download was ever
+// started, and with no store there is nothing that could be cancelled: the
+// request completes as an error, as cancelling a download that does not exist
+// does — rather than a success claiming something was stopped.
+static uint64_t klplat_Application_CancelAppDownload(void) {
+    plat_hit("ovr_Application_CancelAppDownload");
+    return klplat_request_err("ovr_Application_CancelAppDownload", KLPLAT_MSG_APP_CANCEL_DL);
+}
+
 static uint64_t klplat_AppVersion_code(const void *h) {
     plat_hit("ovr_ApplicationVersion_GetCode");
     (void)h;
@@ -2075,6 +2087,7 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_Entitlement_GetIsViewerEntitled", (void *)klplat_Entitlement_GetIsViewerEntitled},
     {"ovr_UserAgeCategory_Get",   (void *)klplat_UserAgeCategory_Get},
     {"ovr_Application_GetVersion",(void *)klplat_Application_GetVersion},
+    {"ovr_Application_CancelAppDownload", (void *)klplat_Application_CancelAppDownload},
     {"ovr_Message_GetApplicationVersion",      (void *)klplat_Message_GetPayload},
     {"ovr_AssetFile_GetList",                  (void *)klplat_AssetFile_GetList},
     {"ovr_AssetFile_StatusByName",             (void *)klplat_AssetFile_StatusByName},

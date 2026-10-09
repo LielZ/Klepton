@@ -2840,6 +2840,39 @@ static XrPosef klxr_head_predicted(XrPosef p, const klxr_head_delta *d) {
     return p;
 }
 
+// LOCAL's height above the tracking floor. Normally kl_ovrp_eye_height(), which
+// is 0 for an OpenXR guest (it never selects an OVRPlugin origin), so LOCAL and
+// STAGE coincide — see the note in kl_openxr_space_selftest.
+//
+// Cave Crave separates them. It is a Unity XR Origin in DEVICE (eye-level)
+// mode that adds its own camera height on top of LOCAL — 1.2 m standing,
+// 0.6 m in its crawl areas — and detects crouching from the head's drop below
+// that. With LOCAL on the floor the measured head height (~1.2 m) is added to
+// the offset: the camera sits at ~2.4 m, kneeling still reads as standing, and
+// the tutorial's crouch step never completes. So for that target LOCAL is
+// what OpenXR says it is: the head's position when tracking started, i.e. the
+// first real head height seen (latched once; under 0.3 m is a frontend that
+// has not published a head yet, and is not latched).
+static float klxr_local_height(void) {
+    static int on = -1;
+    static float latched = -1.0f;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = t && strcmp(t, "x7527722310622065") == 0;
+    }
+    if (!on) return kl_ovrp_eye_height();
+    if (latched < 0.0f) {
+        float x, y, z, qx, qy, qz, qw;
+        kl_ovrp_get_guest_head_pose(&x, &y, &z, &qx, &qy, &qz, &qw);
+        if (y < 0.3f) return 0.0f;
+        latched = y;
+        fprintf(stderr, "  [xr] LOCAL origin latched at head height %.3f m "
+                        "(eye-level origin, this target)\n", latched);
+    }
+    return latched;
+}
+
 // `motion_known` reports whether lin/ang are a measurement — a frontend that
 // publishes pose only has them derived (kl_ovrp), and the first sample after a
 // gap has no basis at all. That case must reach the guest as velocityFlags == 0
@@ -2875,7 +2908,7 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
         // published poses, and reported as a measurement only when it is one.
         if (motion_known) *motion_known = kl_ovrp_head_motion(lin, ang);
     } else if (sp->reference_type == KLXR_REF_SPACE_LOCAL) {
-        base.position.y = kl_ovrp_eye_height();
+        base.position.y = klxr_local_height();
     } else if (sp->reference_type == 0) {
         // An ACTION space — anchored to whatever its pose action is following,
         // which here is one of the two hands. The pose and its motion come out
