@@ -321,6 +321,10 @@ typedef struct {
     VkCommandPool   cap_pool;
     VkCommandBuffer cap_cmd;
     VkFence         cap_fence;
+    // A few bytes of zeroes, for vertex inputs a pipeline leaves unfed
+    // (KL_VK_VIN_FILL). Created on first use.
+    VkBuffer        vin_buf;
+    VkDeviceMemory  vin_mem;
 } klvk_device;
 
 typedef struct {
@@ -854,6 +858,8 @@ static void klvk_DestroyDevice(VkDevice dev, const VkAllocationCallbacks *alloc)
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_ndev; i++)
         if (g_devs[i]->dev == dev) {
+            if (g_devs[i]->vin_buf) g_devs[i]->DestroyBuffer(dev, g_devs[i]->vin_buf, NULL);
+            if (g_devs[i]->vin_mem) g_devs[i]->FreeMemory(dev, g_devs[i]->vin_mem, NULL);
             free(g_devs[i]);
             memmove(&g_devs[i], &g_devs[i + 1], (size_t)(g_ndev - i - 1) * sizeof *g_devs);
             g_devs[--g_ndev] = NULL;
@@ -4071,6 +4077,266 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
     }
     return r;
 }
+// ---------------------------------------------------------------------------
+// KL_VK_VIN_FILL — a vertex shader input the pipeline does not supply.
+//
+// Unreal builds a pipeline's vertex input state from what the mesh's vertex
+// declaration has AND the shader reads, so a shader that reads an attribute the
+// declaration lacks gets a pipeline without it. Vulkan calls the read undefined
+// and the drivers these games shipped on take it; Metal does not compile such a
+// pipeline at all — "Vertex attribute N is not defined in the vertex
+// descriptor", or "Function requires stage_in attributes but no descriptor was
+// set" where none is supplied — and MoltenVK hands back
+// VK_ERROR_INITIALIZATION_FAILED and no pipeline. Alien: Rogue Incursion
+// (UE 5.3) has 23 of these among its first hundred and asks to quit over each.
+//
+// So a pipeline MoltenVK has just refused is looked at once more: if its vertex
+// shader has inputs at locations the state leaves out, it is created again with
+// those locations fed from one more binding — stride 0, which MoltenVK makes a
+// constant step — over a buffer of zeroes of ours, bound to that binding
+// whenever the pipeline is. The shader reads 0 there, which "undefined" allows.
+// A pipeline that compiled is never touched. Default on for that title only.
+#define KLVK_VIN_SLOTS 8192u
+#define KLVK_VIN_MAXB  16u
+// By shader module: the input locations it reads as float / int / uint.
+// By pipeline: f is the binding its zeroes are on.
+typedef struct { uint64_t key; uint32_t f, i, u; } klvk_vin_ent;
+static klvk_vin_ent g_vin_mod[KLVK_VIN_SLOTS], g_vin_pipe[KLVK_VIN_SLOTS];
+static pthread_mutex_t g_vin_mu = PTHREAD_MUTEX_INITIALIZER;
+static unsigned g_vin_pipes;        // pipelines made this way; 0 keeps the bind hooks out of it
+static int klvk_vin_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_VK_VIN_FILL", t && !strcmp(t, "x24882487241367228"));
+    }
+    return on;
+}
+// Open addressing; a key of 1 is a slot whose entry was removed.
+static void klvk_vin_put(klvk_vin_ent *tab, uint64_t key, uint32_t f, uint32_t i, uint32_t u) {
+    if (key < 2) return;
+    uint32_t s = (uint32_t)((key >> 4) * 2654435761u) % KLVK_VIN_SLOTS, at = UINT32_MAX;
+    pthread_mutex_lock(&g_vin_mu);
+    for (uint32_t n = 0; n < KLVK_VIN_SLOTS; n++, s = (s + 1) % KLVK_VIN_SLOTS) {
+        if (tab[s].key == key) { at = s; break; }
+        if (tab[s].key == 1 && at == UINT32_MAX) at = s;
+        if (!tab[s].key) { if (at == UINT32_MAX) at = s; break; }
+    }
+    if (at != UINT32_MAX) tab[at] = (klvk_vin_ent){ key, f, i, u };
+    pthread_mutex_unlock(&g_vin_mu);
+}
+static int klvk_vin_get(const klvk_vin_ent *tab, uint64_t key, klvk_vin_ent *out) {
+    if (key < 2) return 0;
+    int hit = 0;
+    uint32_t s = (uint32_t)((key >> 4) * 2654435761u) % KLVK_VIN_SLOTS;
+    pthread_mutex_lock(&g_vin_mu);
+    for (uint32_t n = 0; n < KLVK_VIN_SLOTS; n++, s = (s + 1) % KLVK_VIN_SLOTS) {
+        if (tab[s].key == key) { *out = tab[s]; hit = 1; break; }
+        if (!tab[s].key) break;
+    }
+    pthread_mutex_unlock(&g_vin_mu);
+    return hit;
+}
+static void klvk_vin_del(klvk_vin_ent *tab, uint64_t key) {
+    if (key < 2) return;
+    uint32_t s = (uint32_t)((key >> 4) * 2654435761u) % KLVK_VIN_SLOTS;
+    pthread_mutex_lock(&g_vin_mu);
+    for (uint32_t n = 0; n < KLVK_VIN_SLOTS; n++, s = (s + 1) % KLVK_VIN_SLOTS) {
+        if (tab[s].key == key) { tab[s].key = 1; break; }
+        if (!tab[s].key) break;
+    }
+    pthread_mutex_unlock(&g_vin_mu);
+}
+// The input locations of a vertex shader, by the base type it reads each as.
+// 0 for a module that is not a vertex shader or has no such input. Arrays and
+// structs are left out: a pipeline short of one of those stays refused.
+static int klvk_spirv_vertex_inputs(const uint32_t *code, size_t nwords, klvk_vin_ent *out) {
+    memset(out, 0, sizeof *out);
+    if (!code || nwords < 6 || code[0] != 0x07230203u) return 0;
+    uint32_t bound = code[3];
+    if (!bound || bound > (1u << 22)) return 0;
+    // Per id: the Location decorated on it (+1); for a type its base kind
+    // (1 float, 2 int, 3 uint) and how many locations it takes; for a pointer
+    // into the Input storage class, what it points at.
+    struct { uint32_t loc, ptr; uint8_t kind, cols, builtin; } *id = calloc(bound, sizeof *id);
+    if (!id) return 0;
+    int vertex = 0;
+#define KLVK_ID(x) ((x) < bound)
+    for (size_t i = 5; i < nwords; ) {
+        uint32_t len = code[i] >> 16, op = code[i] & 0xffffu;
+        if (!len || i + len > nwords || op == 54 /* OpFunction */) break;
+        const uint32_t *w = &code[i];
+        if (op == 15 /* OpEntryPoint */ && len >= 3) {
+            if (w[1] == 0 /* Vertex */) vertex = 1;
+        } else if (op == 71 /* OpDecorate */ && len >= 3 && KLVK_ID(w[1])) {
+            if (w[2] == 30 /* Location */ && len >= 4) id[w[1]].loc = w[3] + 1;
+            if (w[2] == 11 /* BuiltIn */) id[w[1]].builtin = 1;
+        } else if (op == 21 /* OpTypeInt */ && len >= 4 && KLVK_ID(w[1])) {
+            id[w[1]].kind = w[3] ? 2 : 3; id[w[1]].cols = 1;
+        } else if (op == 22 /* OpTypeFloat */ && len >= 3 && KLVK_ID(w[1])) {
+            id[w[1]].kind = 1; id[w[1]].cols = 1;
+        } else if (op == 23 /* OpTypeVector */ && len >= 4 && KLVK_ID(w[1]) && KLVK_ID(w[2])) {
+            id[w[1]].kind = id[w[2]].kind; id[w[1]].cols = 1;
+        } else if (op == 24 /* OpTypeMatrix */ && len >= 4 && KLVK_ID(w[1]) && KLVK_ID(w[2])) {
+            id[w[1]].kind = id[w[2]].kind; id[w[1]].cols = w[3] <= 4 ? (uint8_t)w[3] : 0;
+        } else if (op == 32 /* OpTypePointer */ && len >= 4 && KLVK_ID(w[1]) && KLVK_ID(w[3])) {
+            if (w[2] == 1 /* Input */) id[w[1]].ptr = w[3];
+        } else if (op == 59 /* OpVariable */ && len >= 4 && KLVK_ID(w[1]) && KLVK_ID(w[2]) && w[3] == 1 /* Input */) {
+            uint32_t t = id[w[1]].ptr, loc = id[w[2]].loc;
+            if (t && loc && !id[w[2]].builtin && id[t].kind)
+                for (uint32_t c = 0; c < id[t].cols && loc - 1 + c < 32; c++) {
+                    uint32_t bit = 1u << (loc - 1 + c);
+                    if (id[t].kind == 1) out->f |= bit; else if (id[t].kind == 2) out->i |= bit; else out->u |= bit;
+                }
+        }
+        i += len;
+    }
+#undef KLVK_ID
+    free(id);
+    return vertex && (out->f | out->i | out->u);
+}
+static VkBuffer klvk_vin_zero(klvk_device *d) {
+    if (!d) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_vin_mu);
+    if (!d->vin_buf && d->CreateBuffer && d->GetBufferMemoryRequirements && d->AllocateMemory &&
+        d->BindBufferMemory && d->MapMemory && d->UnmapMemory && d->DestroyBuffer && d->FreeMemory) {
+        VkBufferCreateInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64,
+            .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+        VkBuffer b = VK_NULL_HANDLE; VkDeviceMemory m = VK_NULL_HANDLE; void *p = NULL;
+        if (d->CreateBuffer(d->dev, &bi, NULL, &b) == VK_SUCCESS && b) {
+            VkMemoryRequirements mr; memset(&mr, 0, sizeof mr);
+            d->GetBufferMemoryRequirements(d->dev, b, &mr);
+            VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .allocationSize = mr.size,
+                .memoryTypeIndex = mem_type(d, mr.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
+            if (ai.memoryTypeIndex != UINT32_MAX &&
+                d->AllocateMemory(d->dev, &ai, NULL, &m) == VK_SUCCESS &&
+                d->BindBufferMemory(d->dev, b, m, 0) == VK_SUCCESS &&
+                d->MapMemory(d->dev, m, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS && p) {
+                memset(p, 0, (size_t)mr.size);
+                d->UnmapMemory(d->dev, m);
+                d->vin_buf = b; d->vin_mem = m;
+            } else {
+                d->DestroyBuffer(d->dev, b, NULL);
+                if (m) d->FreeMemory(d->dev, m, NULL);
+            }
+        }
+    }
+    VkBuffer r = d->vin_buf;
+    pthread_mutex_unlock(&g_vin_mu);
+    return r;
+}
+// One pipeline MoltenVK refused, once more with the inputs it lacks.
+static void klvk_vin_retry(PFN_vkCreateGraphicsPipelines real, VkDevice dev, VkPipelineCache cache,
+        const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *alloc, VkPipeline *out) {
+    static unsigned said;
+    klvk_vin_ent in = {0};
+    int known = 0;
+    for (uint32_t k = 0; k < ci->stageCount && ci->pStages && !known; k++) {
+        const VkPipelineShaderStageCreateInfo *st = &ci->pStages[k];
+        if (st->stage != VK_SHADER_STAGE_VERTEX_BIT) continue;
+        known = klvk_vin_get(g_vin_mod, (uint64_t)(uintptr_t)st->module, &in);
+        for (const VkBaseInStructure *x = st->pNext; x && !known; x = x->pNext)
+            if (x->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
+                const VkShaderModuleCreateInfo *m = (const VkShaderModuleCreateInfo *)x;
+                if (m->pCode && !(m->codeSize & 3u))
+                    known = klvk_spirv_vertex_inputs(m->pCode, m->codeSize / 4, &in);
+            }
+    }
+    for (uint32_t k = 0; ci->pDynamicState && k < ci->pDynamicState->dynamicStateCount; k++)
+        if (ci->pDynamicState->pDynamicStates[k] == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT) known = 0;
+    const VkPipelineVertexInputStateCreateInfo *vi = ci->pVertexInputState;
+    uint32_t nb = vi ? vi->vertexBindingDescriptionCount : 0, na = vi ? vi->vertexAttributeDescriptionCount : 0;
+    uint32_t have = 0, slot = 0;
+    for (uint32_t a = 0; a < na; a++)
+        if (vi->pVertexAttributeDescriptions[a].location < 32) have |= 1u << vi->pVertexAttributeDescriptions[a].location;
+    for (uint32_t b = 0; b < nb; b++)
+        if (vi->pVertexBindingDescriptions[b].binding >= slot) slot = vi->pVertexBindingDescriptions[b].binding + 1;
+    uint32_t reads = in.f | in.i | in.u, miss = reads & ~have;
+    if (!known || !miss || slot >= KLVK_VIN_MAXB) {
+        if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 16)
+            VKI("CreateGraphicsPipelines: a refused pipeline is not one KL_VK_VIN_FILL can help "
+                "(vertex shader %s, reads locations %#x, pipeline supplies %#x over %u binding(s))\n",
+                known ? "known" : "unknown", reads, have, nb);
+        return;
+    }
+    VkBuffer zero = klvk_vin_zero(dev_find(dev));
+    VkVertexInputBindingDescription *bd = malloc((nb + 1) * sizeof *bd);
+    VkVertexInputAttributeDescription *ad = malloc((na + 32) * sizeof *ad);
+    if (!zero || !bd || !ad) { free(bd); free(ad); return; }
+    if (nb) memcpy(bd, vi->pVertexBindingDescriptions, nb * sizeof *bd);
+    if (na) memcpy(ad, vi->pVertexAttributeDescriptions, na * sizeof *ad);
+    bd[nb] = (VkVertexInputBindingDescription){ .binding = slot, .stride = 0,
+                                                .inputRate = VK_VERTEX_INPUT_RATE_VERTEX };
+    uint32_t n = na;
+    for (uint32_t loc = 0; loc < 32; loc++)
+        if (miss & (1u << loc))
+            ad[n++] = (VkVertexInputAttributeDescription){ .location = loc, .binding = slot, .offset = 0,
+                .format = (in.f >> loc & 1) ? VK_FORMAT_R32G32B32A32_SFLOAT
+                        : (in.i >> loc & 1) ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_UINT };
+    VkPipelineVertexInputStateCreateInfo v2;
+    if (vi) v2 = *vi;
+    else { memset(&v2, 0, sizeof v2); v2.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO; }
+    v2.vertexBindingDescriptionCount = nb + 1;  v2.pVertexBindingDescriptions = bd;
+    v2.vertexAttributeDescriptionCount = n;     v2.pVertexAttributeDescriptions = ad;
+    VkGraphicsPipelineCreateInfo c = *ci;
+    c.pVertexInputState = &v2;
+    VkPipeline p = VK_NULL_HANDLE;
+    VkResult r = real(dev, cache, 1, &c, alloc, &p);
+    free(bd); free(ad);
+    if (r == VK_SUCCESS && p) {
+        klvk_vin_put(g_vin_pipe, (uint64_t)(uintptr_t)p, slot, 0, 0);
+        __atomic_add_fetch(&g_vin_pipes, 1, __ATOMIC_RELAXED);
+        *out = p;
+    }
+    unsigned s = __atomic_fetch_add(&said, 1, __ATOMIC_RELAXED);
+    if (s < 8 || (!p && s < 64))
+        VKI("CreateGraphicsPipelines: the vertex shader reads locations %#x and the pipeline "
+            "supplies %#x — refused by Metal, created again with %#x reading zeroes on "
+            "binding %u: %s (result %d)\n", reads, have, miss, slot, p ? "ok" : "STILL REFUSED", (int)r);
+}
+// What the recording thread's command buffer has bound, as the guest knows it,
+// and the binding the bound pipeline's zeroes are on (-1: none). The guest does
+// not rebind a buffer it believes is still there, so one we displaced for a
+// pipeline of the kind above is put back when another pipeline follows.
+static __thread struct {
+    void *cb; uint64_t buf[KLVK_VIN_MAXB], off[KLVK_VIN_MAXB]; uint32_t have; int k;
+} t_vin = { .k = -1 };
+static void klvk_vin_bindvb(void *cb, uint32_t binding, uint64_t buf, uint64_t off) {
+    static void (*real)(void *, uint32_t, uint32_t, const uint64_t *, const uint64_t *);
+    if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint32_t, const uint64_t *, const uint64_t *))
+        real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdBindVertexBuffers");
+    if (real && buf) real(cb, binding, 1, &buf, &off);
+}
+static void klvk_vin_begin(void *cb) {
+    if (t_vin.cb == cb) { t_vin.have = 0; t_vin.k = -1; }
+}
+static void klvk_vin_guest_bound(void *cb, uint32_t first, uint32_t count,
+        const uint64_t *bufs, const uint64_t *offs) {
+    if (!__atomic_load_n(&g_vin_pipes, __ATOMIC_RELAXED) || !bufs) return;
+    if (t_vin.cb != cb) { t_vin.cb = cb; t_vin.have = 0; t_vin.k = -1; }
+    for (uint32_t i = 0; i < count && first + i < KLVK_VIN_MAXB; i++) {
+        t_vin.buf[first + i] = bufs[i];
+        t_vin.off[first + i] = offs ? offs[i] : 0;
+        t_vin.have |= 1u << (first + i);
+    }
+    if (t_vin.k >= 0 && (uint32_t)t_vin.k >= first && (uint32_t)t_vin.k < first + count && g_devs[0])
+        klvk_vin_bindvb(cb, (uint32_t)t_vin.k, (uint64_t)(uintptr_t)g_devs[0]->vin_buf, 0);
+}
+static void klvk_vin_pipeline_bound(void *cb, uint64_t pipeline) {
+    if (!__atomic_load_n(&g_vin_pipes, __ATOMIC_RELAXED)) return;
+    klvk_vin_ent e;
+    int k = klvk_vin_get(g_vin_pipe, pipeline, &e) ? (int)e.f : -1;
+    if (t_vin.cb != cb) { t_vin.cb = cb; t_vin.have = 0; t_vin.k = -1; }
+    if (t_vin.k >= 0 && t_vin.k != k && (t_vin.have & (1u << t_vin.k)))
+        klvk_vin_bindvb(cb, (uint32_t)t_vin.k, t_vin.buf[t_vin.k], t_vin.off[t_vin.k]);
+    t_vin.k = k;
+    if (k >= 0 && g_devs[0])
+        klvk_vin_bindvb(cb, (uint32_t)k, (uint64_t)(uintptr_t)g_devs[0]->vin_buf, 0);
+}
+
 static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkPipeline *out) {
@@ -4172,6 +4438,14 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
     double t0 = kl_pipe_ms();
     VkResult r = real ? real(dev, cache, n, use, alloc, out)
                       : VK_ERROR_INITIALIZATION_FAILED;
+    if (r < 0 && real && use && out && klvk_vin_on()) {
+        uint32_t left = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!out[i]) klvk_vin_retry(real, dev, cache, &use[i], alloc, &out[i]);
+            if (!out[i]) left++;
+        }
+        if (!left) r = VK_SUCCESS;
+    }
     if (pipe_trace) { VKI("pipe-trace: DONE through #%llu (r=%d)\n", g_pipe_enter, (int)r); fflush(stderr); }
     free(mod); free(ias); free(mss);
     if (fixed) { static int said; if (said < 8) { said++;
@@ -4553,6 +4827,7 @@ static void VKAPI_CALL klvk_DestroyPipeline(VkDevice dev, uint64_t pipeline, con
         pthread_mutex_unlock(&g_ap_mu);
         if (!pipeline) return;
     }
+    if (__atomic_load_n(&g_vin_pipes, __ATOMIC_RELAXED)) klvk_vin_del(g_vin_pipe, pipeline);
     if (real) real(dev, pipeline, alloc);
 }
 static void VKAPI_CALL klvk_DestroyShaderModule(VkDevice dev, uint64_t mod, const VkAllocationCallbacks *alloc) {
@@ -4560,6 +4835,7 @@ static void VKAPI_CALL klvk_DestroyShaderModule(VkDevice dev, uint64_t mod, cons
     if (!real && real_gdpa) real = (void (*)(VkDevice, uint64_t, const VkAllocationCallbacks *))
         real_gdpa(dev, "vkDestroyShaderModule");
     klvk_ap_drain();
+    if (klvk_vin_on()) klvk_vin_del(g_vin_mod, mod);
     if (real) real(dev, mod, alloc);
 }
 static void VKAPI_CALL klvk_DestroyPipelineLayout(VkDevice dev, uint64_t layout, const VkAllocationCallbacks *alloc) {
@@ -5998,6 +6274,7 @@ static VkResult VKAPI_CALL klvk_BeginCommandBuffer(void *cb, const void *bi) {
     if (!real && real_gdpa) real = (VkResult (*)(void *, const void *))
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkBeginCommandBuffer");
     klvk_cb_set_idx(cb, 0);
+    klvk_vin_begin(cb);
     return real ? real(cb, bi) : VK_ERROR_INITIALIZATION_FAILED;
 }
 static void VKAPI_CALL klvk_CmdBindIndexBuffer(void *cb, uint64_t buffer,
@@ -6261,6 +6538,7 @@ static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64
     pipeline = klvk_ap_bind(cb, bindPoint, pipeline, &drop);
     if (drop) return;
     if (real) real(cb, bindPoint, pipeline);
+    if (bindPoint == 0 /* graphics */) klvk_vin_pipeline_bound(cb, pipeline);
 }
 // Defined in the 2D-mirror block below; used here to record the bind-time GPU copy.
 #define KLVK_BIND_SEEN 128   /* max distinct mirrors deduped per bind / push call */
@@ -6306,6 +6584,7 @@ static void VKAPI_CALL klvk_CmdBindVertexBuffers(void *cb, uint32_t first,
         break;
     }
     if (real) real(cb, first, count, buffers, offsets);
+    klvk_vin_guest_bound(cb, first, count, buffers, offsets);
 }
 
 // KL_VK_DUMP_TEXELBUF (diagnostic, default OFF) — name every UNIFORM/STORAGE
@@ -7293,6 +7572,11 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
         nk = *ci; nk.pCode = nokill; ci = &nk;
     }
     VkResult r = klvk_CreateShaderModule0(dev, ci, alloc, out);
+    if (r == VK_SUCCESS && out && ci && ci->pCode && !(ci->codeSize & 3u) && klvk_vin_on()) {
+        klvk_vin_ent in;
+        if (klvk_spirv_vertex_inputs(ci->pCode, ci->codeSize / 4, &in))
+            klvk_vin_put(g_vin_mod, (uint64_t)(uintptr_t)*out, in.f, in.i, in.u);
+    }
     if (r == VK_SUCCESS && out && ci && ci->pCode && klvk_fs_on())
         klvk_fs_put(g_fs_mod, (uint64_t)(uintptr_t)*out, klvk_fnv(ci->pCode, ci->codeSize));
     free(nokill);

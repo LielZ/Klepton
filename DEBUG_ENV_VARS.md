@@ -1042,6 +1042,13 @@ puts the camera on the ground with its hands underneath it.
   FNV hash of each stage's SPIR-V, sample count, attachment formats, view mask,
   compile time. (How it was established that the game's shipped
   `vulkan_shader_cache.foz` holds none of this build's shaders.)
+- `KL_VK_VIN_FILL=0|1` — a graphics pipeline MoltenVK refuses because its
+  vertex shader reads an input location the pipeline's vertex input state does
+  not supply ("Vertex attribute N is not defined in the vertex descriptor",
+  "Function requires stage_in attributes but no descriptor was set") is created
+  again with those locations reading zeroes from a buffer of the layer's own.
+  Pipelines that compile are untouched. Default 1 for `x24882487241367228`
+  (Alien: Rogue Incursion), else 0.
 - `KL_VK_PASS_BARRIERS=0|1|2` — what happens to a `vkCmdPipelineBarrier`
   recorded INSIDE a dynamic-rendering pass that only makes colour attachments
   readable as input attachments. MoltenVK answers one by ending the Metal pass
@@ -1198,6 +1205,18 @@ puts the camera on the ground with its hands underneath it.
   (`kl_ovrp_set_eye_texture_size`); with nothing pushed the size stays the
   Quest 2's 2290x2400 and this does nothing. The cheapest resolution knob
   there is — Unity then applies its **own** ~1.2x on top of the result.
+- `KL_OVRP_ADAPTIVE_RES=0|1` — `ovrp_GetLayerRecommendedResolution` for the eye
+  layer follows the GPU instead of always answering the full size: the time the
+  guest's frame still had to go on the GPU at frame end, averaged over 30
+  frames, is steered toward `KL_OVRP_ADAPTIVE_GPU_MS` (default 14) by scaling
+  the recommendation between 70 % and 100 %. Only a title that implements Meta's
+  dynamic resolution reads it. Default 1 for `x24882487241367228` (Alien: Rogue
+  Incursion), else 0.
+- `KL_OVRP_VIEWPORT_TOP=0|1` — read the eye layer's submitted render viewport as
+  counted from the picture's top (the rect is moved to the texture's last rows
+  before the compositors see it), which is where Unreal on Vulkan puts a
+  viewport shorter than the texture. Makes no difference to a full-height rect.
+  Default 1 for `x24882487241367228`, else 0.
 - `KL_OVRP_EYE_MAX=<px>` — cap on the longer axis of that size, default 3072,
   0 to disable. Vision Pro's logical per-eye resolution is far larger than a
   Quest's, and the guest allocates stages x eyes of RGBA16F at whatever it is
@@ -2290,6 +2309,11 @@ except its own control vars (next section).
   is opaque so passthrough shows through nowhere it matters, and seeing the
   room makes scale and IPD easier to judge. The scene manifest declares
   `UIImmersionStyleMixed` to match; keep the two in step.
+- `KL_OVERLAY_SUBMIT_ORDER=0|1` — composite the guest's quad layers in the
+  order it submitted them (no depth test between them, depth still written),
+  as a Quest's compositor does. Without it a quad's whole rectangle, transparent
+  parts included, hides whatever farther quad is submitted after it. Default 1
+  for `x24882487241367228` (Alien: Rogue Incursion), else 0.
 - `KL_GUEST_OVERLAYS=0` — stop compositing the GUEST's own non-eye layers.
   **Not the same thing as `KL_OVERLAYS` below, which is a system setting**; the
   two are one word apart and were briefly one name, which would have made each

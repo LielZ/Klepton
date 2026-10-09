@@ -830,6 +830,21 @@ static uint64_t klovrp_GetUserPresent2(int *out) {
     if (out) *out = 1;
     return OVRP_SUCCESS;
 }
+// Environment depth (Quest 3 passthrough occlusion). There is no depth pipe on
+// visionOS, so no frame is ever valid — and that has to be WRITTEN: the
+// descriptor's first field is its IsValid, and Meta's Unreal plugin hands in an
+// uninitialised local and reads it back after a success. Left untouched, Alien:
+// Rogue Incursion found a stale stack-guard value there on its first frame,
+// took the frame for valid and indexed its depth swapchain with more of the
+// same (SIGSEGV on RenderThread, 2026-10-09). wanderer's local happens to be
+// zero, which is why "success and touch nothing" was enough for it. Only that
+// one field is written; the rest of the struct is not read behind a false.
+static uint64_t klovrp_GetEnvironmentDepthFrameDesc(int eye, int *desc) {
+    ovrp_hit("ovrp_GetEnvironmentDepthFrameDesc");
+    (void)eye;
+    if (desc) *desc = 0;    // ovrpEnvironmentDepthFrameDesc.IsValid = ovrpBool_False
+    return OVRP_SUCCESS;
+}
 static uint64_t klovrp_GetNodePresent2(int node, int *out) {
     ovrp_hit("ovrp_GetNodePresent2");
     // node comes FIRST (real 0x16f450: w0 = ovrpNode, x1 = int* out) — the
@@ -1107,6 +1122,64 @@ static uint64_t klovrp_SetSystemDisplayFrequency(float hz) {
                     "display runs at %.1f Hz and cannot switch\n",
             (double)hz, (double)have);
     return -1001;                     // ovrpFailure_InvalidParameter
+}
+
+// KL_OVRP_ADAPTIVE_RES — the eye layer's recommended resolution follows the GPU.
+//
+// Meta's dynamic resolution is the runtime telling the application, frame by
+// frame, how large an eye picture the GPU can afford
+// (ovrp_GetLayerRecommendedResolution), and the application moving its render
+// viewport toward that inside the eye texture it already has. Answered with the
+// full size every time, a title built on it renders at its maximum whatever
+// that costs: Alien: Rogue Incursion sat at 3028x2464 an eye and 16-20 frames a
+// second outdoors, the GPU taking 45-50 ms a frame (2026-10-09).
+//
+// The load is the time the guest's frame still had to go on the GPU when the
+// guest called it done (measured at frame end, below) — near zero for a guest
+// the GPU keeps up with, most of the frame for one it does not. Averaged over
+// 30 frames; the scale goes down by the square root of the overshoot (GPU time
+// follows the pixel count), at most 8 % a step and never below 70 %, and back
+// up 3 % a step once there is room. The application smooths it on its side.
+//   KL_OVRP_ADAPTIVE_RES=0|1     default 1 for that title, else 0
+//   KL_OVRP_ADAPTIVE_GPU_MS=<ms> the wait it steers toward, default 14
+static float g_adapt_scale = 1.0f;
+static int klovrp_adapt_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_OVRP_ADAPTIVE_RES", t && !strcmp(t, "x24882487241367228"));
+    }
+    return on;
+}
+static void klovrp_adapt_note(double wait_ms) {
+    if (!klovrp_adapt_on()) return;
+    static double sum;
+    static unsigned n, changes;
+    static float target = -1.0f;
+    if (target < 0) {
+        target = kl_env_float("KL_OVRP_ADAPTIVE_GPU_MS", 14.0f);
+        if (!(target >= 2.0f && target <= 100.0f)) target = 14.0f;
+    }
+    sum += wait_ms;
+    if (++n < 30) return;
+    double mean = sum / n;
+    sum = 0; n = 0;
+    float s = g_adapt_scale;
+    if (mean > target * 1.15) {
+        float k = sqrtf(target / (float)mean);
+        s *= k < 0.92f ? 0.92f : k;
+    } else if (mean < target * 0.80 && s < 1.0f) {
+        s *= 1.03f;
+    }
+    if (s > 1.0f) s = 1.0f;
+    if (s < 0.70f) s = 0.70f;
+    if (s == g_adapt_scale) return;
+    g_adapt_scale = s;
+    if (changes++ < 12 || changes % 50 == 0)
+        fprintf(stderr, "  [ovrp] adaptive resolution: the GPU had %.1f ms to go at frame end "
+                        "(target %.0f) — recommending %.0f%% of the eye size (change %u)\n",
+                mean, (double)target, (double)s * 100.0, changes);
 }
 
 // The per-eye render target size. Quest 2's recommendation until a frontend
@@ -3222,6 +3295,7 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
         static double sum_ms, worst_ms;
         static unsigned n;
         double ms = (double)(klovrp_mono_ns() - t0) / 1e6;
+        klovrp_adapt_note(ms);
         sum_ms += ms;
         if (ms > worst_ms) worst_ms = ms;
         if (++n % 600 == 0) {
@@ -5778,6 +5852,25 @@ static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[
                     l->desc.texture_size.w > 0
                         ? 100.0 * (double)vp[2] / (double)l->desc.texture_size.w : 0.0);
         }
+        // The compositors read the rect as rows counted from the texture's
+        // first row, which is where a GL guest's y=0 is. Unreal on Vulkan counts
+        // its rect from the picture's TOP, and its picture lies the other way up
+        // in the texture, so a shortened rect sits against the LAST row: taken
+        // as it stands, Alien: Rogue Incursion at 73 % showed the lower part of
+        // the picture and, under it, rows nothing had drawn since the viewport
+        // shrank (2026-10-09). A full-height rect is the same either way, which
+        // is all any Vulkan guest had submitted until then.
+        //   KL_OVRP_VIEWPORT_TOP=0|1   default 1 for that title, else 0
+        static int top = -1;
+        if (top < 0) {
+            const char *t = kl_driver_target_name();
+            top = kl_env_on("KL_OVRP_VIEWPORT_TOP", t && !strcmp(t, "x24882487241367228"));
+        }
+        if (top && l->desc.texture_size.h > 0)
+            for (int eye = 0; eye < 2; eye++) {
+                int y = l->desc.texture_size.h - (vp[eye * 4 + 1] + vp[eye * 4 + 3]);
+                vp[eye * 4 + 1] = y > 0 ? y : 0;
+            }
         return 1;
     }
     return 0;
@@ -6312,6 +6405,15 @@ static uint64_t klovrp_GetLayerRecommendedResolution(int layer_id, ovrp_sizei *o
     } else {
         int w = 0, h = 0; kl_ovrp_eye_texture_size(&w, &h);
         out->w = w; out->h = h;
+    }
+    // The eye layer's follows the GPU where that is asked for (klovrp_adapt_note).
+    if (klovrp_adapt_on() && (!l || l->is_eye)) {
+        static int said;
+        if (!said++) fprintf(stderr, "  [ovrp] ovrp_GetLayerRecommendedResolution is asked for the eye "
+                                     "layer (%dx%d) — KL_OVRP_ADAPTIVE_RES answers it\n", out->w, out->h);
+        float k = g_adapt_scale;
+        out->w = ((int)((float)out->w * k + 0.5f) + 1) & ~1;
+        out->h = ((int)((float)out->h * k + 0.5f) + 1) & ~1;
     }
     return OVRP_SUCCESS;
 }
@@ -7170,6 +7272,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetAppHasVrFocus2", (void *)klovrp_GetAppHasVrFocus2},
     {"ovrp_GetUserPresent2", (void *)klovrp_GetUserPresent2},
     {"ovrp_GetNodePresent2", (void *)klovrp_GetNodePresent2},
+    {"ovrp_GetEnvironmentDepthFrameDesc", (void *)klovrp_GetEnvironmentDepthFrameDesc},
     {"ovrp_GetNodeOrientationTracked2", (void *)klovrp_GetNodeOrientationTracked2},
     {"ovrp_GetSystemBatteryTemperature2", (void *)klovrp_GetSystemBatteryTemperature2},
     {"ovrp_GetSystemBatteryLevel2", (void *)klovrp_GetSystemBatteryLevel2},
@@ -7368,10 +7471,8 @@ static const char *const g_ovrp_result_ok[] = {
     // out reads as "profile 0"; controllers still flow through GetControllerState6, so
     // this only gates a binding-string lookup the guest does not need on this path.
     "ovrp_GetCurrentInteractionProfile",
-    // Environment depth (Quest 3 passthrough occlusion) — wanderer probes the frame
-    // descriptor. No depth pipe on visionOS; success + a zeroed desc reads as an
-    // empty/absent depth frame, which the guest treats as "no occlusion this frame".
-    "ovrp_GetEnvironmentDepthFrameDesc",
+    // (ovrp_GetEnvironmentDepthFrameDesc was here; it has to write its answer —
+    // see klovrp_GetEnvironmentDepthFrameDesc.)
     // Controller haptics — wanderer fires it the frame after it starts submitting
     // eye layers. No haptics sink on visionOS controllers here; accept and drop.
     "ovrp_SetControllerLocalizedVibration",
