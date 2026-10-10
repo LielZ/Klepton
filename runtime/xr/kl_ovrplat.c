@@ -1642,8 +1642,12 @@ static int klplat_user_default(void) {
     // above klplat_User_GetLoggedInUser: the entitlement check passes, this
     // request then fails with "An unknown error occurred. Request failed." and
     // the game never leaves its loading screen.
+    // Maestro (x6963344583787383, UE4): UMaestroGameInstance binds its QuitGame
+    // to the OnlineSubsystem's login-complete delegate; with no user the login
+    // fails and the game calls FGenericPlatformMisc::RequestExit(true) — abort —
+    // right after its first controller poll, before a frame is drawn.
     static const char *on[] = { "zix", "intotheradius", "redmatter2", "vampire", "twd2",
-                                "walkabout", "moss", "x5812519008825194" };
+                                "walkabout", "moss", "x5812519008825194", "x6963344583787383" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;

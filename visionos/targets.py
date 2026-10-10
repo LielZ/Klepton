@@ -1031,6 +1031,22 @@ def _generic_row(name):
     }
 
 
+# What a store game is known to need on top of the generic row, where that is a
+# DEFAULT of a setting and nothing about how it is built — so the row stays the
+# one read off its APK and only the field named here differs.
+STORE_DEFAULTS = {
+    # Assassin's Creed Nexus VR. In-game video on: its loading screens play a
+    # clip through Unity's VideoPlayer, and with the Vulkan refusal
+    # (kl_mediandk.c, klm_extractor_enabled) the game opened that clip again on
+    # every frame of the loading screen, each failed attempt keeping about
+    # 0.6 MB — 50 MB a second, 2.4 GB over one long load, and the world's own
+    # textures then went over the process limit (the app was killed on arrival).
+    # Its Unity decodes with no surface and uploads the bytes itself, like
+    # Arkham Shadow's, which is the path that is served.
+    "x5812519008825194": {"video": True},
+}
+
+
 def _add_generic():
     import os, re
     name = os.environ.get(GENERIC_ENV, "")
@@ -1039,7 +1055,7 @@ def _add_generic():
     if not re.fullmatch(r"x[0-9]{5,24}", name):
         print(f"!! {GENERIC_ENV}={name!r} is not a name of the form x<digits>", file=sys.stderr)
         sys.exit(1)
-    TARGETS[name] = _generic_row(name)
+    TARGETS[name] = {**_generic_row(name), **STORE_DEFAULTS.get(name, {})}
 
 
 _add_generic()
