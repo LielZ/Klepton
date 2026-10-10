@@ -1918,7 +1918,7 @@ X(klb_epoll_create) X(klb_epoll_create1) X(klb_epoll_ctl) X(klb_epoll_wait)
 X(klb_openat) X(klb___open_2)
 X(klb___memmove_chk) X(klb___strncpy_chk) X(klb___strncpy_chk2) X(klb___strcat_chk)
 X(klb___read_chk) X(klb___vsprintf_chk)
-X(klv___sprintf_chk) X(klv___snprintf_chk)
+X(klv___sprintf_chk) X(klv___snprintf_chk) X(klv_swprintf) X(kl_vswprintf_g)
 X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk) X(klb_pread64) X(klb_pwrite64)
 X(klb___strncat_chk) X(klb_ftruncate64) X(klb___fwrite_chk)
 X(klb_fopen64) X(klb_fseeko64) X(klb_ftello64) X(klb_exit) X(klb__exit) X(klb_chdir) X(klb_getcwd) X(klb_realpath)
@@ -2128,6 +2128,12 @@ static int klb_pthread_attr_setinheritsched(void *attr, int inherit) {
 // a real-time policy (a request for one becomes a QoS boost, see
 // klb_sched_setscheduler), so SCHED_OTHER (0) is what every thread has.
 static int klb_sched_getscheduler(int pid) { (void)pid; return 0; }
+// sched_getparam: bionic's struct sched_param is ONE int; Darwin's carries
+// four more opaque bytes, so forwarding would write past the guest's struct.
+// Same answer as the getter above: priority 0 under SCHED_OTHER.
+static int klb_sched_getparam(int pid, int *param) { (void)pid; if (param) *param = 0; return 0; }
+// sched_getcpu: no Darwin equivalent; CPU 0 is a valid answer for "where am I".
+static int klb_sched_getcpu(void) { return 0; }
 
 static const kl_entry g_shim[] = {
 #include "kl_libc_table.h"
@@ -2163,7 +2169,7 @@ static const kl_entry g_shim[] = {
     E("send", kl_send), E("recv", kl_recv),
     E("getsockname", kl_getsockname),
     E("strtold", klv_strtold), E("wcstold", klv_wcstold), E("strtold_l", klv_strtold_l),
-    E("swprintf", klb_swprintf), E("execl", klb_execl), E("system", klb_system),
+    E("swprintf", klv_swprintf), E("vswprintf", kl_vswprintf_g), E("execl", klb_execl), E("system", klb_system),
     E("syscall", klb_syscall),
 
     // guest va_list consumers
@@ -2404,6 +2410,12 @@ static const kl_entry g_shim[] = {
     E("android_set_abort_message", kl_set_abort_message),
     E("openlog", kl_openlog), E("closelog", kl_closelog),
     E("__cxa_atexit", kl_cxa_atexit), E("__cxa_finalize", kl_cxa_finalize),
+
+    // Tea For God (x6323807174332876): wide-string helpers it imports. wchar_t
+    // is 32-bit on both sides, so these forward unchanged.
+    E("wcscasecmp", wcscasecmp), E("wctomb", wctomb),
+    E("sched_getparam", klb_sched_getparam), E("sched_getcpu", klb_sched_getcpu),
+    E("quick_exit", klb__exit),
 
     // Steam Link (SDL3) additions — plain forwards plus the small wrappers above
     E("getentropy", getentropy), E("tzset", tzset), E("strncasecmp", strncasecmp),

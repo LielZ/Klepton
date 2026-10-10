@@ -214,9 +214,27 @@ static int plat_is_checkout(const char *name) {
 // list call moves — a pack that is not on disk cannot be fetched from here, and
 // nothing this answers was ever for sale. Target-scoped on purpose: the same
 // call on another title can be asking about paid content.
+//
+// AC Nexus VR (x5812519008825194) is the second, and asks differently: its
+// voice-over is one `<tag>.lang` Wwise package per language beside the rest of
+// its data in the OBB directory, part of the base game like batman's, and it
+// learns which of them are there from ovr_AssetFile_GetList. With the empty
+// list every title gets, its audio-language menu greyed out every language
+// but the one it had already loaded by path. For it the list names the .lang
+// files that are really in that directory (klplat_scan_obb_langpacks) — again
+// a fact about the disk; delivery, delete and purchase calls are untouched.
+// KL_PLAT_LANGPACK_LIST=0 restores the empty list.
+static int plat_is_obb_langpack_target(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_PLAT_LANGPACK_LIST", t && strcmp(t, "x5812519008825194") == 0);
+    }
+    return v;
+}
 static int plat_is_langpack_target(void) {
     const char *t = kl_driver_target_name();
-    return t && strcmp(t, "batman") == 0;
+    return (t && strcmp(t, "batman") == 0) || plat_is_obb_langpack_target();
 }
 static int plat_is_langpack_status(const char *name) {
     static const char *const ok[] = {
@@ -540,8 +558,73 @@ static int langpack_in_manifest(const char *dir, const char *name,
     return hit;
 }
 
+// The `<tag>.lang` files in AC Nexus's OBB directory (plat_is_obb_langpack_target).
+// Rescanned on every question, so the answer is what is on disk now.
+#define KLPLAT_OBB_LANG_PKG "com.Ubisoft.ACNexusVR"
+static klplat_asset g_lang[8];
+static int          g_nlang;
+static int klplat_scan_obb_langpacks(void) {
+    g_nlang = 0;
+    const char *root = kl_jni_files_dir();
+    char dir[PATH_MAX];
+    if (!root || !root[0] ||
+        snprintf(dir, sizeof dir, "%s/Android/obb/" KLPLAT_OBB_LANG_PKG, root) >= (int)sizeof dir)
+        return 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && g_nlang < (int)(sizeof g_lang / sizeof g_lang[0])) {
+        size_t nl = strlen(de->d_name);
+        if (nl <= 5 || strcmp(de->d_name + nl - 5, ".lang") != 0) continue;
+        klplat_asset *a = &g_lang[g_nlang];
+        memset(a, 0, sizeof *a);
+        if (nl - 5 >= sizeof a->tag ||
+            snprintf(a->path, sizeof a->path, "%s/%s", dir, de->d_name) >= (int)sizeof a->path)
+            continue;
+        struct stat st;
+        if (stat(a->path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) continue;
+        memcpy(a->tag, de->d_name, nl - 5);
+        for (const char *p = de->d_name; *p; p++) a->id = a->id * 131 + (unsigned char)*p;
+        if (!a->id) a->id = 1;
+        a->status = "installed";
+        g_nlang++;
+    }
+    closedir(d);
+    static int said = -1;
+    if (said != g_nlang) {
+        said = g_nlang;
+        char tags[160] = ""; size_t o = 0;
+        for (int i = 0; i < g_nlang && o + 34 < sizeof tags; i++)
+            o += (size_t)snprintf(tags + o, sizeof tags - o, "%s%s", i ? " " : "", g_lang[i].tag);
+        fprintf(stderr, "  [plat] language packs on disk: %d (%s)\n", g_nlang, tags);
+    }
+    return g_nlang;
+}
+// A status request about one of them: the details ride on the message, as for
+// batman. A name or id that is not one of these files is not a language pack,
+// and the refusal stands.
+static uint64_t klplat_obb_langpack_status(const char *what, uint32_t type,
+                                           const char *name, uint64_t id) {
+    klplat_scan_obb_langpacks();
+    klplat_asset *a = NULL;
+    for (int i = 0; i < g_nlang && !a; i++) {
+        const char *base = strrchr(g_lang[i].path, '/');
+        if (name ? (base && strcmp(base + 1, name) == 0) : g_lang[i].id == id) a = &g_lang[i];
+    }
+    if (!a) return klplat_drm(what);
+    uint64_t req = klplat_request(what, type, 0);
+    pthread_mutex_lock(&g_msg_mu);
+    for (unsigned i = g_msg_head; i != g_msg_tail; i++)
+        if (g_msgq[i % KLPLAT_MSGQ].request == req) g_msgq[i % KLPLAT_MSGQ].obj = a;
+    pthread_mutex_unlock(&g_msg_mu);
+    return req;
+}
+
 static uint64_t klplat_langpack_StatusByName(const char *name) {
     plat_hit("ovr_AssetFile_StatusByName");
+    if (plat_is_obb_langpack_target())
+        return klplat_obb_langpack_status("ovr_AssetFile_StatusByName",
+                                          KLPLAT_MSG_ASSET_STATUS_NAME, name ? name : "", 0);
     const char *files = kl_jni_files_dir();
     char dir[1100];
     snprintf(dir, sizeof dir, "%s/obb", files ? files : ".");
@@ -1240,6 +1323,9 @@ static const klplat_product *klplat_as_product(const void *h) {
 
 static uint64_t klplat_AssetFile_GetList(void) {
     plat_hit("ovr_AssetFile_GetList");
+    if (plat_is_obb_langpack_target())
+        return klplat_request_kind("ovr_AssetFile_GetList", KLPLAT_MSG_ASSET_LIST,
+                                   klplat_scan_obb_langpacks(), KLPLAT_KIND_ASSETS);
     klplat_scan_courses();
     return klplat_request_kind("ovr_AssetFile_GetList", KLPLAT_MSG_ASSET_LIST,
                                g_ncourses, KLPLAT_KIND_ASSETS);
@@ -1260,6 +1346,9 @@ static uint64_t klplat_AssetFile_StatusByName(const char *name) {
 
 static uint64_t klplat_AssetFile_StatusById(uint64_t id) {
     plat_hit("ovr_AssetFile_StatusById");
+    if (plat_is_obb_langpack_target())
+        return klplat_obb_langpack_status("ovr_AssetFile_StatusById",
+                                          KLPLAT_MSG_ASSET_STATUS_ID, NULL, id);
     klplat_scan_courses();
     // Outside Walkabout this is answered only where the store delivered add-on
     // files (klplat_scan_delivered); with none, the refusal is unchanged.
@@ -1278,6 +1367,8 @@ static uint64_t klplat_AssetDetailsArray_GetSize(const klplat_msg *m) {
 static void *klplat_AssetDetailsArray_GetElement(const klplat_msg *m, int index) {
     plat_hit("ovr_AssetDetailsArray_GetElement");
     if (!m || m->kind != KLPLAT_KIND_ASSETS) return NULL;
+    if (plat_is_obb_langpack_target())
+        return index >= 0 && index < m->payload && index < g_nlang ? &g_lang[index] : NULL;
     if (index < 0 || index >= m->payload || index >= g_ncourses) return NULL;
     return &g_courses[index];
 }
@@ -1542,8 +1633,12 @@ static int klplat_user_default(void) {
     // then dereferences the subtitle overlay AMossGameMode::CreateSubtitleOverlay
     // could not make without a primary player controller — a NULL read in
     // UGameSubtitleManager::NotifyRoomEnterBegin, about 630 frames in.
+    // AC Nexus as a store install (x5812519008825194) is the chain described
+    // above klplat_User_GetLoggedInUser: the entitlement check passes, this
+    // request then fails with "An unknown error occurred. Request failed." and
+    // the game never leaves its loading screen.
     static const char *on[] = { "zix", "intotheradius", "redmatter2", "vampire", "twd2",
-                                "walkabout", "moss" };
+                                "walkabout", "moss", "x5812519008825194" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;

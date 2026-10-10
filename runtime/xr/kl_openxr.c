@@ -5470,7 +5470,11 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         if (fin < 0) {
             extern const char *kl_driver_target_name(void);
             const char *t = kl_driver_target_name();
-            fin = kl_env_on("KL_XR_GL_FINISH", t && strcmp(t, "doom3quest") == 0);
+            // Tea For God (x6323807174332876) shows the same runaway queue:
+            // 11 ms in its splash, then composite GPU queued 40 -> 250 ms
+            // in-game, felt as heavy judder.
+            fin = kl_env_on("KL_XR_GL_FINISH", t && (strcmp(t, "doom3quest") == 0 ||
+                                                     strcmp(t, "x6323807174332876") == 0));
             if (fin) fprintf(stderr, "  [xr] xrEndFrame waits for the guest's GL frame to "
                                      "complete (KL_XR_GL_FINISH)\n");
         }

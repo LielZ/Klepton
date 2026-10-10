@@ -1349,6 +1349,64 @@ static char *klfb_rewrite_glsl(char *buf, size_t cap, uint32_t shader) {
     // emulate as a 2D texture (host half in klfb_TexBuffer).
     if (klfb_rewrite_texel_buffers(buf, cap)) changed = 1;
 
+    // gl_ClipDistance through GL_EXT_clip_cull_distance: ANGLE on Metal does
+    // not expose that extension, but does expose GL_APPLE_clip_distance, which
+    // provides the same gl_ClipDistance (redeclarable, up to 8). Tea For God's
+    // vertex shaders enable the EXT one and clip with six planes; every one of
+    // them failed to compile ("GL_APPLE_clip_distance : extension is disabled")
+    // and the game's library load then crashed on a missing store. Only when
+    // the shader does not use gl_CullDistance, which APPLE has no equivalent
+    // for. Same length after padding, so the rewrite is in place.
+    if (!strstr(buf, "gl_CullDistance")) {
+        static const char from[] = "GL_EXT_clip_cull_distance";
+        static const char to[]   = "GL_APPLE_clip_distance   ";
+        int n = 0;
+        for (p = buf; (p = strstr(p, from)); p += sizeof from - 1) {
+            memcpy(p, to, sizeof to - 1);
+            n++;
+        }
+        if (n) {
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  [glfb] shader enables GL_EXT_clip_cull_distance "
+                                "— served as GL_APPLE_clip_distance (clip only)\n");
+            }
+            changed = 1;
+        }
+    }
+
+    // fma() is ESSL 3.20 / GL_EXT_gpu_shader5; a "#version 300 es" shader that
+    // calls it compiles on Adreno and not on ANGLE ("'fma' : no matching
+    // overloaded function found"). Tea For God's material shaders all do, so
+    // every material failed and the game went black after its splash. Define
+    // it as the unfused multiply-add right after the #version line — it is a
+    // precision hint, not a semantic difference.
+    if (strncmp(buf, "#version 300 es", 15) == 0 && !strstr(buf, "gpu_shader5")) {
+        int uses = 0;
+        for (p = buf; (p = strstr(p, "fma")); p += 3) {
+            char before = p == buf ? 0 : p[-1];
+            const char *q = p + 3;
+            while (*q == ' ' || *q == '\t') q++;
+            if (!KLFB_IDENT(before) && *q == '(') { uses = 1; break; }
+        }
+        static const char def[] = "#define fma(a, b, c) ((a) * (b) + (c))\n";
+        char *nl = strchr(buf, '\n');
+        size_t len = strlen(buf);
+        if (uses && nl && len + sizeof def <= cap) {
+            nl++;
+            memmove(nl + sizeof def - 1, nl, strlen(nl) + 1);
+            memcpy(nl, def, sizeof def - 1);
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  [glfb] ESSL 3.00 shader calls fma() — defined "
+                                "as a*b+c (ESSL 3.20 built-in)\n");
+            }
+            changed = 1;
+        }
+    }
+
     return changed ? buf : NULL;
 }
 

@@ -733,6 +733,8 @@ int kl_driver_frame(void) {
     // pump). Between frames on the thread that just ran one, which is where
     // managed calls are safe.
     kl_mprobe_tick(g_frames);
+    // AC Nexus's own half-rate spin, taken out (self-gated on the target).
+    kl_mprobe_nexus_frame_budget(g_frames);
     // Custom levels, from the same seat and for the same reason. Self-gated on a
     // CustomLevels directory existing, so every other guest pays one stat().
     kl_songs_tick(g_frames);

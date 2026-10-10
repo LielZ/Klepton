@@ -462,6 +462,9 @@ void *kl_jni_class(const char *name) { return klj_FindClass(NULL, name); }
         {
             const char *t = kl_driver_target_name();
             if (t && strcmp(t, "acnexusvr") == 0) soft_default = 1;
+            // ...and the same game as a store install, where the target is
+            // named after its Meta app id rather than "acnexusvr".
+            if (t && strcmp(t, "x5812519008825194") == 0) soft_default = 1;
             // hl2's libsourcevr does GetObjectClass on an untagged pointer while
             // reading a saved setting (getSharedPreferences -> getInt) in the menu
             // — the same shape as AC Nexus's UbiServices check. Answering Object

@@ -78,6 +78,10 @@ unsigned long long kl_vulkan_layer_image(int k, int s, int e, unsigned w, unsign
                                          int srgb, int layers) {
     (void)k; (void)s; (void)e; (void)w; (void)h; (void)srgb; (void)layers; return 0;
 }
+unsigned long long kl_vulkan_spacewarp_image(int depth, int s, unsigned w, unsigned h,
+                                             int layers) {
+    (void)depth; (void)s; (void)w; (void)h; (void)layers; return 0;
+}
 void *kl_vulkan_layer_mtl_texture(int k, int s, int e, int *w, int *h) {
     (void)k; (void)s; (void)e; if (w) *w = 0; if (h) *h = 0; return NULL;
 }
@@ -1980,6 +1984,41 @@ unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
     return (uint64_t)(uintptr_t)img;
 }
 
+// See kl_vulkan.h. Not published anywhere and never sampled by a compositor:
+// the guest renders its motion-vector pass into these and that is the end of
+// them.
+unsigned long long kl_vulkan_spacewarp_image(int depth, int stage,
+                                             unsigned w, unsigned h, int layers) {
+    if (!kl_vulkan_guest_active()) return 0;
+    if (stage < 0 || stage >= KLVK_EYE_STAGES || !w || !h) return 0;
+    if (layers < 1) layers = 1;
+    if (layers > 2) layers = 2;
+    static klvk_img_slot g_sw[2][KLVK_EYE_STAGES];
+    klvk_img_slot *slot = &g_sw[depth ? 1 : 0][stage];
+    // D24_S8 is what the guest names, and it is not a format this GPU has; the
+    // 32-bit float depth is what its own "24 bits or more" targets already use.
+    VkFormat fmt = depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (slot->img && (slot->w != w || slot->h != h ||
+                      slot->layers != (uint32_t)layers || slot->fmt != fmt)) {
+        slot->img = VK_NULL_HANDLE;      // kept, not freed — as for the eye images
+        slot->mem = VK_NULL_HANDLE;
+    }
+    if (slot->img) return (uint64_t)(uintptr_t)slot->img;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkImage img = klvk_image_alloc(g_devs[0], fmt, w, h, (uint32_t)layers, 1,
+                                   (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                          : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT) |
+                                   VK_IMAGE_USAGE_SAMPLED_BIT, &mem);
+    if (img == VK_NULL_HANDLE) return 0;
+    slot->img = img; slot->mem = mem;
+    slot->w = w; slot->h = h; slot->layers = (uint32_t)layers; slot->fmt = fmt;
+    VKI("spacewarp %s image stage %d = VkImage %p (%ux%u, %d layer(s))\n",
+        depth ? "depth" : "motion-vector", stage, (void *)img, w, h, layers);
+    return (uint64_t)(uintptr_t)img;
+}
+
 unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,
                                               int srgb, int layers) {
     return kl_vulkan_layer_image(KLVK_EYE_LAYER, stage, eye, w, h, srgb, layers);
@@ -2335,7 +2374,22 @@ void *kl_vulkan_mtl_for_handle(unsigned long long h) {
     }
 
     // Resolve on EVERY call (not just the first), so every frame samples fresh UI.
-    if (!kl_env_on("KL_OVERLAY_TEXL", 1)) return NULL;
+    //
+    // Default OFF for the store build of AC Nexus. This detour exists because
+    // the layer's own swapchain image used to be empty there — and it was empty
+    // because ovrp_GetLayerTexturePtr handed Unity the wrong thing (see
+    // klovrp_GetLayerTexturePtr). With that answered properly Unity copies each
+    // panel into its layer image, which is the picture OVRPlugin means to be
+    // shown; a capture of the layer image holds the calibration panel intact
+    // while this path put fragments of unrelated textures on screen in the same
+    // frame (the submitted handle is a pooled render texture that Unity has
+    // already handed to something else).
+    static int texl = -1;
+    if (texl < 0) {
+        const char *t = kl_driver_target_name();
+        texl = kl_env_on("KL_OVERLAY_TEXL", !(t && !strcmp(t, "x5812519008825194")));
+    }
+    if (!texl) return NULL;
     // Only a live, tracked, non-eye image. A wild or already-destroyed handle here
     // is exactly the stale-MVKImage crash that destroy-tracking now prevents:
     // klvk_img_reg_has() is true only for an image still alive in our registry.
@@ -5771,6 +5825,7 @@ static VkResult VKAPI_CALL klvk_BindImageMemory(VkDevice dev, VkImage img,
 // vkCreateImage does not enforce (a sample count, a usage, a max extent), Unity
 // decides the temp RT is invalid, never registers it, and SetRenderTarget then
 // fails "temporary render texture not found" — the menu-compositing wall.
+static uint32_t klvk_sample_mask(void);
 static VkResult VKAPI_CALL klvk_GetPhysicalDeviceImageFormatProperties(
         VkPhysicalDevice pd, VkFormat fmt, VkImageType type, VkImageTiling tiling,
         VkImageUsageFlags usage, VkImageCreateFlags flags,
@@ -5782,6 +5837,7 @@ static VkResult VKAPI_CALL klvk_GetPhysicalDeviceImageFormatProperties(
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceImageFormatProperties");
     VkResult r = real ? real(pd, fmt, type, tiling, usage, flags, out)
                       : VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (r == VK_SUCCESS && out) out->sampleCounts &= klvk_sample_mask();
     if (r != VK_SUCCESS || (klvk_trace() && (usage & 0x30u))) {
         fprintf(stderr, "[TRACE] [imgfmt] fmt %d type %d tiling %d usage %#x flags %#x -> %d%s\n",
             (int)fmt, (int)type, (int)tiling, usage, flags, (int)r,
@@ -5813,7 +5869,40 @@ static int klvk_spoof_gpu(void) {
     }
     return on;
 }
+// KL_VK_MAX_SAMPLES=<1|2|4>: the most samples per pixel the guest is told this
+// device can render with (0, the default, tells it the truth). A guest's
+// multisampled targets are transient on a tiler and cost a Quest nothing; here
+// they are real memory — AC Nexus's 4x colour and depth pair is 865 MB per eye
+// stage at 3072 px — so the sample count is what an eye size is paid for with.
+// Default 2 for AC Nexus, with a larger eye (KL_OVRP_EYE_MAX 3840): 2x at
+// 4800x3080 is 676 MB a stage, and a level load peaks at 7.1 GB of the 8.2 GB
+// limit, where 4x at that size was killed on its first load.
+static uint32_t klvk_sample_mask(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        v = kl_env_int("KL_VK_MAX_SAMPLES", t && strcmp(t, "x5812519008825194") == 0 ? 2 : 0);
+    }
+    return v == 1 ? 0x1u : v == 2 ? 0x3u : v == 4 ? 0x7u : ~0u;
+}
+static void klvk_cap_sample_limits(VkPhysicalDeviceProperties *p) {
+    uint32_t m = klvk_sample_mask();
+    if (!p || m == ~0u) return;
+    p->limits.framebufferColorSampleCounts &= m;
+    p->limits.framebufferDepthSampleCounts &= m;
+    p->limits.framebufferStencilSampleCounts &= m;
+    p->limits.framebufferNoAttachmentsSampleCounts &= m;
+    p->limits.sampledImageColorSampleCounts &= m;
+    p->limits.sampledImageIntegerSampleCounts &= m;
+    p->limits.sampledImageDepthSampleCounts &= m;
+    p->limits.sampledImageStencilSampleCounts &= m;
+    p->limits.storageImageSampleCounts &= m;
+    static int said;
+    if (!said++) VKI("KL_VK_MAX_SAMPLES: sample counts reported to the guest masked to %#x\n", m);
+}
 static void klvk_spoof_props(VkPhysicalDeviceProperties *p) {
+    klvk_cap_sample_limits(p);
     if (!p || !klvk_spoof_gpu()) return;
     p->vendorID = 0x5143;                 // Qualcomm
     p->deviceID = 0x43051401;             // an Adreno 740-class id (plausible)
@@ -6099,6 +6188,7 @@ static VkResult VKAPI_CALL klvk_GetPhysicalDeviceImageFormatProperties2(
             real_gipa(g_instance, "vkGetPhysicalDeviceImageFormatProperties2KHR");
     }
     VkResult r = real ? real(pd, info, props) : VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (r == VK_SUCCESS && props) props->imageFormatProperties.sampleCounts &= klvk_sample_mask();
     if (info && (r != VK_SUCCESS || (klvk_trace() && (info->usage & 0x30u))))
         fprintf(stderr, "[TRACE] [imgfmt2] fmt %d type %d tiling %d usage %#x flags %#x -> %d%s\n",
             (int)info->format, (int)info->type, (int)info->tiling, info->usage,

@@ -483,6 +483,25 @@ The guest's own memory management, and the three seams that used to disable it.
   from the core count, so `KL_CPUS=1` collapses the pak-decompression fan-out.
   It earned its keep by **exonerating** one — RE4's Oodle crash reproduced
   identically at 1 and at 32, which is what moved the search off concurrency.
+- `KL_GUEST_FRESH_POSE=0|1` — start each guest frame on a freshly offered
+  pose: one offered while the previous frame was still running is dropped
+  (unless that frame ended within 2.5 ms of it) and the loop waits for the
+  next. A guest frame then always lasts a whole number of display frames
+  instead of beating against them.
+  Default 1 for `x5812519008825194`, else 0 (start at once on any pending pose).
+- `KL_NEXUS_FRAME_BUDGET=0|1` — AC Nexus spins every frame out to a fixed
+  length for Application SpaceWarp, a per-headset constant (21.25 ms as a
+  Quest 2 at 80 Hz), which held it at 46.7 fps here where nothing synthesises
+  the frames between. With this on, that one managed value is rewritten to
+  `KL_NEXUS_FRAME_BUDGET_MS` and the game runs as fast as it can (100 fps in
+  menus, 70-98 in a level on device). Default 1 for `x5812519008825194`, else 0.
+- `KL_NEXUS_FRAME_BUDGET_MS=<ms>` — the length to spin to instead, default 0
+  (no spin). 17.0 is the game's own rule (85% of two display periods) at
+  100 Hz and, with `KL_GUEST_FRESH_POSE`, gives exactly half the display rate.
+- `KL_FS_REL_SDCARD=0|1` — resolve a relative path that begins with `sdcard/`
+  (or another spelling of external storage) as the absolute one, as it is on a
+  device where the app's working directory is `/`. AC Nexus opens its animator
+  controller bundle that way. Default 1 for `x5812519008825194`, else 0.
 - `KL_MADV_DONTNEED=remap|reusable|zero|passthrough` — how a guest
   `madvise(MADV_DONTNEED)` is served. Default `remap`. **`MADV_DONTNEED` is 4 on
   Linux and Darwin and means different things**: Linux frees the pages, Darwin
@@ -631,6 +650,12 @@ CLOCK_REALTIME. Forwarding either verbatim poisons guest time:
 
 - `KL_TRACE_TIME=1` — log the first 40 `clock_gettime`/`gettimeofday` calls
   with caller address and result. How the unchecked-failure sites were found.
+- `KL_CLOCK_RES_LINUX=1` — `clock_getres` answers 1 ns for the realtime,
+  monotonic, raw and boottime clocks, as a Linux kernel with high-resolution
+  timers does, instead of Darwin's 1000 ns / 42 ns. For a guest that turns the
+  resolution into a clock frequency. Read by `kl_libc.c`. Default on for
+  `x5812519008825194` (AC Nexus, whose UbiServices clock otherwise runs 1000×
+  fast), off elsewhere; `=0` turns it off there too.
 - `KL_TRACE_CONDWAIT=1` — log the first 60 guest `pthread_cond_timedwait`
   calls: tid, return address, ts and delta-from-now. A delta of hours is the
   signature of the poisoned abstime; sane runs read 1 ms – 1 s.
@@ -981,7 +1006,9 @@ puts the camera on the ground with its hands underneath it.
   is what makes frames arrive. On device the compositor measures and pushes the
   real offsets, so this stays what it has always been there: the A/B for "is the
   compositor's number the wrong one".
-- `KL_OVRP_STAGES=<n>` — eye-swapchain depth (default 3, clamped to
+- `KL_OVRP_STAGES=<n>` — eye-swapchain depth (default 3 — 2 for
+  `x5812519008825194`, whose per-stage multisampled targets are real memory
+  here and put a level load at the jetsam limit with three — clamped to
   1..max). `=1` restores the earlier single-buffered behaviour, which every
   measurement was taken against, and its tearing; each extra stage costs a
   full-size RGBA16F two-slice eye texture (~160 MB at map resolution). The
@@ -1217,7 +1244,54 @@ puts the camera on the ground with its hands underneath it.
   before the compositors see it), which is where Unreal on Vulkan puts a
   viewport shorter than the texture. Makes no difference to a full-height rect.
   Default 1 for `x24882487241367228`, else 0.
-- `KL_OVRP_EYE_MAX=<px>` — cap on the longer axis of that size, default 3072,
+- `KL_OVRP_TEXPTR_INDIRECT=0|1` — on a Vulkan guest, `ovrp_GetLayerTexturePtr`
+  hands back a pointer to the layer's `VkImage` rather than the `VkImage`
+  itself, which is what Unity's `Texture2D.CreateExternalTexture` reads a
+  native texture pointer as. With 0, Unity dereferences the image object and
+  builds its overlay textures on the "wild handle" `kl_vulkan.c` substitutes a
+  scratch for. Default 1 for `x5812519008825194` (AC Nexus), else 0.
+- `KL_LOADVID_FOLLOW_SUBMIT=0` — keep the host-played loading video (AC Nexus's
+  Equirect loading layer) up for as long as that layer EXISTS. The default takes
+  it down once six eye frames have ended without the guest submitting the layer,
+  because the guest hides its loading screen by no longer submitting it, not by
+  destroying it.
+- `KL_LOADVID_OFF=1` — never draw the host-played loading video.
+- `KL_OVERLAY_TEXL=0|1` — composite a guest quad layer from the texture handle
+  it SUBMITTED (`ovrp_EnqueueSubmitLayer2`'s texL, resolved to the guest's own
+  render texture) rather than from the layer's swapchain image. Default 1,
+  except 0 for `x5812519008825194`, where `KL_OVRP_TEXPTR_INDIRECT` makes the
+  swapchain image the valid one and the submitted handle is a recycled
+  render texture.
+- `KL_OVRP_SPACEWARP_TEX=0|1` — when the guest's eye layer asks for Application
+  SpaceWarp (`ovrpLayerFlag_SpaceWarpDataAllocation`), give it a motion-vector
+  texture size and answer `ovrp_GetLayerTextureSpaceWarp` with real images
+  instead of "unsupported". Nothing here consumes the vectors; the point is that
+  the Oculus XR provider in AC Nexus fails its eye-texture creation without
+  them and Unity then stops the XR display after one frame. Default 1 for
+  `x5812519008825194`, else 0.
+- `KL_PLAT_LANGPACK_LIST=0|1` — answer `ovr_AssetFile_GetList` (and the status
+  calls) with the `<tag>.lang` voice packs that are really in the game's OBB
+  directory, as installed language packs, instead of an empty list. AC Nexus
+  greys out every audio language it is not told is installed. Nothing is
+  downloaded, deleted or reported as purchased. Default 1 for
+  `x5812519008825194`, else 0.
+- `KL_OVRP_ENQ_OWNS_OVERLAYS=0|1` — while the guest is filing panels through
+  `ovrp_EnqueueSubmitLayer`, an `ovrp_EndFrame4` whose own list carries no
+  overlay leaves the published set alone instead of emptying it (which blinked
+  AC Nexus's cards off every few seconds). Default 1 for `x5812519008825194`,
+  else 0.
+- `KL_OVRP_POSE_TIME=0|1` — fill `ovrpPoseStatef.Time` in
+  `ovrp_GetNodePoseState` with the moment the step's sample was latched instead
+  of leaving it 0. AC Nexus moves its physical hand bodies only when the
+  controller pose time advances, so with 0 the hands that touch things never
+  left the rig's origin. Default 1 for `x5812519008825194`, else 0.
+- `KL_VK_MAX_SAMPLES=<1|2|4>` — the highest multisample count a Vulkan guest
+  is told the device supports (limits and image-format properties), 0 for the
+  truth. A guest's multisampled eye targets are real memory here, so this is
+  what a larger eye is paid for with. Default 2 for `x5812519008825194`
+  (with `KL_OVRP_EYE_MAX` 3840), else 0.
+- `KL_OVRP_EYE_MAX=<px>` — cap on the longer axis of that size, default 3072
+  (4000 for `doom3quest`, 3840 for `x5812519008825194`),
   0 to disable. Vision Pro's logical per-eye resolution is far larger than a
   Quest's, and the guest allocates stages x eyes of RGBA16F at whatever it is
   told, so an uncapped number turns straight into hundreds of MiB and into fill
@@ -2312,8 +2386,12 @@ except its own control vars (next section).
 - `KL_OVERLAY_SUBMIT_ORDER=0|1` — composite the guest's quad layers in the
   order it submitted them (no depth test between them, depth still written),
   as a Quest's compositor does. Without it a quad's whole rectangle, transparent
-  parts included, hides whatever farther quad is submitted after it. Default 1
-  for `x24882487241367228` (Alien: Rogue Incursion), else 0.
+  parts included, hides whatever farther quad is submitted after it — and so
+  does the eye picture, which is drawn as a quad at `KL_REPROJECT_DEPTH`: a
+  panel the guest places beyond that distance fails the depth test against it
+  and is never seen. Default 1 for `x24882487241367228` (Alien: Rogue
+  Incursion) and `x5812519008825194` (AC Nexus, whose calibration card sits
+  2.3 m out), else 0.
 - `KL_GUEST_OVERLAYS=0` — stop compositing the GUEST's own non-eye layers.
   **Not the same thing as `KL_OVERLAYS` below, which is a system setting**; the
   two are one word apart and were briefly one name, which would have made each

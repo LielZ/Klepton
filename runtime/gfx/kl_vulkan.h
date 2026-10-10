@@ -116,6 +116,15 @@ unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, un
 unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
                                          unsigned w, unsigned h, int srgb, int layers);
 
+// The two extra images an eye layer carries when the guest asked for
+// Application SpaceWarp: motion vectors (RGBA16F) and their depth. Nothing on
+// this host consumes them — reprojection here is the visionOS compositor's —
+// but a provider that asked for them treats their absence as "the eye textures
+// could not be created" and stops its display, so they have to EXIST. One pair
+// per stage, re-allocated when the shape asked for changes. 0 on failure.
+unsigned long long kl_vulkan_spacewarp_image(int depth, int stage,
+                                             unsigned w, unsigned h, int layers);
+
 // ...and the MTLTexture behind one of those, for a compositor that has to draw
 // the layer. The eye layer is deliberately NOT reachable here: its textures go
 // through kl_glfb's eye table, where every consumer already looks, and a second

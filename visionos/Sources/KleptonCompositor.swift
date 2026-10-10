@@ -3105,7 +3105,8 @@ final class KleptonCompositor {
     /// interaction labels lost a side that way behind the invisible margin of a
     /// panel held in the hand (2026-10-09). Default on for that title only.
     private static let overlaysInSubmitOrder =
-        klEnvOn("KL_OVERLAY_SUBMIT_ORDER", default: klTargetName() == "x24882487241367228")
+        klEnvOn("KL_OVERLAY_SUBMIT_ORDER",
+                default: ["x24882487241367228", "x5812519008825194"].contains(klTargetName()))
     private static let drawEquirectOverlays = klEnvOn("KL_OVERLAY_EQ", default: true)
     private static let eqFlipY = klEnvOn("KL_EQ_FLIP", default: false)
     private static let eqSrgbDecode = klEnvOn("KL_EQ_SRGB", default: false)

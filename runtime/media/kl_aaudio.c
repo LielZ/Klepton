@@ -154,7 +154,17 @@ static int klaa_burst_frames(void) {
     // is configured in multiples of. AAudio's real burst is the HAL's; the
     // guest only uses it to size its buffer, so any sane value works and a
     // small one keeps the callback rate close to Android's.
-    if (n < 32 || n > 8192) n = 240;
+    if (n < 32 || n > 8192) {
+        n = 240;
+        // AC Nexus's Wwise (2019.2) mixes in larger blocks than that and its
+        // AAudio sink runs dry between them when it is asked for 240 frames at
+        // a time: "Voice Starvation" 225 times a minute, a steady crackle, with
+        // the device ring itself never underrunning. Asked for 1024 it logged
+        // one starvation in a 50 s run and the crackle was gone.
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (t && strcmp(t, "x5812519008825194") == 0) n = 1024;
+    }
     return n;
 }
 

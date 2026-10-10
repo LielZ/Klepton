@@ -2062,6 +2062,15 @@ final class KleptonControllers {
                 handSuppressed[hand] = false
                 let (p, q) = gripPose(anchor, hand: hand)
                 st.position = p; st.orientation = q
+                // A Sense controller wrote this hand's input, but its pose
+                // dropped out for this frame. The hand may stand in for the
+                // POSE, never for the input: fingers wrapped round a controller
+                // measure as a pinch, and the pinch below replaced the real
+                // trigger with that distance — random clicks, and real ones
+                // lost (Tea For God's menu: "12 down" on a hand holding a Sense).
+                if st.fromController {
+                    pinchHeld[hand] = false
+                } else {
                 // pollButtons() has already cleared this hand's bits (no Sense
                 // controller wrote it), so everything the pinch sets is set
                 // here and nothing has to be undone.
@@ -2110,6 +2119,7 @@ final class KleptonControllers {
                 }
                 // The gamepad's sticks and buttons, on top of what the hand said.
                 mergePad(into: &st, hand: hand)
+                }
             } else {
                 // Nothing tracked this hand. Leave kl_ovrp's own synthesised
                 // head-relative hand alone rather than pushing a stale pose —

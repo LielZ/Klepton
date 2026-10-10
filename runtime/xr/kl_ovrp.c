@@ -1228,6 +1228,12 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
     {
         const char *t = kl_driver_target_name();
         if (t && strcmp(t, "doom3quest") == 0) cap_dflt = 4000;
+        // AC Nexus: a quarter more, paid for by rendering 2x multisampled
+        // instead of 4x (KL_VK_MAX_SAMPLES in kl_vulkan.c, which is where the
+        // memory arithmetic is). 3072 px is about 22 pixels a degree at the
+        // centre of this display, and its owner read that as "no anti-aliasing
+        // or too little resolution"; at 3840 he called it good enough.
+        if (t && strcmp(t, "x5812519008825194") == 0) cap_dflt = 3840;
     }
     int cap = kl_env_int("KL_OVRP_EYE_MAX", cap_dflt);
     if (cap > 0 && (w > cap || h > cap)) {
@@ -2425,6 +2431,9 @@ static klovrp_pose g_step_head[KLOVRP_NSTEPS];
 static klovrp_pose g_step_hand[KLOVRP_NSTEPS][2];
 static uint32_t    g_step_seq;
 static int         g_step_valid[KLOVRP_NSTEPS];
+// When each step's sample was latched (seconds, the clock
+// kl_ovrp_predicted_display_time answers on), for ovrpPoseStatef.Time.
+static double      g_step_time[KLOVRP_NSTEPS];
 static int         g_saw_update2;
 
 // The render step's sample, kept apart so BeginFrame can record exactly what
@@ -2573,6 +2582,7 @@ static uint64_t klovrp_Update2(int step, int frame_index, double prediction) {
     g_step_hand[ix][0] = l; g_step_hand[ix][1] = r;
     if (ix == 0) g_render_sample = h;
     __atomic_store_n(&g_step_seq, s + 2, __ATOMIC_RELEASE);
+    g_step_time[ix] = kl_ovrp_predicted_display_time();
     __atomic_store_n(&g_step_valid[ix], 1, __ATOMIC_RELEASE);
     __atomic_store_n(&g_saw_update2, 1, __ATOMIC_RELEASE);
 
@@ -2774,7 +2784,15 @@ static struct {
 int kl_ovrp_stage_count(void) {
     static int n;
     if (!n) {
-        n = kl_env_int("KL_OVRP_STAGES", KLOVRP_STAGES_DEFAULT);
+        // Two for AC Nexus. Unity keeps a 4x multisampled colour and depth
+        // target per stage beside each eye image, transient on a Quest and
+        // real memory here (865 MB a stage at this eye size — a memoryless
+        // target is refused by the GPU: "too much geometry"). With three the
+        // level load peaked at 8.1 GB of an 8.2 GB limit and was killed once;
+        // with two it peaks at 7.1-7.6.
+        const char *t = kl_driver_target_name();
+        int dflt = t && !strcmp(t, "x5812519008825194") ? 2 : KLOVRP_STAGES_DEFAULT;
+        n = kl_env_int("KL_OVRP_STAGES", dflt);
         if (n < 1) n = 1;
         if (n > KLOVRP_MAX_STAGES) n = KLOVRP_MAX_STAGES;
     }
@@ -3221,9 +3239,15 @@ static uint64_t klovrp_EndFrame(int guest_frame_index) {
 // The guest's submitted-frame counter — see KL_OVRP_POKE and kl_vulkan_capture_eyes.
 static unsigned g_vk_frame;
 
+static volatile unsigned g_loadvid_frames_since;   // defined with the loading video, below
+// EndFrames since the guest last called ovrp_EnqueueSubmitLayer — see
+// klovrp_enq_owns_overlays.
+static volatile unsigned g_enq_frames_since = 1000000u;
 static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submits,
                                  int layer_submit_count, void *sync) {
     ovrp_hit("ovrp_EndFrame4");
+    if (g_loadvid_frames_since < 1000000u) g_loadvid_frames_since++;
+    if (g_enq_frames_since < 1000000u) g_enq_frames_since++;
     { static unsigned n; if (n < 48 || n % 300 == 0 || klovrp_pose_trace(n)) {
         uint64_t tid=0; pthread_threadid_np(NULL,&tid);
         fprintf(stderr, "  [ovrp] frameloop EndFrame4 #%u frameIdx=%d layers=%d "
@@ -3980,6 +4004,23 @@ static void klovrp_hand_sweep(const klovrp_pose *head, klovrp_pose *hand) {
     hand->px = head->px; hand->py = head->py; hand->pz = head->pz;
 }
 
+// KL_OVRP_POSE_TIME: fill ovrpPoseStatef.Time (the double at +0x50) with the
+// moment the step's sample was latched. It was left 0, which a guest reads as
+// "tracking has never produced a sample": AC Nexus drives its physical hand
+// bodies (GrabPhysTracker, a joint from the rig to each PlayerHandCollider)
+// only when the controller's pose time has moved on, so with a constant 0 the
+// visual hands followed the controllers while the bodies that touch things
+// stayed at the rig's origin (_lastControllerTime 0 in a managed dump) — the
+// start cube could not be touched. Default on for the one target measured.
+static int klovrp_pose_time(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_OVRP_POSE_TIME", t && !strcmp(t, "x5812519008825194"));
+    }
+    return v;
+}
+
     // out-struct via the sret register x8, NOT x2: the real function returns the
 // 88-byte ovrpPoseStatef by value (its own prologue does `mov x19, x8` and an
 // 0x58-byte memcpy back), so callers place the destination in x8 and the
@@ -4078,6 +4119,12 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     // estimate off a 90 Hz pose stream is noise wearing a physical name.
     f[7]  = p->vx;  f[8]  = p->vy;  f[9]  = p->vz;
     f[13] = p->avx; f[14] = p->avy; f[15] = p->avz;
+    if (klovrp_pose_time()) {
+        int ix = klovrp_step_ix(step);
+        double t = __atomic_load_n(&g_step_valid[ix], __ATOMIC_ACQUIRE)
+                       ? g_step_time[ix] : kl_ovrp_predicted_display_time();
+        memcpy((char *)out + 0x50, &t, sizeof t);   // ovrpPoseStatef.Time
+    }
     return OVRP_SUCCESS;
 }
 
@@ -5260,6 +5307,11 @@ static struct klovrp_layer *klovrp_layer(int id) {
 // layer stays and the loading screen stays, and when the guest finishes it
 // destroys the layer, g_loadvid_active clears, and the world shows through.
 static int g_loadvid_active;
+// Eye frames ended since an Equirect layer was last submitted — see
+// kl_loadingvideo_active. Written from the guest's main and render threads and
+// read by the compositor; a stale read costs one frame of backdrop either way.
+#define KLOVRP_LOADVID_GRACE_FRAMES 6
+static volatile unsigned g_loadvid_frames_since;
 static int g_loadvid_suppressed;   // the guest asked to hide the loading screen
 static void kl_loadvid_recount(void) {
     int any = 0;
@@ -5280,7 +5332,27 @@ int kl_loadingvideo_active(void) {
     // overlays. This knob lets a run reveal the menu behind it without a rebuild;
     // the proper fix is to deactivate the skybox when the menu is being submitted.
     if (kl_env_on("KL_LOADVID_OFF", 0)) return 0;
-    return g_loadvid_active;
+    // ...and this is that fix. The layer's EXISTENCE is the wrong signal: the
+    // guest keeps its Equirect layers allocated and simply stops SUBMITTING
+    // them when its loading screen is hidden. So once eye frames are flowing,
+    // a run of them with no Equirect submitted means the guest is showing its
+    // own picture and the backdrop has to get out of the way. Counted in the
+    // guest's own frames (klovrp_EndFrame4), not in time, so a load that stalls
+    // the main thread for a second does not uncover a stale eye — no frame
+    // ends, the count does not move. With no eye frames at all (a guest whose
+    // display never came up) it never trips and the old behaviour stands.
+    // KL_LOADVID_FOLLOW_SUBMIT=0 restores "live while the layer exists".
+    static int follow = -1, shown = -1;
+    if (follow < 0) follow = kl_env_on("KL_LOADVID_FOLLOW_SUBMIT", 1);
+    int on = g_loadvid_active &&
+             !(follow && g_loadvid_frames_since >= KLOVRP_LOADVID_GRACE_FRAMES);
+    if (on != shown && g_loadvid_active) {
+        shown = on;
+        fprintf(stderr, "  [ovrp] loading-video skybox %s (the guest %s its Equirect "
+                        "layer)\n", on ? "shown" : "hidden",
+                on ? "is submitting" : "stopped submitting");
+    }
+    return on;
 }
 // The guest's LoadingScreen.stopUpdatingLoadingScreen() - it wants the loading
 // screen gone, so hide the skybox and reveal whatever the eye now holds (the
@@ -5546,6 +5618,25 @@ static struct {
 // wrong placement has no error surface at all.
 #define KLOVRP_SUBMIT_HEAD_LOCKED 0x2
 
+// KL_OVRP_ENQ_OWNS_OVERLAYS: a guest that files its panels through
+// ovrp_EnqueueSubmitLayer hands ovrp_EndFrame4 a list holding the eye layer and
+// nothing else, on another thread. Read as "this frame has no overlays", that
+// list emptied the published set every KLOVRP_OVERLAY_TTL frames, and the
+// panels were gone until the next enqueue put them back — AC Nexus's cards
+// blinking every few seconds, seen on device. While enqueue submits are
+// arriving the enqueue path owns the set (it publishes an empty one itself
+// when every panel is hidden); once they stop for a few frames this takes the
+// panels down as before. Default on for the one target measured.
+#define KLOVRP_ENQ_LIVE_FRAMES 6
+static int klovrp_enq_owns_overlays(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_OVRP_ENQ_OWNS_OVERLAYS", t && !strcmp(t, "x5812519008825194"));
+    }
+    return v && g_enq_frames_since < KLOVRP_ENQ_LIVE_FRAMES;
+}
+
 static void klovrp_record_overlays(const void *layer_submits, int count) {
     const ovrp_layer_submit *const *list = layer_submits;
     kl_ovrp_overlay tmp[KLOVRP_MAX_LAYERS];
@@ -5578,6 +5669,12 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
             }
         }
         struct klovrp_layer *l = klovrp_layer(s->layer_id);
+        // An Equirect layer handed in through the frame's own list counts as
+        // submitted for the loading backdrop, the same as one that came through
+        // ovrp_EnqueueSubmitLayer (see kl_loadingvideo_active). Without this the
+        // backdrop would leave after a few frames on every guest that submits
+        // its loading layer this way — the count is only ever reset there.
+        if (l && !l->is_eye && l->desc.shape == 5) g_loadvid_frames_since = 0;
         int effective_id = s->layer_id;
         if (!l) {
             // A submit can outlive its layer. UE4 destroys the toast layer and
@@ -5668,6 +5765,7 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
     // while a real removal still clears once the TTL lapses. The bridging above
     // handles a submit that NAMES a destroyed layer; this handles a frame that
     // omits it entirely. KL_OVRP_OVERLAY_PERSIST=0 restores strict per-frame.
+    if (n == 0 && klovrp_enq_owns_overlays()) return;
     static int persist = -1;
     if (persist < 0) persist = kl_env_on("KL_OVRP_OVERLAY_PERSIST", 1);
     enum { KLOVRP_OVERLAY_TTL = 12 };   // frames a dropped overlay is held for
@@ -5885,6 +5983,21 @@ static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[
 // textureScale is the render-scale multiplier Unity carries in its frame setup
 // hints; the real plugin applies it to the recommended size, so we do too, and
 // clamp to at least 1 pixel so a hint of 0 cannot produce a zero-sized layer.
+// ovrpLayerFlag_SpaceWarpDataAllocation: "this eye layer also carries motion
+// vectors and their depth". AC Nexus sets it (flags=0x300, with the dedicated-
+// depth bit beside it) because its OculusSettings asset has SpaceWarp on.
+#define KLOVRP_LAYER_FLAG_SPACEWARP 0x100
+// KL_OVRP_SPACEWARP_TEX: hand the provider real motion-vector textures when it
+// asks. Default on for the one target measured; see
+// klovrp_GetLayerTextureSpaceWarp for why refusing is not survivable there.
+static int klovrp_spacewarp_tex(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_OVRP_SPACEWARP_TEX", t && !strcmp(t, "x5812519008825194"));
+    }
+    return v;
+}
 static void klovrp_fill_eye_desc(ovrp_layer_desc_eyefov *d, int layout,
                                  int mip_levels, int sample_count, int format,
                                  int depth_format, int mv_format,
@@ -5927,6 +6040,16 @@ static void klovrp_fill_eye_desc(ovrp_layer_desc_eyefov *d, int layout,
     d->depth_format    = depth_format;
     d->mv_format       = mv_format;
     d->mv_depth_format = mv_depth_format;
+    // ...unless the guest asked for Application SpaceWarp and we serve it (see
+    // klovrp_GetLayerTextureSpaceWarp): then the motion-vector textures need a
+    // size, and it is read from here. A quarter of the eye in each direction —
+    // nothing consumes the vectors, so the only thing the number buys is a
+    // cheap extra pass for the guest.
+    if ((layer_flags & KLOVRP_LAYER_FLAG_SPACEWARP) && klovrp_spacewarp_tex()) {
+        d->mv_texture_size = (ovrp_sizei){ (w + 3) / 4, (h + 3) / 4 };
+        if (d->mv_texture_size.w < 16) d->mv_texture_size.w = 16;
+        if (d->mv_texture_size.h < 16) d->mv_texture_size.h = 16;
+    }
 }
 
     // ovrp_CalculateEyeLayerDesc3(layout, mipLevels, sampleCount, format,
@@ -6203,14 +6326,18 @@ static uint64_t klovrp_EnqueueSetupLayer2(const ovrp_layer_desc_eyefov *desc,
 //   (uint flags, void* texL, void* texR, int layerId, int frameIndex,
 //    const ovrpPosef* pose, const ovrpVector3f* scale, int layerIndex)
 // Record each submitted non-eye layer into a per-frame set and publish it to the
-// compositor at the frame boundary. The boundary is detected two ways (a changed
-// frameIndex, or the same layer id appearing again) so it is robust even if the
-// frameIndex arg is not what this ABI guess assumes.
+// compositor at the frame boundary — the same layer id appearing again (see the
+// note at the test for why frameIndex is no part of it).
 static kl_ovrp_overlay g_enq[KLOVRP_MAX_LAYERS];
 static int g_enq_n;
-static int g_enq_frame = -0x7fffffff;
+// Every layer id submitted in the frame being gathered, hidden ones included —
+// what the boundary test looks at (see klovrp_EnqueueSubmitLayer2).
+static int g_enq_seen[KLOVRP_MAX_LAYERS], g_enq_seen_n;
+#define KLOVRP_SUBMIT_HIDDEN 0x200
 static void klovrp_enq_flush(void) {
-    if (g_enq_n) kl_ovrp_overlays_external(g_enq, g_enq_n);
+    // An EMPTY set is published too: a frame in which every panel was hidden
+    // has to take the previous frame's panels down, not leave them standing.
+    kl_ovrp_overlays_external(g_enq, g_enq_n);
     g_enq_n = 0;
 }
 //
@@ -6260,7 +6387,11 @@ static uint64_t klovrp_EnqueueSubmitLayer2(uint32_t flags, void *texL, void *tex
                                            int override_color, const float *color_scale,
                                            const float *color_offset) {
     ovrp_hit("ovrp_EnqueueSubmitLayer2");
+    g_enq_frames_since = 0;
     (void)override_color; (void)color_scale; (void)color_offset;
+    { struct klovrp_layer *eq = klovrp_layer(layer_id);
+      if (eq && !eq->is_eye && eq->desc.shape == 5 && !(flags & 0x200))
+          g_loadvid_frames_since = 0; }
     // Log the SUBMITTED texture handles per layer (once each): if texL differs
     // from the VkImage we handed out via GetLayerTexture2 for this layer, the
     // guest is drawing its UI into ITS OWN texture and we are sampling an empty
@@ -6283,12 +6414,30 @@ static uint64_t klovrp_EnqueueSubmitLayer2(uint32_t flags, void *texL, void *tex
                 pose ? pose[4] : 0.f, pose ? pose[5] : 0.f, pose ? pose[6] : 0.f,
                 scale ? scale[0] : 0.f, scale ? scale[1] : 0.f, scale ? scale[2] : 0.f);
     }
+    // The frame boundary is the same layer id coming round again, and ONLY
+    // that. The frameIndex argument cannot serve: OVROverlay keeps one counter
+    // per overlay — 0 for ever on a static one, and on a dynamic one the number
+    // of frames since THAT overlay was created — so two panels submitted in the
+    // same frame routinely carry different numbers. Reading a changed number as
+    // a boundary (what this did) cut every frame of AC Nexus's UI into
+    // fragments, each published and replaced within the frame: the published
+    // set flipped between { 5 } and { 55..61 } on every flush, and the
+    // calibration card, submitted on every frame for fourteen seconds, reached
+    // the compositor once.
+    //
+    // Hidden layers (ovrpLayerSubmitFlag 0x200, OVROverlay.hidden) count for
+    // the boundary — they are how a frame of nothing-but-hidden panels is still
+    // seen to have begun — but are not handed on: "hidden" means do not
+    // composite, and these are the panels the guest has parked.
     int dup = 0;
-    for (int i = 0; i < g_enq_n; i++) if (g_enq[i].layer_id == layer_id) { dup = 1; break; }
-    if (dup || frame_index != g_enq_frame) {
+    for (int i = 0; i < g_enq_seen_n; i++) if (g_enq_seen[i] == layer_id) { dup = 1; break; }
+    if (dup) {
         klovrp_enq_flush();
-        g_enq_frame = frame_index;
+        g_enq_seen_n = 0;
     }
+    if (g_enq_seen_n < KLOVRP_MAX_LAYERS) g_enq_seen[g_enq_seen_n++] = layer_id;
+    (void)frame_index;
+    if (flags & KLOVRP_SUBMIT_HIDDEN) return OVRP_SUCCESS;
     struct klovrp_layer *l = klovrp_layer(layer_id);
     if (l && !l->is_eye && g_enq_n < KLOVRP_MAX_LAYERS) {
         kl_ovrp_overlay *o = &g_enq[g_enq_n++];
@@ -6681,11 +6830,58 @@ static uint64_t klovrp_GetLayerTextureFoveation(int layer_id, int stage, int eye
 // SpaceWarp and carries on; SUCCESS with zero handles would be the damaging
 // answer, flagging the descriptor as space-warped against texture id 0. Same
 // story we already tell for foveation and ovrp_GetTiledMultiResSupported.
+// ...which is true of the provider that note was written from, and false of AC
+// Nexus's (Oculus XR Plugin on OVRPlugin 1.60, SpaceWarp enabled in its
+// settings). There OculusDisplayProvider::CreateMotionVectorTexture treats any
+// failure as fatal for the STAGE: "Failed to get spaceWarp layer textures" ->
+// "CreateEyeTextureStages failed." -> "Failed to create eye textures.", and
+// Unity answers a failed first frame by stopping the display provider for good
+// (GfxThread_Stop, "Destroying distortion window"). Everything after that runs
+// with no XR display: one frame submitted in the whole run, XRSettings reporting
+// a 0x0 eye texture, and only OVROverlay quads ever reaching the compositor.
+//
+// So for that provider the textures are handed out. Its call has SEVEN
+// arguments, read off its own call site (libOculusXRPlugin+0x13c28):
+//
+//   ovrp_GetLayerTextureSpaceWarp(layerId, stage, eye,
+//                                 &motionVector, &a, &motionVectorDepth, &b)
+//
+// and it uses the first and third out-params as the colour and depth native
+// textures of a Unity render texture of desc.mv_texture_size (two array layers
+// under the Array layout); the other two it never reads, so they are zeroed.
+// The five-argument shape above is what every other caller gets, untouched —
+// its x5/x6 are not pointers and must not be written through.
 static uint64_t klovrp_GetLayerTextureSpaceWarp(int layer_id, int stage, int eye,
-                                                uint64_t *motion, uint64_t *depth) {
+                                                uint64_t *motion, uint64_t *depth,
+                                                uint64_t *motion_depth, uint64_t *extra) {
     ovrp_hit("ovrp_GetLayerTextureSpaceWarp");
-    (void)layer_id; (void)stage; (void)eye;
     if (!motion || !depth) return OVRP_FAIL_INVALID_PARAM;
+    struct klovrp_layer *l = klovrp_layer(layer_id);
+    if (klovrp_spacewarp_tex() && kl_vulkan_guest_active() && l && l->is_eye &&
+        (l->desc.layer_flags & KLOVRP_LAYER_FLAG_SPACEWARP) &&
+        motion_depth && extra && l->desc.mv_texture_size.w > 0) {
+        int layers = (l->desc.layout == KLOVRP_LAYOUT_ARRAY) ? 2 : 1;
+        unsigned w = (unsigned)l->desc.mv_texture_size.w;
+        unsigned h = (unsigned)l->desc.mv_texture_size.h;
+        unsigned long long c = kl_vulkan_spacewarp_image(0, stage, w, h, layers);
+        unsigned long long z = kl_vulkan_spacewarp_image(1, stage, w, h, layers);
+        if (c && z) {
+            *motion = c;
+            *depth = 0;
+            *motion_depth = z;
+            *extra = 0;
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  [ovrp] GetLayerTextureSpaceWarp: layer %d stage %d eye %d "
+                                "-> motion vectors %#llx, depth %#llx (%ux%u, %d layer(s)); "
+                                "rendered into by the guest, consumed by nothing\n",
+                        layer_id, stage, eye, c, z, w, h, layers);
+            }
+            return OVRP_SUCCESS;
+        }
+    }
+    (void)stage; (void)eye;
     *motion = 0;
     *depth = 0;
     return OVRP_FAIL_UNSUPPORTED;
@@ -6698,12 +6894,52 @@ static uint64_t klovrp_GetLayerTextureSpaceWarp(int layer_id, int stage, int eye
 // layers by layer_id (not the shared eye storage), so this allocates the layer's
 // own image and cannot disturb the eyes. The handle it hands back is the same
 // 64-bit value - a GL name on the GLES path, a VkImage on Vulkan.
+//
+// ...except that on Vulkan the name of this entry is literal: what the caller
+// wants is a POINTER to the VkImage, not the VkImage. OVROverlay hands the value
+// straight to Texture2D.CreateExternalTexture, and Unity's Vulkan backend reads
+// a native texture pointer as VkImage* - the same shape kl_vulkan_mtl_for_handle
+// already found on the way back (texL is a pointer whose first word is the
+// image). Handed the VkImage itself, Unity dereferences it: the first word of a
+// MoltenVK image object is its C++ vtable, so every layer yields the SAME
+// "image", pointing into MoltenVK's read-only data. That is AC Nexus's
+// deterministic wild handle in vkCreateImageView (0x...d99d0 on every layer,
+// moving only with the ASLR slide), and why its overlay textures never held a
+// picture. Tied to the one target it was traced on; KL_OVRP_TEXPTR_INDIRECT
+// overrides in either direction.
+static int klovrp_texptr_indirect(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_OVRP_TEXPTR_INDIRECT", t && !strcmp(t, "x5812519008825194"));
+    }
+    return v;
+}
+// One stable word per distinct image, because the guest may read the pointer
+// again long after this call returns. Images are recycled by value, so the
+// table stops growing once the guest's set of layers has been seen.
+static uint64_t *klovrp_texptr_slot(uint64_t img) {
+    static uint64_t slots[4096];
+    static int n;
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t *s = NULL;
+    pthread_mutex_lock(&lk);
+    for (int i = 0; i < n; i++) if (slots[i] == img) { s = &slots[i]; break; }
+    if (!s && n < (int)(sizeof slots / sizeof slots[0])) { s = &slots[n++]; *s = img; }
+    pthread_mutex_unlock(&lk);
+    return s;
+}
 static uint64_t klovrp_GetLayerTexturePtr(int layer_id, int stage, int eye,
                                           uint64_t *texture_ptr) {
     ovrp_hit("ovrp_GetLayerTexturePtr");
     uint64_t color = 0, depth = 0;
     uint64_t r = klovrp_GetLayerTexture2(layer_id, stage, eye, &color, &depth);
-    if (texture_ptr) *texture_ptr = color;
+    uint64_t out = color;
+    if (color && kl_vulkan_guest_active() && klovrp_texptr_indirect()) {
+        uint64_t *slot = klovrp_texptr_slot(color);
+        if (slot) out = (uint64_t)(uintptr_t)slot;
+    }
+    if (texture_ptr) *texture_ptr = out;
     // TEMP diagnostic: the guest was seen creating an image view on a wild
     // pointer right after this call - if these args do not read as a plausible
     // (layer, stage, eye, ptr) then the signature is wrong and the real texture
