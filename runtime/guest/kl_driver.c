@@ -174,6 +174,16 @@ static void kl_driver_env_defaults(const kl_target *t) {
         setenv("KL_USLEEP_CAP", "250", 0);   // microseconds; the FMOD poll slept 5-33 ms/call
         setenv("KL_GUEST_QOS",  "1",   0);   // USER_INITIATED instead of default
     }
+    else if (!strcmp(t->name, "x5269080709783454")) {
+        // Max Mustard (Unity 2022.3 + FMOD Studio over OpenSL). FMOD produced
+        // sound in only a small fraction of its buffers — heard as near-silence
+        // with the odd quiet stutter — while the banks loaded fine. wrath2's fix
+        // class: at default QoS visionOS coalesces the mixer's short timed waits
+        // to ~33 ms, longer than one 512-frame block at 48 kHz (10.7 ms), so the
+        // output starves between blocks.
+        setenv("KL_USLEEP_CAP", "250", 0);
+        setenv("KL_GUEST_QOS",  "1",   0);
+    }
 }
 
 void kl_driver_init(const kl_target *t, const char *libdir, kl_slink_door door) {

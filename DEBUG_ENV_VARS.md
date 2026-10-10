@@ -36,6 +36,10 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   0 instead of aborting. Read by `kl_jni.c` (via `kl_jni_set_permissive`),
   `kl_egl.c`, `kl_ovrp.c`, `kl_ovrplat.c`. Scouting only — the guest carries
   on with answers we invented. Does not apply to the DRM entitlement guard.
+- `KL_JNI_DROP_ANALYTICS=0` — (`runtime/kl_jni.c`) restore the abort for
+  unimplemented calls into third-party analytics SDKs (`com/gameanalytics/…`).
+  Default 1: such calls are dropped and answer zero/NULL/void, since there is
+  no host to report to. Max Mustard aborted on `GameAnalytics.addErrorEvent`.
 - `KL_DYLIB_DIR=<dir>` — (`runtime/kl_image.c`) prefer `<dir>/<name>.dylib`
   (klepton-ld output) over the ELF when loading each guest library — how
   `make bootdylib*` runs the translated images. Unset, the runtime ELF loader
@@ -270,6 +274,13 @@ answers GL and kl_glfb never initializes.
   the knob adds the *clean* lines, which is what makes two platforms diffable.
   Costs a `glGetIntegerv` per upload, hence opt-in. This is what exonerated
   the guest over the Simulator's ETC2 fault.
+- `KL_GLFB_RESOLVE_STAGE=0` — turn off the staged MSAA resolve. On by
+  default: when a guest's `glBlitFramebuffer` from a multisampled renderbuffer
+  fails with `GL_INVALID_OPERATION` (ES 3.0 forbids a resolve into a different
+  format; the Quest's driver allows it), the resolve is redone through a
+  same-format staging texture and then blitted to the guest's destination.
+  Keep Talking and Nobody Explodes resolves RGBA8 into its SRGB8_ALPHA8 eye
+  texture and showed solid pink without it.
 - `KL_GLFB_LOG_UNITS=1` — log texture-unit traffic (the "Invalid texture
   unit!" neighbourhood — see `KL_POKE_CAP` under Viewer).
 
@@ -1858,6 +1869,12 @@ reads no knobs).
 - `KL_AUDIO_TRACE=1` — one line every 200 writes: input/output frame counts,
   ring fill in frames and ms, underruns. What to turn on when the sound is
   present but wrong.
+- `KL_SL_SILENT_YIELD=0` — (`runtime/media/kl_opensl.c`) keep feeding the
+  device from an OpenSL player that has only ever produced silence while
+  another same-rate player is audible. Default 1: such a player stops writing
+  (it paces itself) until it hands over a non-silent buffer, because its
+  back-to-back writes starved the audible player's turn at the mix lock — Max
+  Mustard's FMOD output beside Unity's own silent one, heard as choppy audio.
 - `KL_AUDIO_SPATIAL=1` — visionOS only. Leave the system's spatialiser in the
   path. The default is `setIntendedSpatialExperience(.bypassed)` plus two
   preferred output channels (`KleptonAudio.directStereo`, imported from ALVR's

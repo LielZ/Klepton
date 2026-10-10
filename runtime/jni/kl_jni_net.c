@@ -251,6 +251,16 @@ static klj_val klj_System_load(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.j = 0};
 }
 
+// System.loadLibrary(name) itself, called straight from managed code through
+// AndroidJavaClass("java.lang.System") rather than through one of the wrappers
+// (Max Mustard does this after its platform init). Same resolution and the same
+// JNI_OnLoad as UnityPlayer.loadLibrary; the boolean is dropped because the
+// Java method returns void.
+static klj_val klj_System_loadLibrary(void *env, void *self, const klj_val *a, int n) {
+    klj_UnityPlayer_loadLibrary(env, self, a, n);
+    return (klj_val){.l = NULL};
+}
+
 // Epic Online Services' own loader: com.epicgames.mobile.eossdk.LibraryLoader
 // .load() is a no-arg System.loadLibrary("EOSSDK") wrapper (ZIX ships
 // libEOSSDK.so). It aborted as an unimplemented Java method; route it through
@@ -521,6 +531,7 @@ const klj_binding klj_bind_net[] = {
     {"android/content/Context", "getResources",
      "()Landroid/content/res/Resources;", klj_Context_getResources},
     {"java/lang/System", "load", "(Ljava/lang/String;)V", klj_System_load},
+    {"java/lang/System", "loadLibrary", "(Ljava/lang/String;)V", klj_System_loadLibrary},
     {"com/epicgames/mobile/eossdk/LibraryLoader", "load", "()V", klj_EOS_LibraryLoader_load},
     // EOSSDK.init(activity) — EOS bring-up after the loader ran. Online/account
     // services; a no-op lets the game boot offline (the platform SDKs are all

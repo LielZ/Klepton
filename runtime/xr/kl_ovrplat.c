@@ -364,6 +364,11 @@ static uint64_t klplat_called(const char *name) {
 #define KLPLAT_MSG_IAP_PURCHASES       974095385u  // IAP_GetViewerPurchases
 #define KLPLAT_MSG_IAP_PURCHASES_CACHE 1666817579u // IAP_GetViewerPurchasesDurableCache
 #define KLPLAT_MSG_IAP_PRODUCTS       2124073717u  // IAP_GetProductsBySKU
+// Read from Keep Talking and Nobody Explodes' global-metadata default-value blob
+// the same way (the same read reproduces 0x186B58B1 and 0x436F345D above), and
+// found again in Eye of the Temple's.
+#define KLPLAT_MSG_LEADERBOARD_GET_ENTRIES 0x5DB3474Cu // Leaderboard_GetEntries
+#define KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY 0x117FC8FEu // Leaderboard_WriteEntry
 #define KLPLAT_INIT_SUCCESS        0            // PlatformInitializeResult.Success
 #define KLPLAT_AGE_ADULT           3            // AccountAgeCategory.Ad
 
@@ -1781,6 +1786,34 @@ static uint64_t klplat_Application_CancelAppDownload(void) {
     return klplat_request_err("ovr_Application_CancelAppDownload", KLPLAT_MSG_APP_CANCEL_DL);
 }
 
+// Leaderboards. Keep Talking and Nobody Explodes reads one when a bomb is picked
+// from the binder, Eye of the Temple reads one while it starts, and both aborted
+// here on the unimplemented trampoline. There is no leaderboard service on this
+// host, so the read and the write complete as an error — what a Quest without a
+// network says — rather than as an empty or accepted board that would claim a
+// service answered. Nothing about ownership rides on a score.
+//
+// For every title: the two message types are the Platform SDK's own constants
+// (ovrMessage_Leaderboard_GetEntries / _WriteEntry in OVR_MessageType.h), and
+// they were read back identically from the global-metadata of both games, built
+// years apart (Unity 2022.3 and 2019.4) — the same check that reproduces the
+// Entitlement and User values above.
+static uint64_t klplat_Leaderboard_GetEntries(const char *name, int limit,
+                                              int filter, int start_at) {
+    (void)name; (void)limit; (void)filter; (void)start_at;
+    plat_hit("ovr_Leaderboard_GetEntries");
+    return klplat_request_err("ovr_Leaderboard_GetEntries",
+                              KLPLAT_MSG_LEADERBOARD_GET_ENTRIES);
+}
+static uint64_t klplat_Leaderboard_WriteEntry(const char *name, long long score,
+                                              const void *extra, unsigned extra_size,
+                                              int force) {
+    (void)name; (void)score; (void)extra; (void)extra_size; (void)force;
+    plat_hit("ovr_Leaderboard_WriteEntry");
+    return klplat_request_err("ovr_Leaderboard_WriteEntry",
+                              KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY);
+}
+
 static uint64_t klplat_AppVersion_code(const void *h) {
     plat_hit("ovr_ApplicationVersion_GetCode");
     (void)h;
@@ -2240,6 +2273,9 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     // exact-match binding here overrides the ovr_Achievements_ prefix rule.
     {"ovr_User_GetAccessToken",                (void *)klplat_User_GetAccessToken},
     {"ovr_Achievements_GetAllDefinitions",     (void *)klplat_Achievements_GetAllDefinitions},
+    // Leaderboards: error completions (see the handlers).
+    {"ovr_Leaderboard_GetEntries",             (void *)klplat_Leaderboard_GetEntries},
+    {"ovr_Leaderboard_WriteEntry",             (void *)klplat_Leaderboard_WriteEntry},
     {"ovr_Message_GetAchievementDefinitionArray", (void *)klplat_Message_GetPayload},
     // The logged-in user (async) and the User accessors its completion feeds.
     // Gated by KL_PLAT_USER inside the handler; the accessors are inert unless a

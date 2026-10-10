@@ -56,6 +56,10 @@ const klj_binding klj_bind_fmod[] = {
     // is nothing to store here (getContext answers from the activity), so no-ops.
     {FMODCLS, "init",                "(Landroid/content/Context;)V", klf_void},
     {FMODCLS, "init",                "(Ljava/lang/Object;)V",  klf_void},
+    // FMOD for Unity calls init through AndroidJavaClass, and Unity builds the
+    // signature from the activity's Class.getName() — dots, not slashes (Max
+    // Mustard). Matched as the string the guest asks for, like OculusDeviceConfig.
+    {FMODCLS, "init",                "(Lcom.unity3d.player.UnityPlayerActivity;)V", klf_void},
     {FMODCLS, "close",               "()V",                    klf_void},
     {FMODCLS, "getContext",          "()Landroid/content/Context;", klf_getContext},
     {FMODCLS, "getContext",          "()Ljava/lang/Object;",   klf_getContext},

@@ -211,6 +211,8 @@ typedef struct kl_sl_player {
 
     unsigned rate, channels, bits;          // from the PCM format
     int      mixes;                          // 1: feed kl_audio; 0: usleep-pace only
+    int      heard;                          // has handed over a non-silent buffer
+    int      yielded;                        // silent, standing aside (silent_yield)
     unsigned long consumed;
 } kl_sl_player;
 
@@ -307,6 +309,51 @@ static void player_wait_cb(kl_sl_player *p);   // caller must hold p->lock
 static void recorder_stop(kl_sl_recorder *r);
 static void *rec_feeder(void *arg);
 
+// ---- a silent player stands aside for one that is heard ----
+//
+// Two players at the SAME rate both mix into kl_audio, and kl_audio_write_src
+// serialises its producers on one lock that a writer holds while it waits for
+// room. Max Mustard (Unity 2022.3 + FMOD): Unity's own OpenSL output only ever
+// carries silence, but it writes back-to-back and keeps winning that lock, so
+// FMOD's feeder — the one with the game's sound — got a write in only now and
+// then, fell behind the reader, and was resynced each time: choppy, mostly
+// silent audio with 0 underruns, because the silent stream kept the ring full.
+// Adding silence changes nothing, so a player that has never produced a sample
+// stops writing while another player that HAS is playing; it paces itself with
+// usleep (the short-write path) and releases its mix slot. The first non-silent
+// buffer it hands over puts it back. KL_SL_SILENT_YIELD=0 is the A/B.
+static int another_player_heard(const kl_sl_player *p) {
+    for (int i = 0; i < KL_SL_MAX_PLAYERS; i++) {
+        const kl_sl_player *q = &g_players[i];
+        if (q != p && q->started && q->mixes && q->heard &&
+            q->state == SL_PLAYSTATE_PLAYING) return 1;
+    }
+    return 0;
+}
+static int silent_yield(kl_sl_player *p, const void *buf, SLuint32 size) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_SL_SILENT_YIELD", 1);
+    if (p->heard || p->bits != 16) return 0;
+    if (pcm_has_sound(buf, size)) {
+        p->heard = 1;
+        if (p->yielded) {
+            p->yielded = 0;
+            fprintf(stderr, "  [sl] player #%d has sound now — mixing again\n",
+                    (int)(p - g_players));
+        }
+        return 0;
+    }
+    if (!on || !another_player_heard(p)) return 0;
+    if (!p->yielded) {
+        p->yielded = 1;
+        kl_audio_src_release(p);
+        fprintf(stderr, "  [sl] player #%d has carried only silence while another "
+                        "is heard — it stops writing to the device\n",
+                (int)(p - g_players));
+    }
+    return 1;
+}
+
 // ---- the feeder ----
 //
 // FMOD enqueues a buffer, we "play" it for as long as it would really take, then
@@ -361,7 +408,8 @@ static void *feeder(void *arg) {
             !kl_aaudio_output_rate() && pcm_has_sound(buf, size))
             take_device(p);
 
-        size_t played = (buf && p->mixes) ? kl_audio_write_src(p, buf, size) : 0;
+        int quiet = buf && p->mixes && silent_yield(p, buf, size);
+        size_t played = (buf && p->mixes && !quiet) ? kl_audio_write_src(p, buf, size) : 0;
         if (played < size) {
             uint64_t rem = ((uint64_t)size - played) / frame;
             useconds_t us = (useconds_t)(rem * 1000000ull / rate);

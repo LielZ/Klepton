@@ -1147,6 +1147,26 @@ static klj_val klj_call_common(void *env, void *self, void *mid, char want,
         return b->fn(env, self, argv, argc);
     }
 
+    // Third-party analytics SDKs have no host to report to, and nothing a guest
+    // does with their answers is load-bearing: every call is dropped and answers
+    // zero/NULL/void, as a disabled SDK would. A whole class family rather than
+    // one row per method, because the guest's C# wrapper reaches for whichever
+    // entry its own error hook or event fires next. Max Mustard
+    // (x5269080709783454) aborted here on GameAnalytics.addErrorEvent right
+    // after its splash. KL_JNI_DROP_ANALYTICS=0 restores the abort.
+    static const char *const k_dropped[] = { "com/gameanalytics/" };
+    for (unsigned i = 0; i < sizeof k_dropped / sizeof *k_dropped; i++)
+        if (strncmp(w->cls, k_dropped[i], strlen(k_dropped[i])) == 0 &&
+            kl_env_on("KL_JNI_DROP_ANALYTICS", 1)) {
+            static int said;   // the first few name the entries; the rest are noise
+            if (said < 16) {
+                said++;
+                KLJ_LOG("%s.%s%s — analytics SDK, dropped (no host to report to)",
+                        w->cls, w->name, w->sig);
+            }
+            return zero;
+        }
+
     KLJ_LOG("no host implementation for %s.%s%s", w->cls, w->name, w->sig);
     if (!g_permissive) {
         fprintf(stderr, "[jni] this is a work item — add it to the family table in runtime/jni/.\n");

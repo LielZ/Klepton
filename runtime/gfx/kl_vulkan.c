@@ -574,8 +574,11 @@ static int klvk_park_instances(void) {
         // VkPhysicalDevice on the instance it kept than the one the plugin had
         // been handed off the probe, matched nothing, and fell back to GLES2;
         // parked, 6 of 6 created their device.
+        // Max Mustard (x5269080709783454) takes the handle answer too (see
+        // klovrp_adapter_is_phys), so it needs the probe's device kept alive.
         on = kl_env_on("KL_VK_PARK_INSTANCE",
-                       t && (strcmp(t, "walkabout") == 0 || strcmp(t, "batman") == 0));
+                       t && (strcmp(t, "walkabout") == 0 || strcmp(t, "batman") == 0 ||
+                             strcmp(t, "x5269080709783454") == 0));
     }
     return on;
 }

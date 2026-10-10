@@ -1491,9 +1491,22 @@ static void *klj_oculus_surface_created_native(void) {
         kl_image *img = kl_find_image("libOculusXRPlugin.so");
         if (img)
             fn = kl_sym(img, "Java_com_unity_oculus_OculusUnity_surfaceCreated");
+        // The plugin's 1.x line (Unity 2019.4 — Eye of the Temple) names the same
+        // private native initComplete(Surface): its OculusUnity.initOculus builds
+        // a SurfaceView on the UI thread and calls initComplete(holder.getSurface())
+        // from surfaceCreated. Same arguments, same job — the native turns the
+        // Surface into its window and lets the XR display start. Without it the
+        // plugin waits for a surface for good: the game runs and never submits a
+        // frame (no crash, 0 layers).
+        if (!fn && img) {
+            fn = kl_sym(img, "Java_com_unity_oculus_OculusUnity_initComplete");
+            if (fn)
+                fprintf(stderr, "  [jni] libOculusXRPlugin.so has the older initComplete(Surface) "
+                                "in place of surfaceCreated — calling that\n");
+        }
         if (!fn)
-            fprintf(stderr, "  [jni] no Java_com_unity_oculus_OculusUnity_surfaceCreated "
-                            "export in libOculusXRPlugin.so — surface setup skipped\n");
+            fprintf(stderr, "  [jni] no Java_com_unity_oculus_OculusUnity_surfaceCreated or "
+                            "_initComplete export in libOculusXRPlugin.so — surface setup skipped\n");
     }
     return fn;
 }
@@ -2079,6 +2092,11 @@ const klj_binding klj_bind_services[] = {
     {"java/util/Scanner", "next",          "()Ljava/lang/String;",                       klj_Scanner_next},
 
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetAssetManager",
+     "()Landroid/content/res/AssetManager;", klj_Context_getAssets},
+    // FMOD's Java helper hands its native side the AssetManager to read banks
+    // from file:///android_asset (Max Mustard). The same single manager as
+    // Context.getAssets — AAssetManager_fromJava maps any of them to one tree.
+    {"org/fmod/FMOD", "getAssetManager",
      "()Landroid/content/res/AssetManager;", klj_Context_getAssets},
 
     // android.media.MediaPlayer — GTA Vice City's intro/cutscene movie audio,

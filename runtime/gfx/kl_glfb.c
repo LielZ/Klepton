@@ -5707,6 +5707,122 @@ static void klfb_RenderbufferStorage(uint32_t target, uint32_t fmt,
     if (g_real_RenderbufferStorage) g_real_RenderbufferStorage(target, fmt, w, h);
 }
 
+// An MSAA resolve into a destination of a DIFFERENT format. ES 3.0 forbids it
+// (GL_INVALID_OPERATION, and the blit does nothing); the Quest's driver does it.
+// Keep Talking and Nobody Explodes renders its scene into an RGBA8 multisample
+// renderbuffer and resolves it straight into the SRGB8_ALPHA8 eye texture, so on
+// ANGLE every eye resolve failed, the eye texture was never written, and both
+// eyes showed whatever the storage held — solid pink. Called only after the
+// guest's own blit has failed with 0x502 and only for a multisampled
+// renderbuffer source: resolve into a same-format staging texture (legal), then
+// blit that single-sampled copy to the guest's destination, where a format
+// conversion is legal. KL_GLFB_RESOLVE_STAGE=0 turns it off.
+static int klfb_resolve_via_stage(int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1,
+                                  int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1,
+                                  uint32_t mask, uint32_t filter) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GLFB_RESOLVE_STAGE", 1);
+    if (!on || !(mask & 0x4000 /* COLOR_BUFFER_BIT */) || !a_glGetIntegerv ||
+        !g_real_BlitFramebuffer)
+        return 0;
+    static void (*bindfb)(uint32_t, uint32_t);
+    static void (*getfap)(uint32_t, uint32_t, uint32_t, int32_t *);
+    static void (*bindrb)(uint32_t, uint32_t);
+    static void (*getrbp)(uint32_t, uint32_t, int32_t *);
+    static void (*gentex)(int32_t, uint32_t *);
+    static void (*deltex)(int32_t, const uint32_t *);
+    static void (*bindtex)(uint32_t, uint32_t);
+    static void (*texstorage)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
+    static void (*genfb)(int32_t, uint32_t *);
+    static void (*fbtex)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+    if (!bindfb) {
+        bindfb     = asym("glBindFramebuffer");
+        getfap     = asym("glGetFramebufferAttachmentParameteriv");
+        bindrb     = asym("glBindRenderbuffer");
+        getrbp     = asym("glGetRenderbufferParameteriv");
+        gentex     = asym("glGenTextures");
+        deltex     = asym("glDeleteTextures");
+        bindtex    = asym("glBindTexture");
+        texstorage = asym("glTexStorage2D");
+        genfb      = asym("glGenFramebuffers");
+        fbtex      = asym("glFramebufferTexture2D");
+    }
+    if (!bindfb || !getfap || !bindrb || !getrbp || !gentex || !deltex ||
+        !bindtex || !texstorage || !genfb || !fbtex)
+        return 0;
+    int32_t rfb = 0, dfb = 0, rbuf = 0;
+    a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &rfb);
+    a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &dfb);
+    a_glGetIntegerv(0x0C02 /* READ_BUFFER */, &rbuf);
+    if (rfb <= 0 || rbuf == 0 /* NONE */) return 0;
+    int32_t otype = 0, oname = 0;
+    getfap(0x8CA8 /* READ_FRAMEBUFFER */, (uint32_t)rbuf, 0x8CD0 /* OBJECT_TYPE */, &otype);
+    if (otype != 0x8D41 /* RENDERBUFFER */) return 0;
+    getfap(0x8CA8, (uint32_t)rbuf, 0x8CD1 /* OBJECT_NAME */, &oname);
+    int32_t save_rb = 0, fmt = 0, samples = 0, w = 0, h = 0;
+    a_glGetIntegerv(0x8CA7 /* RENDERBUFFER_BINDING */, &save_rb);
+    bindrb(0x8D41, (uint32_t)oname);
+    getrbp(0x8D41, 0x8D44 /* INTERNAL_FORMAT */, &fmt);
+    getrbp(0x8D41, 0x8CAB /* SAMPLES */, &samples);
+    getrbp(0x8D41, 0x8D42 /* WIDTH */, &w);
+    getrbp(0x8D41, 0x8D43 /* HEIGHT */, &h);
+    bindrb(0x8D41, (uint32_t)save_rb);
+    if (samples <= 0 || w <= 0 || h <= 0) return 0;
+
+    static uint32_t stex, sfb;
+    static int32_t sfmt, sw, sh;
+    if (!sfb) genfb(1, &sfb);
+    if (!sfb) return 0;
+    if (!stex || sfmt != fmt || sw != w || sh != h) {
+        if (stex) deltex(1, &stex);
+        stex = 0;
+        gentex(1, &stex);
+        if (!stex) return 0;
+        int32_t save_tex = 0;
+        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &save_tex);
+        bindtex(0x0DE1 /* TEXTURE_2D */, stex);
+        texstorage(0x0DE1, 1, (uint32_t)fmt, w, h);
+        bindtex(0x0DE1, (uint32_t)save_tex);
+        bindfb(0x8CA9 /* DRAW_FRAMEBUFFER */, sfb);
+        fbtex(0x8CA9, 0x8CE0 /* COLOR_ATTACHMENT0 */, 0x0DE1, stex, 0);
+        sfmt = fmt; sw = w; sh = h;
+        fprintf(stderr, "  [glfb] MSAA resolve across formats refused by GL — "
+                        "resolving through a staging 0x%x %dx%d texture instead\n",
+                fmt, w, h);
+    }
+    // The source is foveated by the size rule (multisampled, eye-sized) and so
+    // is the eye texture; the staging texture is single-sampled and would not
+    // be. Patched ANGLE copies texel for texel only between targets carrying
+    // the SAME map and otherwise resamples through screen space — which
+    // warped the picture twice: squeezed into the lower part of the view and
+    // stretching as the head moved. So for these two blits the rule's sample
+    // floor drops to 1, which puts the staging texture under the same map.
+    int vrr = g_eye_rate_map && a_SetRateMapForSize && g_rate_rule_on &&
+              w == g_eye_rate_w && h == g_eye_rate_h;
+    if (vrr) a_SetRateMapForSize((uint32_t)w, (uint32_t)h, 1, g_eye_rate_map);
+    // 1: the resolve, same format and same rectangle on both sides.
+    bindfb(0x8CA9, sfb);
+    // Re-attached so ANGLE re-syncs the framebuffer and builds its pass with
+    // the map now in force (see klfb_resync_fbo for the caching this defeats).
+    if (vrr) fbtex(0x8CA9, 0x8CE0, 0x0DE1, stex, 0);
+    g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, sx0, sy0, sx1, sy1,
+                           0x4000, 0x2600 /* NEAREST */);
+    // 2: the guest's blit, from the single-sampled copy.
+    bindfb(0x8CA8, sfb);
+    bindfb(0x8CA9, (uint32_t)dfb);
+    g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, 0x4000, filter);
+    if (vrr)
+        a_SetRateMapForSize((uint32_t)w, (uint32_t)h, (uint32_t)g_eye_rate_min,
+                            g_eye_rate_map);
+    bindfb(0x8CA8, (uint32_t)rfb);
+    // Depth/stencil were refused along with the colour; their formats were not
+    // the problem, so they go as the guest asked.
+    if (mask & ~0x4000u)
+        g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
+                               mask & ~0x4000u, filter);
+    return 1;
+}
+
 static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1,
                                  int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1,
                                  int64_t mask, int64_t filter) {
@@ -5955,9 +6071,16 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
             }
         }
     }
-    if (g_real_BlitFramebuffer)
+    if (g_real_BlitFramebuffer) {
+        // Drained first so a 0x502 after the blit is provably the blit's own.
+        int check = a_glGetError && (mask & 0x4000);
+        if (check) while (a_glGetError()) {}
         g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
                                (uint32_t)mask, (uint32_t)filter);
+        if (check && a_glGetError() == 0x502 /* INVALID_OPERATION */)
+            klfb_resolve_via_stage(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
+                                   (uint32_t)mask, (uint32_t)filter);
+    }
     // Did the redirected eye-copy actually land the lit source into the swapchain dest?
     // Read the DRAW (swapchain) fbo's centre. Lit here but black on-screen = the per-eye
     // layer we fill is not the one submitted (a deeper submission-path problem, not a blit

@@ -365,8 +365,13 @@ static int klovrp_adapter_is_phys(void) {
         // hardware requirements" and a GLES2 context — with the Adreno identity
         // and the Quest 3 model already in place, so neither of those was the
         // gate. With the handle it creates its device (35 extensions) and renders.
+        // Max Mustard (x5269080709783454, Unity 2022.3.16) is the third: same
+        // LUID answer, same one-device walk, same fall to GLES2 — whose shaders
+        // it does not ship ("shader compiler platform 5"), so every material
+        // drew as Unity's pink error shader.
         on = kl_env_on("KL_OVRP_ADAPTER_PHYS",
-                       t && (strcmp(t, "walkabout") == 0 || strcmp(t, "batman") == 0));
+                       t && (strcmp(t, "walkabout") == 0 || strcmp(t, "batman") == 0 ||
+                             strcmp(t, "x5269080709783454") == 0));
     }
     return on;
 }
@@ -7851,6 +7856,13 @@ static const char *const g_ovrp_result_ok[] = {
     // without changing what reaches the display. Graduates to a real body only
     // if a title turns out to read the alpha mode back and require it.
     "ovrp_SetEyeFovPremultipliedAlphaMode",
+    // Whether the compositor masks the lens' hidden area with the occlusion
+    // mesh. ovrpResult (the C# wrapper compares it to Result.Success).
+    // There is no occlusion mesh on this host — ovrp_GetEyeOcclusionMesh and
+    // ovrp_GetViewportStencil already say so — so the switch has nothing to
+    // act on; accepting it is recorded state, like the other setters here.
+    // Keep Talking and Nobody Explodes pushes it while OVRManager starts up.
+    "ovrp_SetEyeOcclusionMeshEnabled",
 };
 
 static const char *const g_ovrp_bool_yes[] = {
