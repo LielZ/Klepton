@@ -479,6 +479,16 @@ int kl_glfb_init(void) {
                     ? "yes" : "NO",
                 (strstr(ext, "GL_OES_draw_buffers_indexed") ||
                  strstr(ext, "GL_EXT_draw_buffers_indexed")) ? "yes" : "NO");
+        static const char *const want[] = {
+            "GL_OES_draw_buffers_indexed", "GL_OES_copy_image", "GL_EXT_copy_image",
+            "GL_OES_draw_elements_base_vertex", "GL_EXT_texture_buffer",
+            "GL_OVR_multiview2", "GL_ANGLE_multiview_multisample",
+            "GL_EXT_clip_control", "GL_OES_texture_border_clamp",
+        };
+        fprintf(stderr, "  [glfb] beyond ES 3.0:");
+        for (size_t i = 0; i < sizeof want / sizeof want[0]; i++)
+            fprintf(stderr, " %s=%s", want[i] + 3, strstr(ext, want[i]) ? "yes" : "NO");
+        fprintf(stderr, "\n");
     }
 
     // Release it. EGL binds a context to one thread at a time and *refuses* to
@@ -522,7 +532,66 @@ static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 typedef struct { void *ctx, *surf; int probed; int debug_cb; } klfb_thread_gl;
 
 static void klfb_tls_free(void *p) { free(p); }
-static void klfb_tls_init(void) { pthread_key_create(&g_tls_key, klfb_tls_free); }
+static int g_tls_ready;
+static void klfb_tls_init(void) { pthread_key_create(&g_tls_key, klfb_tls_free); g_tls_ready = 1; }
+
+// ---- emulation state, kept PER CONTEXT -------------------------------------
+//
+// Several of the ES 3.1 emulations below remember what the guest has bound —
+// the buffer on each target, the 2D texture on each unit, the vertex layout of
+// each VAO, the CPU shadow of a mapped buffer. That is context state, and it
+// was kept once for the process, on the reasoning that GL is serialised on one
+// thread. Unreal runs TWO contexts at once (its shared context on the game
+// thread for uploads, its rendering context on the render thread), each on its
+// own ANGLE context here, so each thread overwrote what the other had recorded:
+// a restore put the other thread's texture back on a unit, an unmap flushed the
+// other thread's shadow into the wrong buffer, a draw applied the other
+// context's VAO layout (Maestro: exploded geometry, black textures, refused
+// buffer uploads).
+//
+// The state follows the ANGLE context the calling thread holds, not the thread:
+// in migration mode the one root context moves between threads and its state
+// has to move with it. A thread with no context yet shares the NULL entry.
+#define KLFB_CTX_SLOT_TB    0
+#define KLFB_CTX_SLOT_EMAPS 1
+#define KLFB_CTX_SLOT_VAO   2
+#define KLFB_CTX_SLOT_FBO   3
+#define KLFB_CTX_SLOTS      4
+#define KLFB_CTXS           16
+static struct { void *ctx; int used; void *slot[KLFB_CTX_SLOTS]; } g_ctx_state[KLFB_CTXS];
+static pthread_mutex_t g_ctx_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static void *klfb_ctx_slot(int which, size_t size) {
+    static _Thread_local void *cached_ctx;
+    static _Thread_local int   cached_valid;
+    static _Thread_local void *cached[KLFB_CTX_SLOTS];
+    void *ctx = NULL;
+    if (g_tls_ready) {
+        klfb_thread_gl *t = pthread_getspecific(g_tls_key);
+        if (t) ctx = t->ctx;
+    }
+    if (cached_valid && cached_ctx == ctx && cached[which]) return cached[which];
+    if (!cached_valid || cached_ctx != ctx) {
+        memset(cached, 0, sizeof cached);
+        cached_ctx = ctx; cached_valid = 1;
+    }
+    void *p = NULL;
+    pthread_mutex_lock(&g_ctx_state_lock);
+    int i = 0, free_i = -1;
+    for (; i < KLFB_CTXS; i++) {
+        if (g_ctx_state[i].used && g_ctx_state[i].ctx == ctx) break;
+        if (!g_ctx_state[i].used && free_i < 0) free_i = i;
+    }
+    if (i == KLFB_CTXS) {
+        // More contexts than rows: the last row is shared rather than refused.
+        i = free_i >= 0 ? free_i : KLFB_CTXS - 1;
+        if (!g_ctx_state[i].used) { g_ctx_state[i].used = 1; g_ctx_state[i].ctx = ctx; }
+    }
+    if (!g_ctx_state[i].slot[which]) g_ctx_state[i].slot[which] = calloc(1, size);
+    p = g_ctx_state[i].slot[which];
+    pthread_mutex_unlock(&g_ctx_state_lock);
+    cached[which] = p;
+    return p;
+}
 
 // Owner of the root context in migration mode: the thread id that last took it
 // and has not released it, 0 when free.
@@ -731,6 +800,42 @@ void kl_glfb_make_current(void) {
 // Frees the root context for the next thread and detaches it here, so the
 // next claimant's make_current can retake it. Called from klegl_MakeCurrent
 // when the guest makes no context current.
+// A context for a runtime call that has to make a GL object on a thread holding
+// none — the guest's OVRPlugin asks ovrp_GetLayerTexture2 for an overlay's
+// storage from whichever thread it is on, and Sniper Elite VR asks from one
+// with no context at all, so the glGenTextures there produced no name and the
+// game's video/briefing overlay was never created (a black scene under its
+// narration). Only when NOTHING is current on this thread: then binding a
+// context of our own is EGL-legal and cannot disturb the guest's ownership of
+// its own. The context is in the guest's share group, so the texture made under
+// it is visible to the guest's context; one per thread, kept, and unbound again
+// by kl_glfb_return_context. Returns 1 if a context was borrowed.
+static __thread void *g_borrow_ctx, *g_borrow_surf;
+int kl_glfb_borrow_context(void) {
+    if (!g_ready || !a_eglMakeCurrent || !a_eglCreateContext) return 0;
+    static void *(*r_GetCurrentContext)(void);
+    if (!r_GetCurrentContext) r_GetCurrentContext = asym("eglGetCurrentContext");
+    if (!r_GetCurrentContext || r_GetCurrentContext()) return 0;   // something is current: leave it
+    if (!g_borrow_ctx) {
+        const int32_t surf_attrs[] = { EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE };
+        const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+        g_borrow_surf = a_eglCreatePbufferSurface(g_dpy, g_cfg, surf_attrs);
+        g_borrow_ctx  = a_eglCreateContext(g_dpy, g_cfg, g_ctx, ctx_attrs);
+        uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+        fprintf(stderr, "  [glfb] thread %llu had no context for a runtime GL call — "
+                        "borrowing a shared one (%p)\n", (unsigned long long)tid, g_borrow_ctx);
+    }
+    if (!g_borrow_ctx || !g_borrow_surf) return 0;
+    return a_eglMakeCurrent(g_dpy, g_borrow_surf, g_borrow_surf, g_borrow_ctx) ? 1 : 0;
+}
+void kl_glfb_return_context(void) {
+    if (!a_eglMakeCurrent) return;
+    static void (*r_Flush)(void);
+    if (!r_Flush) r_Flush = asym("glFlush");
+    if (r_Flush) r_Flush();          // the objects made here are visible to the share group
+    a_eglMakeCurrent(g_dpy, NULL, NULL, NULL);
+}
+
 void kl_glfb_release_current(void) {
     if (!g_ready || !a_eglMakeCurrent) return;
     pthread_once(&g_tls_once, klfb_tls_init);
@@ -1294,6 +1399,7 @@ static int klfb_rename_varying(char *buf, char *p, int is_frag) {
     char *after = close + 1;
     while (*after == ' ' || *after == '\t') after++;
     char *q = after;
+    int saw_flat = 0;
     for (;;) {
         while (*q == ' ' || *q == '\t') q++;
         static const char *skip[] = { "flat", "smooth", "noperspective", "centroid",
@@ -1301,7 +1407,10 @@ static int klfb_rename_varying(char *buf, char *p, int is_frag) {
         int did = 0;
         for (unsigned i = 0; i < sizeof skip / sizeof skip[0]; i++) {
             size_t l = strlen(skip[i]);
-            if (strncmp(q, skip[i], l) == 0 && !KLFB_IDENT(q[l])) { q += l; did = 1; break; }
+            if (strncmp(q, skip[i], l) == 0 && !KLFB_IDENT(q[l])) {
+                if (i == 0) saw_flat = 1;
+                q += l; did = 1; break;
+            }
         }
         if (!did) break;
     }
@@ -1309,6 +1418,32 @@ static int klfb_rename_varying(char *buf, char *p, int is_frag) {
     int is_in  = (strncmp(q, "in",  2) == 0 && !KLFB_IDENT(q[2]));
     int varying = is_frag ? is_in : is_out;
     if (!varying) return 0;
+    // An INTEGER varying must be `flat` in GLSL ES — the language says so and
+    // ANGLE holds to it ("'out' : must use 'flat' interpolation here"), where a
+    // Quest's driver lets it pass. Unreal's cross-compiler writes
+    // `layout(location=0) out uint var_...;` for the view index it hands from a
+    // multiview vertex shader to its fragment shader (Maestro: one shader of
+    // forty, and whatever it draws was missing). The qualifier goes in where the
+    // layout came out, so the text still only shrinks.
+    int need_flat = 0;
+    if (!saw_flat) {
+        const char *ty = q + (is_out ? 3 : 2);
+        for (;;) {
+            while (*ty == ' ' || *ty == '\t') ty++;
+            static const char *prec[] = { "highp", "mediump", "lowp" };
+            int did = 0;
+            for (unsigned i = 0; i < 3; i++) {
+                size_t l = strlen(prec[i]);
+                if (strncmp(ty, prec[i], l) == 0 && !KLFB_IDENT(ty[l])) { ty += l; did = 1; break; }
+            }
+            if (!did) break;
+        }
+        static const char *ints[] = { "int", "uint", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3", "uvec4" };
+        for (unsigned i = 0; i < sizeof ints / sizeof ints[0]; i++) {
+            size_t l = strlen(ints[i]);
+            if (strncmp(ty, ints[i], l) == 0 && !KLFB_IDENT(ty[l])) { need_flat = 1; break; }
+        }
+    }
     // The declared identifier: the last name before ';' (or before a '[N]').
     char *semi = strchr(q, ';');
     if (!semi) return 0;
@@ -1325,6 +1460,10 @@ static int klfb_rename_varying(char *buf, char *p, int is_frag) {
     char canon[24]; snprintf(canon, sizeof canon, "kl_var%ld", L);
     if (strlen(canon) > strlen(name)) return 0;         // only shrink, for in-place
     memmove(p, after, strlen(after) + 1);               // drop "layout(...) "
+    if (need_flat && (size_t)(after - p) >= 5) {        // ...and "flat " fits in its place
+        memmove(p + 5, p, strlen(p) + 1);
+        memcpy(p, "flat ", 5);
+    }
     klfb_rename_ident(buf, name, canon);                // pair by canonical name
     return 1;
 }
@@ -1853,7 +1992,9 @@ static void klfb_LinkProgram(uint32_t program) {
     // lightmap; the model shader computes ambient from constants + normal instead.
     static int dump_all = -2, dumped_n = 0;
     if (dump_all == -2) dump_all = kl_env_on("KL_GLFB_DUMP_SHADERS", 0);
-    if (dump_all && dumped_n < 80) {
+    static int dump_max = -1;
+    if (dump_max < 0) dump_max = kl_env_int("KL_GLFB_DUMP_SHADERS_MAX", 80);
+    if (dump_all && dumped_n < dump_max) {
         dumped_n++;
         static void (*r_gas)(uint32_t, int32_t, int32_t *, uint32_t *);
         if (!r_gas) r_gas = asym("glGetAttachedShaders");
@@ -2097,6 +2238,7 @@ static void klfb_cimg_forget(int32_t n, const uint32_t *ids);
 // The gen/delete pairs, as a macro: the only thing that varies is which counter
 // moves, and a typo in one hand-written copy is a census that lies about exactly
 // one class.
+static void klfb_tb_forget(uint32_t tex, uint32_t buffer);   // texel-buffer emulation, below
 #define KLFB_GENDEL(Name, KIND)                                               \
     static void (*g_real_Gen##Name)(int32_t, uint32_t *);                     \
     static void (*g_real_Delete##Name)(int32_t, const uint32_t *);            \
@@ -2110,6 +2252,12 @@ static void klfb_cimg_forget(int32_t n, const uint32_t *ids);
         if (klfb_census_every() && ids &&                                     \
             ((KIND) == KLC_TEX || (KIND) == KLC_RBO))                         \
             for (int32_t i = 0; i < n; i++) klfb_vram_forget(KIND, ids[i]);   \
+        if ((KIND) == KLC_TEX && ids)                                         \
+            for (int32_t i = 0; i < n; i++) {                                 \
+                klfb_tb_forget(ids[i], 0);                                   \
+            }                                                                 \
+        if ((KIND) == KLC_BUF && ids)                                         \
+            for (int32_t i = 0; i < n; i++) klfb_tb_forget(0, ids[i]);        \
         if (g_real_Delete##Name) g_real_Delete##Name(n, ids);                 \
     }
 
@@ -2345,14 +2493,139 @@ static uint8_t (*g_real_UnmapBuffer_t)(uint32_t);
 // re-upload whenever that buffer is written. Declared here (before the buffer
 // unmap code that refreshes) though the copy itself lives with the texture code.
 // GL is serialized on the context thread, so plain statics are safe.
-#define KLFB_TB_ASSOC 256
+#define KLFB_TB_ASSOC 1024
 // off/len: the glTexBufferRange window (len 0 = the whole buffer, glTexBuffer).
 static struct { uint32_t buffer, tex, ifmt; intptr_t off, len; } g_tb_assoc[KLFB_TB_ASSOC];
 static unsigned g_tb_assoc_n;
-static int      g_tb_active_unit;              // current glActiveTexture unit
+// A deleted texture or buffer leaves the table: names are reused, and an entry
+// that outlived its texture would have every later write to the buffer uploaded
+// over whatever texture next got that name.
+// ---- a CPU copy of every buffer that backs a texel-buffer texture ------------
+//
+// The 2D stand-in is filled from the buffer's bytes, and until now those were
+// read back out of GL with a READ mapping each time the buffer was written.
+// That read is the weak link: this ANGLE's Metal backend hands back NULL for
+// maps of some dynamic buffers (see klfb_MapBufferRange), a failed read uploads
+// nothing, and a bone buffer that is never uploaded is all zeros — every vertex
+// of the mesh at one point, i.e. a skinned character that is simply not there
+// (Maestro: its musicians and its book, with their instruments in mid-air).
+//
+// So the bytes are kept as they are written — glBufferData, glBufferSubData and
+// both kinds of unmap all pass through here — and the upload uses them. Only
+// for buffers a texture has been pointed at; the read-back stays as the way a
+// copy is first seeded, and as the fallback when there is none.
+#define KLFB_TBM 1024
+static struct { uint32_t buf; uint8_t *bytes; size_t size; unsigned ev; } g_tbm[KLFB_TBM];
+// KL_GLFB_TB_REPORT also names the first few things that happen to each kept
+// buffer — where its bytes come from, and whether they are anything but zero.
+static void klfb_tbm_event(int i, const char *what, size_t off, size_t len, const void *data) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GLFB_TB_REPORT", 0);
+    if (!on || g_tbm[i].ev >= 5) return;
+    g_tbm[i].ev++;
+    size_t nz = 0;
+    if (data) for (size_t b = 0; b < len; b++) nz += ((const uint8_t *)data)[b] != 0;
+    uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+    fprintf(stderr, "  [glfb]   kept buffer %u: %s off %zu len %zu%s, %zu non-zero (t%llu)\n",
+            g_tbm[i].buf, what, off, len, data ? "" : " (no data)", nz, (unsigned long long)tid);
+}
+static unsigned g_tbm_n;
+static pthread_mutex_t g_tbm_mu = PTHREAD_MUTEX_INITIALIZER;
+static int klfb_tbm_ix(uint32_t buf) {            // call with g_tbm_mu held
+    for (unsigned i = 0; i < g_tbm_n; i++) if (g_tbm[i].buf == buf) return (int)i;
+    return -1;
+}
+// Start keeping `buf` (glTexBuffer named it). Its size is not known yet.
+static void klfb_tbm_want(uint32_t buf) {
+    if (!buf) return;
+    pthread_mutex_lock(&g_tbm_mu);
+    if (klfb_tbm_ix(buf) < 0 && g_tbm_n < KLFB_TBM) {
+        g_tbm[g_tbm_n].buf = buf; g_tbm[g_tbm_n].bytes = NULL; g_tbm[g_tbm_n].size = 0;
+        g_tbm[g_tbm_n].ev = 0;
+        g_tbm_n++;
+    }
+    pthread_mutex_unlock(&g_tbm_mu);
+}
+static void klfb_tbm_drop(uint32_t buf) {
+    pthread_mutex_lock(&g_tbm_mu);
+    int i = klfb_tbm_ix(buf);
+    if (i >= 0) { free(g_tbm[i].bytes); g_tbm[i] = g_tbm[--g_tbm_n]; }
+    pthread_mutex_unlock(&g_tbm_mu);
+}
+// The buffer was (re)specified: `size` bytes, from `data` or undefined (zeros).
+static void klfb_tbm_respecify(uint32_t buf, size_t size, const void *data) {
+    if (!buf || !g_tbm_n) return;
+    pthread_mutex_lock(&g_tbm_mu);
+    int i = klfb_tbm_ix(buf);
+    if (i >= 0) {
+        uint8_t *nb = size ? realloc(g_tbm[i].bytes, size) : NULL;
+        if (size && !nb) { free(g_tbm[i].bytes); nb = NULL; size = 0; }
+        if (!size) free(g_tbm[i].bytes);
+        g_tbm[i].bytes = nb; g_tbm[i].size = size;
+        if (nb) { if (data) memcpy(nb, data, size); else memset(nb, 0, size); }
+        klfb_tbm_event(i, "respecified", 0, size, data);
+    }
+    pthread_mutex_unlock(&g_tbm_mu);
+}
+// `len` bytes were written at `off`. Grows the copy when the write reaches past
+// it (a copy that was never sized starts here).
+static void klfb_tbm_write(uint32_t buf, size_t off, size_t len, const void *data) {
+    if (!buf || !g_tbm_n || !data || !len) return;
+    pthread_mutex_lock(&g_tbm_mu);
+    int i = klfb_tbm_ix(buf);
+    if (i >= 0) {
+        if (off + len > g_tbm[i].size) {
+            uint8_t *nb = realloc(g_tbm[i].bytes, off + len);
+            if (nb) {
+                memset(nb + g_tbm[i].size, 0, off + len - g_tbm[i].size);
+                g_tbm[i].bytes = nb; g_tbm[i].size = off + len;
+            }
+        }
+        if (g_tbm[i].bytes && off + len <= g_tbm[i].size) memcpy(g_tbm[i].bytes + off, data, len);
+        klfb_tbm_event(i, "written", off, len, data);
+    }
+    pthread_mutex_unlock(&g_tbm_mu);
+}
+// A copy of [off, off+len) of the kept bytes (len 0 = to the end), malloc'd for
+// the caller; NULL when nothing is kept for `buf`.
+static void *klfb_tbm_copy(uint32_t buf, size_t off, size_t len, size_t *out_len) {
+    void *r = NULL;
+    pthread_mutex_lock(&g_tbm_mu);
+    int i = klfb_tbm_ix(buf);
+    if (i >= 0 && g_tbm[i].bytes && off < g_tbm[i].size) {
+        size_t n = g_tbm[i].size - off;
+        if (len && len < n) n = len;
+        r = malloc(n);
+        if (r) { memcpy(r, g_tbm[i].bytes + off, n); *out_len = n; }
+    }
+    pthread_mutex_unlock(&g_tbm_mu);
+    return r;
+}
+
+static void klfb_tb_forget(uint32_t tex, uint32_t buffer) {
+    for (unsigned i = 0; i < g_tb_assoc_n; ) {
+        if ((tex && g_tb_assoc[i].tex == tex) || (buffer && g_tb_assoc[i].buffer == buffer))
+            g_tb_assoc[i] = g_tb_assoc[--g_tb_assoc_n];
+        else i++;
+    }
+    if (buffer) klfb_tbm_drop(buffer);
+}
 #define KLFB_TB_UNITS 128
-static uint32_t g_tb_bound2d[KLFB_TB_UNITS];   // GL_TEXTURE_2D bound per unit
-static uint32_t g_tb_bound_buf[10];            // bound buffer per target slot (below)
+// What the guest has bound, per context (klfb_ctx_slot): the three names below
+// read as the globals they used to be.
+typedef struct {
+    int      active_unit;                  // current glActiveTexture unit
+    uint32_t bound2d[KLFB_TB_UNITS];       // GL_TEXTURE_2D bound per unit
+    uint32_t bound_buf[10];                // bound buffer per target slot (below)
+    uint32_t sampler[KLFB_TB_UNITS];       // the guest's sampler object per unit
+    uint8_t  tb_unit[KLFB_TB_UNITS];       // unit currently shows a texel-buffer stand-in
+} klfb_tb_state;
+#define KLFB_TB_STATE    ((klfb_tb_state *)klfb_ctx_slot(KLFB_CTX_SLOT_TB, sizeof(klfb_tb_state)))
+#define g_tb_active_unit (KLFB_TB_STATE->active_unit)
+#define g_tb_bound2d     (KLFB_TB_STATE->bound2d)
+#define g_tb_bound_buf   (KLFB_TB_STATE->bound_buf)
+#define g_tb_sampler     (KLFB_TB_STATE->sampler)
+#define g_tb_unit        (KLFB_TB_STATE->tb_unit)
 static int klfb_tb_tgtslot(uint32_t target) {
     switch (target) {
         case 0x8892: return 0;  // ARRAY_BUFFER
@@ -2387,13 +2660,17 @@ static int klfb_trace_buf(void) {
 // unmap — glBufferSubData needs no mapping and always works. READ maps are not
 // emulated: GLES has no glGetBufferSubData to seed the shadow from the buffer.
 #define KLFB_MAX_EMAPS 8
-static struct {
-    int      active;               // slot in use between map and unmap
+typedef struct {
+    int      active;               // slot in use between map and unmap (2: a REAL map, watched)
+    void    *real;                 // ...and for that kind, ANGLE's own pointer
     uint32_t buf, target;
     intptr_t offset, length;
     void    *shadow;               // kept and GROWN across maps, not malloc'd each time
     size_t   cap;
-} g_emaps[KLFB_MAX_EMAPS];
+} klfb_emap;
+// Per context too: a map and its unmap happen on one context, and two threads
+// mapping at once must not be handed each other's shadow.
+#define g_emaps ((klfb_emap *)klfb_ctx_slot(KLFB_CTX_SLOT_EMAPS, sizeof(klfb_emap) * KLFB_MAX_EMAPS))
 // Set once ANGLE-Metal has proven it will not map these dynamic buffers, so the
 // hot path stops paying for a doomed real map + glBufferData orphan on every one.
 static int g_map_metal_refuses;
@@ -2403,9 +2680,18 @@ static uint32_t klfb_buffer_binding_of(uint32_t target) {
         case 0x8892: return 0x8894; // ARRAY_BUFFER          -> ARRAY_BUFFER_BINDING
         case 0x8893: return 0x8895; // ELEMENT_ARRAY_BUFFER  -> ELEMENT_ARRAY_BUFFER_BINDING
         case 0x8A11: return 0x8A28; // UNIFORM_BUFFER         -> UNIFORM_BUFFER_BINDING
+        // Unreal uploads textures through a mapped GL_PIXEL_UNPACK_BUFFER; a
+        // shadow that does not know which buffer it stands for cannot tell two
+        // of them apart.
+        case 0x88EB: return 0x88ED; // PIXEL_PACK_BUFFER      -> PIXEL_PACK_BUFFER_BINDING
+        case 0x88EC: return 0x88EF; // PIXEL_UNPACK_BUFFER    -> PIXEL_UNPACK_BUFFER_BINDING
+        case 0x8F36: return 0x8F36; // COPY_READ_BUFFER       (binding query is the same enum)
+        case 0x8F37: return 0x8F37; // COPY_WRITE_BUFFER      (likewise)
         default:     return 0;
     }
 }
+static void klfb_buffer_refused(const char *fn, uint32_t target, intptr_t size, uint32_t usage);
+static int glfb_errscan(void);
 static uint32_t klfb_bound_buffer(uint32_t target) {
     uint32_t pn = klfb_buffer_binding_of(target);
     int32_t  v  = 0;
@@ -2491,6 +2777,24 @@ static void *klfb_MapBufferRange(uint32_t target, intptr_t offset, intptr_t leng
             }
         }
     }
+    // A REAL map of a buffer whose bytes are being kept (klfb_tbm): remember
+    // where the guest is writing, so the unmap can take the bytes with it.
+    if (p && length > 0 && (access & 0x0002 /* MAP_WRITE */) && g_tbm_n) {
+        int kept = 0;
+        for (int i = 0; i < KLFB_MAX_EMAPS && !kept; i++)
+            kept = g_emaps[i].active && g_emaps[i].shadow == p;   // it IS a shadow
+        uint32_t bound = klfb_bound_buffer(target);
+        pthread_mutex_lock(&g_tbm_mu);
+        int want = !kept && bound && klfb_tbm_ix(bound) >= 0;
+        pthread_mutex_unlock(&g_tbm_mu);
+        for (int i = 0; want && i < KLFB_MAX_EMAPS; i++) {
+            if (g_emaps[i].active) continue;
+            g_emaps[i].active = 2; g_emaps[i].real = p;
+            g_emaps[i].buf = bound; g_emaps[i].target = target;
+            g_emaps[i].offset = offset; g_emaps[i].length = length;
+            break;
+        }
+    }
     if (klfb_trace_buf()) {
         if (!p) {
             uint32_t e = a_glGetError ? a_glGetError() : 0;
@@ -2508,12 +2812,25 @@ static uint8_t klfb_UnmapBuffer(uint32_t target) {
     // real buffer with glBufferSubData and report success WITHOUT calling the real
     // glUnmapBuffer — the real buffer was never mapped.
     uint32_t buf = klfb_bound_buffer(target);
+    // A watched REAL map first: take the bytes while ANGLE's pointer is valid.
     for (int i = 0; i < KLFB_MAX_EMAPS; i++) {
-        if (!g_emaps[i].active || g_emaps[i].target != target) continue;
+        if (g_emaps[i].active != 2 || g_emaps[i].target != target) continue;
         if (g_emaps[i].buf != buf && buf != 0) continue;
+        klfb_tbm_write(g_emaps[i].buf, (size_t)g_emaps[i].offset, (size_t)g_emaps[i].length,
+                       g_emaps[i].real);
+        g_emaps[i].active = 0; g_emaps[i].real = NULL;
+        break;
+    }
+    for (int i = 0; i < KLFB_MAX_EMAPS; i++) {
+        if (g_emaps[i].active != 1 || g_emaps[i].target != target) continue;
+        if (g_emaps[i].buf != buf && buf != 0) continue;
+        klfb_tbm_write(g_emaps[i].buf, (size_t)g_emaps[i].offset, (size_t)g_emaps[i].length,
+                       g_emaps[i].shadow);
         if (g_real_BufferSubData_t)
             g_real_BufferSubData_t(target, g_emaps[i].offset, g_emaps[i].length,
                                    g_emaps[i].shadow);
+        if (glfb_errscan())
+            klfb_buffer_refused("glUnmapBuffer's shadow flush", target, g_emaps[i].length, 0);
         if (klfb_trace_buf())
             fprintf(stderr, "  [glfb] glUnmapBuffer(0x%x): flushed CPU shadow "
                     "(buf=%u off=%ld len=%ld) via glBufferSubData\n", target,
@@ -2535,15 +2852,34 @@ static void (*g_real_FlushMappedBufferRange_t)(uint32_t, intptr_t, intptr_t);
 static void klfb_FlushMappedBufferRange(uint32_t target, intptr_t offset, intptr_t length) {
     uint32_t buf = klfb_bound_buffer(target);
     for (int i = 0; i < KLFB_MAX_EMAPS; i++)
-        if (g_emaps[i].active && g_emaps[i].target == target &&
+        if (g_emaps[i].active == 1 && g_emaps[i].target == target &&
             (g_emaps[i].buf == buf || buf == 0))
             return;   // emulated — nothing to flush now
     if (g_real_FlushMappedBufferRange_t)
         g_real_FlushMappedBufferRange_t(target, offset, length);
 }
+static int glfb_errscan(void);
+// ERRSCAN: a refused buffer call, with what it was aimed at — the error alone
+// does not say which target, and "nothing bound there" is the usual reason.
+static void klfb_buffer_refused(const char *fn, uint32_t target, intptr_t size, uint32_t usage) {
+    uint32_t e = a_glGetError ? a_glGetError() : 0;
+    static int said;
+    if (!e || said >= 16) return;
+    said++;
+    uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+    fprintf(stderr, "  [glfb] %s(target 0x%x, size %ld, usage 0x%x) REFUSED 0x%x — buffer "
+                    "bound there: %u (tracked %u), thread %llu\n",
+            fn, target, (long)size, usage, e, klfb_bound_buffer(target),
+            klfb_tb_tgtslot(target) >= 0 ? g_tb_bound_buf[klfb_tb_tgtslot(target)] : 0,
+            (unsigned long long)tid);
+    while (a_glGetError && a_glGetError()) {}
+}
 static void klfb_BufferData(uint32_t target, intptr_t size, const void *data,
                             uint32_t usage) {
     if (g_real_BufferData_t) g_real_BufferData_t(target, size, data, usage);
+    if (glfb_errscan()) klfb_buffer_refused("glBufferData", target, size, usage);
+    { int ks = klfb_tb_tgtslot(target);
+      if (ks >= 0 && size >= 0) klfb_tbm_respecify(g_tb_bound_buf[ks], (size_t)size, data); }
     if (klfb_trace_buf())
         fprintf(stderr, "  [glfb] glBufferData(0x%x, size=%ld, %s, usage=0x%x)\n",
                 target, (long)size, data ? "data" : "NULL", usage);
@@ -2605,7 +2941,19 @@ static int  klfb_stage_of_fbo(uint32_t fbo);
 static void klfb_map_fbo(uint32_t fbo, uint32_t tex);
 static void klfb_note_render_stage(int stage);
 static void klfb_note_eye_fbo(uint32_t fbo, uint32_t touched);
-static uint32_t g_draw_fb;
+// Which framebuffer is bound for drawing and for reading, and which of them are
+// multiview — per context (klfb_ctx_slot), like the rest of what the guest has
+// bound: framebuffers are container objects and their names repeat across
+// contexts. The multiview entry is the VIEW COUNT (0 for an ordinary one).
+#define KLFB_RESYNC_FBOS 1024
+typedef struct {
+    uint32_t draw_fb, read_fb;
+    uint8_t  multiview[KLFB_RESYNC_FBOS];
+} klfb_fbo_ctx;
+#define KLFB_FBO_CTX    ((klfb_fbo_ctx *)klfb_ctx_slot(KLFB_CTX_SLOT_FBO, sizeof(klfb_fbo_ctx)))
+#define g_draw_fb       (KLFB_FBO_CTX->draw_fb)
+#define g_read_fb       (KLFB_FBO_CTX->read_fb)
+#define g_fbo_multiview (KLFB_FBO_CTX->multiview)
 // ...and the framebuffer the last draw CALL targeted, which is a different
 // question from the last binding — see klfb_note_draw.
 static uint32_t g_last_draw_fb;
@@ -2620,7 +2968,6 @@ static unsigned long g_blits, g_blits_read0;
 // is a guess — and a guest that configures a blit SOURCE attaches through
 // GL_READ_FRAMEBUFFER, where the guess is wrong every time and the trace says
 // so confidently.
-static uint32_t g_read_fb;
 
 // Is this target a DRAW binding? GL_FRAMEBUFFER binds both.
 static int klfb_is_draw_target(uint32_t target) {
@@ -2697,11 +3044,9 @@ static int glfb_errscan(void);
 
 static void klfb_resync_fbo(uint32_t fb);   // below, with the rate map
 static void klfb_rate_rule_for_fbo(uint32_t fb);
-#define KLFB_RESYNC_FBOS 1024
 // Which guest FBOs render both eyes at once (glFramebufferTextureMultiviewOVR
-// with more than one view). On a mirrored guest these are the eye swapchain's,
-// and the only framebuffers the rate map is meant for.
-static uint8_t g_fbo_multiview[KLFB_RESYNC_FBOS];
+// with more than one view) is g_fbo_multiview, above. On a mirrored guest these
+// are the eye swapchain's, and the only framebuffers the rate map is meant for.
 static void (*g_real_FramebufferTextureMultiviewOVR)(uint32_t, uint32_t, uint32_t, int32_t,
                                                       int32_t, int32_t);
 static void klfb_FramebufferTextureMultiviewOVR(uint32_t target, uint32_t attachment,
@@ -2709,7 +3054,8 @@ static void klfb_FramebufferTextureMultiviewOVR(uint32_t target, uint32_t attach
                                                 int32_t base_view, int32_t num_views) {
     if (attachment == 0x8CE0 /* COLOR_ATTACHMENT0 */ && g_draw_fb < KLFB_RESYNC_FBOS &&
         target != 0x8CA8 /* READ_FRAMEBUFFER */) {
-        g_fbo_multiview[g_draw_fb] = texture && num_views > 1;
+        g_fbo_multiview[g_draw_fb] =
+            (texture && num_views > 1) ? (uint8_t)(num_views > 255 ? 255 : num_views) : 0;
         klfb_rate_rule_for_fbo(g_draw_fb);
     }
     if (g_real_FramebufferTextureMultiviewOVR)
@@ -3187,6 +3533,83 @@ static int klfb_tex_info(uint32_t name, uint32_t *fmt, int32_t *w, int32_t *h) {
         }
     pthread_mutex_unlock(&g_compile_lock);
     return found;
+}
+
+// A decoded movie frame into a guest texture — the GLES half of UE4's
+// MediaPlayer14. On Android the Java player draws its SurfaceTexture into the
+// texture the engine names (getVideoLastFrame(int)); here the frame is already
+// plain pixels, so it is an upload. Clipped to the texture's own extent where
+// that is known: a movie that changes size is re-described to the engine one
+// tick later than its first frame arrives, and an upload larger than the
+// storage is an error that leaves the texture untouched.
+int kl_glfb_upload_picture(uint32_t tex, int w, int h, const void *pixels, int bgra) {
+    static void (*bind)(uint32_t, uint32_t);
+    static void (*sub)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
+                       uint32_t, uint32_t, const void *);
+    static void (*store)(uint32_t, int32_t);
+    static void (*bindbuf)(uint32_t, uint32_t);
+    if (!bind) {
+        bind = asym("glBindTexture");
+        sub = asym("glTexSubImage2D");
+        store = asym("glPixelStorei");
+        bindbuf = asym("glBindBuffer");
+    }
+    if (!tex || !pixels || w <= 0 || h <= 0 || !bind || !sub || !store || !a_glGetIntegerv) return 0;
+
+    int32_t tw = 0, th = 0, cw = w, ch = h;
+    uint32_t tfmt = 0;
+    if (klfb_tex_info(tex, &tfmt, &tw, &th) && tw > 0 && th > 0) {
+        if (cw > tw) cw = tw;
+        if (ch > th) ch = th;
+    }
+    // GLES takes RGBA; the decoder's frames are BGRA. Swapped into a buffer
+    // kept per thread — a movie plays on one thread, and a frame a tick is a
+    // megabyte or eight that should not be allocated each time.
+    static __thread uint8_t *scratch;
+    static __thread size_t scratch_n;
+    const uint8_t *src = pixels;
+    if (bgra) {
+        size_t need = (size_t)w * (size_t)ch * 4;
+        if (need > scratch_n) {
+            uint8_t *grown = realloc(scratch, need);
+            if (!grown) return 0;
+            scratch = grown; scratch_n = need;
+        }
+        const uint8_t *s = pixels;
+        for (size_t i = 0; i < need; i += 4) {
+            scratch[i] = s[i + 2]; scratch[i + 1] = s[i + 1];
+            scratch[i + 2] = s[i]; scratch[i + 3] = s[i + 3];
+        }
+        src = scratch;
+    }
+    int32_t prev = 0, align = 4, rowlen = 0, pbo = 0;
+    a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &prev);
+    a_glGetIntegerv(0x0CF5 /* UNPACK_ALIGNMENT */, &align);
+    a_glGetIntegerv(0x0CF2 /* UNPACK_ROW_LENGTH */, &rowlen);
+    a_glGetIntegerv(0x88EF /* PIXEL_UNPACK_BUFFER_BINDING */, &pbo);
+    if (pbo && bindbuf) bindbuf(0x88EC, 0);
+    store(0x0CF5, 1);
+    store(0x0CF2, w);
+    bind(0x0DE1, tex);
+    // Said for the first few uploads only, with the error the upload itself
+    // raised: a movie that plays into a texture of another format or size is
+    // black with every call succeeding as far as the guest can tell.
+    static int said;
+    uint32_t before = (said < 4 && a_glGetError) ? a_glGetError() : 0;
+    sub(0x0DE1, 0, 0, 0, cw, ch, 0x1908 /* RGBA */, 0x1401 /* UNSIGNED_BYTE */, src);
+    if (said < 4) {
+        said++;
+        uint32_t err = a_glGetError ? a_glGetError() : 0;
+        fprintf(stderr, "  [glfb] picture %dx%d -> texture %u (%s 0x%04x %dx%d), %dx%d sent, "
+                        "GL error 0x%x (pending before: 0x%x), unpack buffer %d\n",
+                w, h, tex, tw ? "allocated" : "not in the allocation table", tfmt, tw, th,
+                cw, ch, err, before, pbo);
+    }
+    bind(0x0DE1, (uint32_t)prev);
+    store(0x0CF2, rowlen);
+    store(0x0CF5, align);
+    if (pbo && bindbuf) bindbuf(0x88EC, (uint32_t)pbo);
+    return 1;
 }
 
 // The eye textures, by name, as kl_ovrp's SetupEyeTexture2 allocates them
@@ -5997,6 +6420,15 @@ static void klfb_Clear(uint32_t mask) {
     if (g_real_Clear) g_real_Clear(mask);
 }
 static void klfb_ClearColor(float r, float g, float b, float a) {
+    // KL_GLFB_X_CLEAR_MAGENTA=1 — an experiment: every clear colour becomes
+    // opaque magenta. A scene that comes out black then says which black it
+    // is — magenta left standing is geometry that never reached the target,
+    // black over magenta is geometry that was drawn black.
+    {
+        static int magenta = -1;
+        if (magenta < 0) magenta = kl_env_on("KL_GLFB_X_CLEAR_MAGENTA", 0);
+        if (magenta) { r = 1.0f; g = 0.0f; b = 1.0f; a = 1.0f; }
+    }
     if (klfb_timeline())
         fprintf(stderr, "  [glfb] glClearColor(%.2f, %.2f, %.2f, %.2f)\n",
                 r, g, b, a);
@@ -6536,6 +6968,43 @@ static void klfb_cimg_note_upload(uint32_t target, int32_t level, int32_t xoff,
                                   int32_t yoff, int32_t w, int32_t h, uint32_t fmt,
                                   int32_t sz, const void *data);
 
+// The Simulator's crash, found (2026-10-11, Tales from the Galaxy's Edge, an
+// 892x512 ASTC 8x8 upload of 114688 bytes): ANGLE's Metal backend uploads
+// through a staging buffer there, and its CopyTextureData walks the source by
+// PIXEL rows — regionSize.height rows of one block-row's bytes each — where a
+// compressed image has only height/blockHeight of them. It reads blockHeight
+// times the bytes the call describes (4x for ETC2/EAC, 8x for ASTC 8x8), which
+// is harmless while the guest's buffer has readable memory behind it and a
+// fault as soon as it does not. The destination is sized by the same sum, and
+// only its true extent is blitted on, so the picture is right either way.
+//
+// So in the Simulator the upload is handed a copy with that much behind it.
+// Not on a device: there the upload does not take this path, and the copy
+// would cost every texture a second allocation. A bound unpack buffer makes
+// `data` an offset rather than memory; that case is passed on as it is.
+// Returns the copy to free, or NULL when the caller's pointer is used.
+#include <TargetConditionals.h>
+static void *klfb_sim_pad_compressed(uint32_t fmt, int32_t w, int32_t h, int32_t sz,
+                                     const void **data) {
+#if TARGET_OS_SIMULATOR
+    int bw, bh, bpb;
+    if (!*data || sz <= 0 || w <= 0 || h <= 0 || !klfb_block_geom(fmt, &bw, &bh, &bpb)) return NULL;
+    size_t need = (size_t)((w + bw - 1) / bw) * (size_t)bpb * (size_t)h;
+    if (need <= (size_t)sz) return NULL;
+    int32_t pbo = 0;
+    if (a_glGetIntegerv) a_glGetIntegerv(0x88EF /* PIXEL_UNPACK_BUFFER_BINDING */, &pbo);
+    if (pbo) return NULL;
+    void *copy = calloc(1, need);
+    if (!copy) return NULL;
+    memcpy(copy, *data, (size_t)sz);
+    *data = copy;
+    return copy;
+#else
+    (void)fmt; (void)w; (void)h; (void)sz; (void)data;
+    return NULL;
+#endif
+}
+
 static void klfb_CompressedTexSubImage2D(uint32_t target, int32_t level, int32_t xoff,
                                          int32_t yoff, int32_t w, int32_t h,
                                          int64_t format, int64_t imageSize,
@@ -6583,8 +7052,11 @@ static void klfb_CompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
                 bound, tfmt, tw, th, lw, lh, verdict);
 
     klfb_cimg_note_upload(target, level, xoff, yoff, w, h, fmt, sz, data);
-    if (g_real_CompressedTexSubImage2D)
+    if (g_real_CompressedTexSubImage2D) {
+        void *padded = klfb_sim_pad_compressed(fmt, w, h, sz, &data);
         g_real_CompressedTexSubImage2D(target, level, xoff, yoff, w, h, fmt, sz, data);
+        free(padded);
+    }
 }
 
 static void (*g_real_CompressedTexSubImage3D)(uint32_t, int32_t, int32_t, int32_t,
@@ -6617,8 +7089,10 @@ static void klfb_CompressedTexSubImage3D(uint32_t target, int32_t level, int32_t
 //
 // The shadow costs memory equal to the compressed textures resident, so it is
 // on only where it is needed: when ANGLE lacks copy_image, and by default only
-// for the two Unreal titles it was sent in for (fix 15 and, by the same need,
-// Tales from the Galaxy's Edge, x3484270071659289; 2026-10-11). The call is
+// for the Unreal titles that were seen to need it (fix 15; by the same need
+// Tales from the Galaxy's Edge, x3484270071659289; and Maestro,
+// x6963344583787383, which was brought up with an emulation of its own before
+// this one existed; 2026-10-11). The call is
 // core in the ES 3.2 this runtime says it is, so every Unreal guest on GLES
 // that streams textures wants this — and would pay that memory, which nobody
 // has measured on a headset yet. KL_GLFB_COPYIMAGE_EMU=0/1 overrides.
@@ -6629,7 +7103,8 @@ static int klfb_cimg_on(void) {
         const char *t = kl_driver_target_name();
         on = !g_angle_copy_image &&
              kl_env_on("KL_GLFB_COPYIMAGE_EMU", t && (strcmp(t, "x2897337400373711") == 0 ||
-                                                      strcmp(t, "x3484270071659289") == 0));
+                                                      strcmp(t, "x3484270071659289") == 0 ||
+                                                      strcmp(t, "x6963344583787383") == 0));
         if (on) fprintf(stderr, "  [glfb] glCopyImageSubData emulated (compressed "
                                 "uploads shadowed on the CPU)\n");
     }
@@ -6877,8 +7352,12 @@ static void klfb_CopyImageSubData_impl(uint32_t src, uint32_t stgt, int32_t slev
         if (a_glGetIntegerv) a_glGetIntegerv(0x88EF, &pbo);
         if (pbo && bindbuf) bindbuf(0x88EC, 0);
         if (bind) bind(0x0DE1, dst);
-        if (g_real_CompressedTexSubImage2D)
-            g_real_CompressedTexSubImage2D(0x0DE1, dlevel, dx, dy, w, h, fmt, bytes, buf);
+        if (g_real_CompressedTexSubImage2D) {
+            const void *src = buf;
+            void *padded = klfb_sim_pad_compressed(fmt, w, h, bytes, &src);
+            g_real_CompressedTexSubImage2D(0x0DE1, dlevel, dx, dy, w, h, fmt, bytes, src);
+            free(padded);
+        }
         if (bind) bind(0x0DE1, prev);
         if (pbo && bindbuf) bindbuf(0x88EC, (uint32_t)pbo);
         free(buf);
@@ -6934,7 +7413,25 @@ static void klfb_CopyImageSubData_impl(uint32_t src, uint32_t stgt, int32_t slev
 static struct { int32_t fb; unsigned draws; uint64_t tid; } g_draw_fbs[KLFB_MAX_FBS];
 static unsigned g_ndraw_fbs;
 
+// KL_GLFB_X_NO_DEPTH=1 / KL_GLFB_X_NO_CULL=1 — experiments, not fixes: switch
+// the depth test or face culling off before every draw. A scene that draws and
+// leaves nothing behind is, more often than anything else, one of these two
+// rejecting every fragment; this separates them in one run each.
+static void klfb_draw_experiments(void) {
+    static int nodepth = -1, nocull = -1;
+    static void (*disable)(uint32_t);
+    if (nodepth < 0) {
+        nodepth = kl_env_on("KL_GLFB_X_NO_DEPTH", 0);
+        nocull  = kl_env_on("KL_GLFB_X_NO_CULL", 0);
+        disable = asym("glDisable");
+    }
+    if (!disable) return;
+    if (nodepth) disable(0x0B71);
+    if (nocull)  disable(0x0B44);
+}
+
 static void klfb_note_draw(void) {
+    klfb_draw_experiments();
     int32_t fb = -1;
     if (a_glGetIntegerv) a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
     // Fall back to the binding Klepton tracks in the glBindFramebuffer wrapper when
@@ -7197,6 +7694,62 @@ static void klfb_draw_probe(int verts) {
                              NULL, NULL, NULL, dvp[2], dvp[3]);
     if (dp_bind) dp_bind(0x8CA8, (uint32_t)(rfb >= 0 ? rfb : 0));
     fprintf(stderr, "  [glfb] DRAW_PROBE fb=%d: %lu lit (%s)\n", fb, lit, note);
+    // ...and what the draw was made of. "Nothing lit" has a dozen causes that
+    // all look alike from the framebuffer — a scissor, a mask, a blend that
+    // multiplies by zero, a texture that is not the one believed — and they
+    // are told apart only by the state the draw ran with.
+    if (a_glGetIntegerv) {
+        int32_t prog = 0, sc[4] = {0}, mask[4] = {0}, bsrc = 0, bdst = 0, basrc = 0, badst = 0, unit = 0;
+        static uint8_t (*enabled)(uint32_t);
+        static void (*active)(uint32_t);
+        if (!enabled) { enabled = asym("glIsEnabled"); active = asym("glActiveTexture"); }
+        a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &prog);
+        a_glGetIntegerv(0x0C10 /* SCISSOR_BOX */, sc);
+        a_glGetIntegerv(0x0C23 /* COLOR_WRITEMASK */, mask);
+        a_glGetIntegerv(0x80C9 /* BLEND_SRC_RGB */, &bsrc);
+        a_glGetIntegerv(0x80C8 /* BLEND_DST_RGB */, &bdst);
+        a_glGetIntegerv(0x80CB /* BLEND_SRC_ALPHA */, &basrc);
+        a_glGetIntegerv(0x80CA /* BLEND_DST_ALPHA */, &badst);
+        a_glGetIntegerv(0x84E0 /* ACTIVE_TEXTURE */, &unit);
+        char tex[160] = ""; size_t tn = 0;
+        for (int u = 0; active && u < 6; u++) {
+            int32_t t2 = 0, tx = 0;
+            active(0x84C0 + (uint32_t)u);
+            a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &t2);
+            a_glGetIntegerv(0x8D67 /* TEXTURE_BINDING_EXTERNAL_OES */, &tx);
+            if (t2 || tx)
+                tn += (size_t)snprintf(tex + tn, sizeof tex - tn, " u%d=%d%s", u, t2 ? t2 : tx, t2 ? "" : "(ext)");
+            if (tn >= sizeof tex) break;
+        }
+        if (active) active((uint32_t)unit);
+        {
+            int32_t dfunc = 0, dmask = 0, cmode = 0, ffront = 0, dobj = 0, dname = 0;
+            float dclear = -1.0f, drange[2] = {-1.0f, -1.0f};
+            static void (*getf)(uint32_t, float *);
+            static void (*fbattach)(uint32_t, uint32_t, uint32_t, int32_t *);
+            if (!getf) { getf = asym("glGetFloatv"); fbattach = asym("glGetFramebufferAttachmentParameteriv"); }
+            a_glGetIntegerv(0x0B74 /* DEPTH_FUNC */, &dfunc);
+            a_glGetIntegerv(0x0B72 /* DEPTH_WRITEMASK */, &dmask);
+            a_glGetIntegerv(0x0B45 /* CULL_FACE_MODE */, &cmode);
+            a_glGetIntegerv(0x0B46 /* FRONT_FACE */, &ffront);
+            if (getf) { getf(0x0B73 /* DEPTH_CLEAR_VALUE */, &dclear); getf(0x0B70 /* DEPTH_RANGE */, drange); }
+            if (fbattach) {
+                fbattach(0x8CA9, 0x8D00 /* DEPTH_ATTACHMENT */, 0x8CD0 /* OBJECT_TYPE */, &dobj);
+                if (dobj) fbattach(0x8CA9, 0x8D00, 0x8CD1 /* OBJECT_NAME */, &dname);
+            }
+            fprintf(stderr, "  [glfb]   depth func=0x%x write=%d clear=%.3f range=%.3f..%.3f attachment=%s %d | "
+                            "cull mode=0x%x front=0x%x\n", dfunc, dmask, dclear, drange[0], drange[1],
+                    dobj == 0x1702 ? "texture" : dobj == 0x8D41 ? "renderbuffer" : "NONE", dname, cmode, ffront);
+        }
+        fprintf(stderr, "  [glfb]   verts=%d program=%d viewport=%dx%d+%d+%d scissor=%s %dx%d+%d+%d "
+                        "mask=%d%d%d%d blend=%s rgb 0x%x/0x%x a 0x%x/0x%x depth=%s cull=%s textures:%s\n",
+                verts, prog, dvp[2], dvp[3], dvp[0], dvp[1],
+                enabled && enabled(0x0C11) ? "on" : "off", sc[2], sc[3], sc[0], sc[1],
+                mask[0], mask[1], mask[2], mask[3],
+                enabled && enabled(0x0BE2) ? "on" : "off", bsrc, bdst, basrc, badst,
+                enabled && enabled(0x0B71) ? "on" : "off", enabled && enabled(0x0B44) ? "on" : "off",
+                tex[0] ? tex : " none");
+    }
 }
 
 // ---- ES 3.1 vertex-attribute-binding, translated to ES 3.0 -----------------
@@ -7222,9 +7775,18 @@ typedef struct klfb_vao_state {
 } klfb_vao_state;
 
 #define KLFB_MAX_VAOS 512
-static klfb_vao_state  g_vaos[KLFB_MAX_VAOS];
-static unsigned        g_nvaos;
-static klfb_vao_state *g_cur_vao;                    // the bound VAO's state
+// Per context (klfb_ctx_slot): VAOs are container objects, never shared, and
+// their NAMES repeat across contexts — VAO 2 of one context is not VAO 2 of
+// another, and which one is bound is each context's own business.
+typedef struct {
+    klfb_vao_state  vaos[KLFB_MAX_VAOS];
+    unsigned        nvaos;
+    klfb_vao_state *cur;                             // the bound VAO's state
+} klfb_vao_ctx;
+#define KLFB_VAO_CTX ((klfb_vao_ctx *)klfb_ctx_slot(KLFB_CTX_SLOT_VAO, sizeof(klfb_vao_ctx)))
+#define g_vaos    (KLFB_VAO_CTX->vaos)
+#define g_nvaos   (KLFB_VAO_CTX->nvaos)
+#define g_cur_vao (KLFB_VAO_CTX->cur)
 
 static klfb_vao_state *klfb_vao_get(uint32_t name) {
     for (unsigned i = 0; i < g_nvaos; i++)
@@ -7311,6 +7873,8 @@ static void klfb_apply_vertex_bindings(void) {
     if (!r_BindBuffer || !r_AttribPointer) return;
     int32_t save_ab = 0;
     if (r_GetIntegerv_vtx) r_GetIntegerv_vtx(0x8894 /* ARRAY_BUFFER_BINDING */, &save_ab);
+    uint32_t dfb = g_draw_fb;
+    unsigned views = dfb < KLFB_RESYNC_FBOS ? g_fbo_multiview[dfb] : 0;
     for (unsigned i = 0; i < KLFB_VTX_ATTRS; i++) {
         if (!v->a[i].has) continue;
         unsigned bi = v->a[i].binding;
@@ -7330,9 +7894,27 @@ static void klfb_apply_vertex_bindings(void) {
         // buffer. ES 3.0 spells "the same element for every vertex" as a divisor
         // no draw reaches. KL_GLFB_ZERO_STRIDE=0 restores the plain pass-through.
         uint32_t div = v->b[bi].divisor;
+        // A multiview framebuffer is drawn by instancing: ANGLE issues every
+        // draw views-times-instances and the vertex stage splits the instance
+        // id back into (view, instance). Its Metal backend does not do the same
+        // for the STEP RATE of a per-instance attribute, so with a divisor of 1
+        // instance k of the doubled draw read element k — the left eye got the
+        // even instances, the right eye the odd ones, and the second half read
+        // past the end of the data (Maestro's instanced chairs: a different
+        // place in each eye, and shapes that came and went). One element per
+        // views instances puts it back.
+        if (div && views > 1) {
+            div *= views;
+            static int saidmv;
+            if (!saidmv++)
+                fprintf(stderr, "  [glfb] instanced draw into a %u-view framebuffer: "
+                                "per-instance attributes stepped every %u instances "
+                                "(attribute %u, divisor %u)\n",
+                        views, div, i, v->b[bi].divisor);
+        }
         static int zs = -1;
         if (zs < 0) zs = kl_env_on("KL_GLFB_ZERO_STRIDE", 1);
-        if (zs && v->b[bi].stride == 0 && div == 0) {
+        if (zs && v->b[bi].stride == 0 && v->b[bi].divisor == 0) {
             div = 0x7fffffffu;
             static int said_zs;
             if (said_zs < 8) { said_zs++;
@@ -7347,6 +7929,25 @@ static void klfb_apply_vertex_bindings(void) {
     if (said < 4) { said++;
         fprintf(stderr, "  [glfb] translated ES 3.1 vertex-attrib bindings to ES 3.0 "
                         "pointers for VAO %u\n", v->name); }
+    // KL_GLFB_VTX_LOG=<n>: the layout handed to ANGLE for the first n draws that
+    // go through this translation — what each attribute reads, and from where.
+    static int vlog = -1, vlogged;
+    if (vlog < 0) vlog = kl_env_int("KL_GLFB_VTX_LOG", 0);
+    if (vlogged < vlog) {
+        vlogged++;
+        fprintf(stderr, "  [glfb] vtx layout #%d (VAO %u):", vlogged, v->name);
+        for (unsigned i = 0; i < KLFB_VTX_ATTRS; i++) {
+            if (!v->a[i].has) continue;
+            unsigned bi = v->a[i].binding;
+            if (bi >= KLFB_VTX_BINDS) continue;
+            fprintf(stderr, " a%u[%d x 0x%x%s%s +%u b%u buf %u off %lld stride %d div %u]",
+                    i, v->a[i].size, v->a[i].type, v->a[i].integer ? " int" : "",
+                    v->a[i].normalized ? " norm" : "", v->a[i].reloff, bi,
+                    v->b[bi].buffer, (long long)v->b[bi].offset, v->b[bi].stride,
+                    v->b[bi].divisor);
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 static void klfb_DrawElements(uint32_t mode, int32_t count, uint32_t type,
@@ -7979,6 +8580,22 @@ int kl_glfb_has_gpu_fence(void) { return g_gpu_fence != NULL; }
 uint64_t kl_glfb_gpu_fence_value(void) {
     return __atomic_load_n(&g_gpu_fence_value, __ATOMIC_ACQUIRE);
 }
+static unsigned klfb_gpu_frame_now(void);
+// A guest frame that reaches the compositor by COPY (kl_glfb_mirror_eye_layer)
+// and never swaps: the copy is the last thing in ANGLE's command stream for the
+// frame, the frame's record is published straight after, and without a fence
+// the compositor samples the destination before the copy has run — the stage's
+// previous picture, three frames old, under this frame's pose. With a turning
+// head that is the picture pulled back against the turn on every frame (Maestro:
+// "as if two trackers ran against each other"). The caller invokes this after
+// its copies, on the thread that issued them.
+static int g_frame_fenced;
+void kl_glfb_frame_fence(void) {
+    if (!g_ready || !g_gpu_fence) return;
+    klfb_gpu_frame_now();
+    __atomic_store_n(&g_frame_fenced, 1, __ATOMIC_RELEASE);
+}
+int kl_glfb_frame_fenced(void) { return __atomic_load_n(&g_frame_fenced, __ATOMIC_ACQUIRE); }
 
 // Runs on the context-owning thread, in place of glfb_capture_now, once per
 // swap. Encodes "the guest's frame is done" into ANGLE's command stream and
@@ -8107,6 +8724,24 @@ static void klfb_err_say(const char *what, uint32_t a0) {
         }
     }
 }
+// Occlusion query results, counted — and, with KL_GL_QUERY_VISIBLE=1, all
+// answered "something passed". An engine that culls by query hides whatever a
+// query says drew nothing, so a query that wrongly answers 0 is an object that
+// is simply never drawn again; this says how many answer 0, and the knob says
+// what the picture is without them.
+static void (*g_real_GetQueryObjectuiv)(uint32_t, uint32_t, uint32_t *);
+static void klfb_GetQueryObjectuiv(uint32_t id, uint32_t pname, uint32_t *params) {
+    if (g_real_GetQueryObjectuiv) g_real_GetQueryObjectuiv(id, pname, params);
+    if (pname != 0x8866 /* GL_QUERY_RESULT */ || !params) return;
+    static unsigned n, zero;
+    static int force = -1;
+    if (force < 0) force = kl_env_on("KL_GL_QUERY_VISIBLE", 0);
+    n++; if (!*params) zero++;
+    if (n == 200 || n == 5000 || n == 50000)
+        fprintf(stderr, "  [glfb] occlusion queries: %u results read, %u of them 0%s\n",
+                n, zero, force ? " (all answered 1: KL_GL_QUERY_VISIBLE)" : "");
+    if (force) *params = 1;
+}
 static void (*g_real_UseProgram)(uint32_t);
 static void klfb_UseProgram(uint32_t p) {
     if (a_glGetError) while (a_glGetError()) {}
@@ -8139,9 +8774,42 @@ static void klfb_EGLImageTargetTexture2DOES(uint32_t target, void *image) {
 }
 
 static void (*g_real_BindTexture)(uint32_t, uint32_t);
+static void (*g_real_BindSampler)(uint32_t, uint32_t);
 static void klfb_BindTexture(uint32_t t, uint32_t n) {
     if (a_glGetError) while (a_glGetError()) {}
     if (g_real_BindTexture) g_real_BindTexture(klfb_detarget(t), n);
+    // A buffer texture has no sampler state: whatever sampler object sits on
+    // its unit is ignored. The 2D texture standing in for it is NOT exempt — a
+    // sampler left on that unit by the unit's last user (trilinear, say) applies
+    // to it, and a float or integer texture under a linear filter is INCOMPLETE:
+    // it samples as zero, texelFetch included. Zero bone matrices are a skinned
+    // mesh with every vertex at one point (Maestro's musicians and its book,
+    // with their bone buffers correctly filled). So while a stand-in is on a
+    // unit, no sampler object is: the guest's is taken off, remembered, and put
+    // back when the unit goes to an ordinary texture again.
+    {
+        int u = g_tb_active_unit;
+        if (u >= 0 && u < KLFB_TB_UNITS && n) {
+            if (!g_real_BindSampler) g_real_BindSampler = asym("glBindSampler");
+            if (t == GL_TEXTURE_BUFFER_) {
+                if (!g_tb_unit[u]) {
+                    g_tb_unit[u] = 1;
+                    if (g_tb_sampler[u] && g_real_BindSampler) {
+                        g_real_BindSampler((uint32_t)u, 0);
+                        static int said;
+                        if (!said++)
+                            fprintf(stderr, "  [glfb] texel-buffer stand-in on unit %d: sampler "
+                                            "object %u taken off the unit while it is there\n",
+                                    u, g_tb_sampler[u]);
+                    }
+                }
+            } else if (g_tb_unit[u]) {
+                g_tb_unit[u] = 0;
+                if (g_tb_sampler[u] && g_real_BindSampler)
+                    g_real_BindSampler((uint32_t)u, g_tb_sampler[u]);
+            }
+        }
+    }
     // Track the 2D binding per unit — a texel buffer arrives as glBindTexture(
     // GL_TEXTURE_BUFFER, tex) which detargets to 2D, so glTexBuffer can name the
     // texture it must keep in sync (klfb_texbuffer_upload / klfb_tb_refresh).
@@ -8163,6 +8831,13 @@ static void klfb_BindTexture(uint32_t t, uint32_t n) {
 // float4 / uint4; the switch covers the common set and defaults to RGBA32F.
 static void klfb_texbuffer_upload(uint32_t internalformat, uint32_t buffer,
                                   intptr_t off, intptr_t len) {
+    // ANGLE's own entry points, resolved HERE: the slots are otherwise only
+    // filled when the GUEST resolves those names, and Unreal never asks for
+    // glTexImage2D (it allocates with glTexStorage2D) — so for it this whole
+    // function returned at its first line, on every call, and no texel-buffer
+    // texture was ever given a single byte.
+    if (!g_real_TexImage2D)    g_real_TexImage2D    = asym("glTexImage2D");
+    if (!g_real_TexParameteri) g_real_TexParameteri = asym("glTexParameteri");
     if (!buffer || !g_real_TexImage2D) return;
     static void   (*r_BindBuffer)(uint32_t, uint32_t);
     static void   (*r_GetBufferParameteriv)(uint32_t, uint32_t, int32_t *);
@@ -8187,10 +8862,68 @@ static void klfb_texbuffer_upload(uint32_t internalformat, uint32_t buffer,
         case 0x8235: fmt = 0x8D94; type = 0x1404; texel = 4;  break;  // R32I
         case 0x8058: fmt = 0x1908; type = 0x1401; texel = 4;  break;  // RGBA8
         case 0x8D7C: fmt = 0x8D99; type = 0x1401; texel = 4;  break;  // RGBA8UI
+        // The narrow ones Unreal points at index and weight data. Without a row
+        // here a format fell to the RGBA32F default: eight of its texels read
+        // as one, through a sampler of the wrong kind.
+        case 0x8234: fmt = 0x8D94; type = 0x1403; texel = 2;  break;  // R16UI
+        case 0x8233: fmt = 0x8D94; type = 0x1402; texel = 2;  break;  // R16I
+        case 0x822D: fmt = 0x1903; type = 0x140B; texel = 2;  break;  // R16F
+        case 0x8232: fmt = 0x8D94; type = 0x1401; texel = 1;  break;  // R8UI
+        case 0x8229: fmt = 0x1903; type = 0x1401; texel = 1;  break;  // R8
+        case 0x823A: fmt = 0x8228; type = 0x1403; texel = 4;  break;  // RG16UI
+        case 0x823C: fmt = 0x8228; type = 0x1405; texel = 8;  break;  // RG32UI
+        case 0x822F: fmt = 0x8227; type = 0x140B; texel = 4;  break;  // RG16F
+        case 0x8D76: fmt = 0x8D99; type = 0x1403; texel = 8;  break;  // RGBA16UI
+        case 0x8D88: fmt = 0x8D99; type = 0x1402; texel = 8;  break;  // RGBA16I
         default:     fmt = 0x1908; type = 0x1406; texel = 16; internalformat = 0x8814; break;
     }
     const uint32_t COPY_READ = 0x8F36, BUFFER_SIZE = 0x8764, MAP_READ = 0x0001;
     if (a_glGetError) while (a_glGetError()) {}
+    // The kept bytes first (klfb_tbm); the read-back below is for a buffer that
+    // has not been written since a texture was pointed at it.
+    {
+        size_t klen = 0;
+        void *kept = klfb_tbm_copy(buffer, len > 0 && off > 0 ? (size_t)off : 0,
+                                   len > 0 ? (size_t)len : 0, &klen);
+        static unsigned n_kept;
+        if (kept && klen >= (size_t)texel) {
+            int W = KLFB_TB_W;
+            int texels = (int)(klen / (size_t)texel);
+            int H = (texels + W - 1) / W; if (H < 1) H = 1;
+            size_t need = (size_t)W * (size_t)H * (size_t)texel;
+            void *tmp = calloc(1, need);
+            if (tmp) {
+                memcpy(tmp, kept, klen < need ? klen : need);
+                int32_t pbo = 0;
+                if (a_glGetIntegerv) a_glGetIntegerv(0x88EF, &pbo);
+                if (pbo) r_BindBuffer(0x88EC, 0);     // the pointer below is memory, not an offset
+                g_real_TexImage2D(GL_TEXTURE_2D_, 0, (int32_t)internalformat, W, H, 0, fmt, type, tmp);
+                if (pbo) r_BindBuffer(0x88EC, (uint32_t)pbo);
+                if (g_real_TexParameteri) {
+                    g_real_TexParameteri(GL_TEXTURE_2D_, 0x2801, 0x2600);
+                    g_real_TexParameteri(GL_TEXTURE_2D_, 0x2800, 0x2600);
+                    g_real_TexParameteri(GL_TEXTURE_2D_, 0x2802, 0x812F);
+                    g_real_TexParameteri(GL_TEXTURE_2D_, 0x2803, 0x812F);
+                }
+                uint32_t e = a_glGetError ? a_glGetError() : 0;
+                if (n_kept++ < 6 || e) {
+                    static int said_e;
+                    if (!e || said_e++ < 6) {
+                        const uint32_t *w = (const uint32_t *)tmp;
+                        fprintf(stderr, "  [glfb] texel buffer %u: %zu kept bytes -> %dx%d fmt 0x%x "
+                                        "(first %08x %08x %08x %08x)%s\n",
+                                buffer, klen, W, H, internalformat, w[0], w[1], w[2], w[3],
+                                e ? "  <-- UPLOAD FAILED" : "");
+                    }
+                }
+                free(tmp);
+            }
+            free(kept);
+            if (a_glGetError) while (a_glGetError()) {}
+            return;
+        }
+        free(kept);
+    }
     r_BindBuffer(COPY_READ, buffer);
     int32_t size = 0; r_GetBufferParameteriv(COPY_READ, BUFFER_SIZE, &size);
     // A glTexBufferRange window: the texel buffer STARTS at `off`. Unreal pools
@@ -8223,7 +8956,17 @@ static void klfb_texbuffer_upload(uint32_t internalformat, uint32_t buffer,
         r_UnmapBuffer(COPY_READ);
     }
     r_BindBuffer(COPY_READ, 0);
+    {
+        static unsigned n_ok, n_fail;
+        if (tmp) n_ok++; else n_fail++;
+        if ((!tmp && n_fail <= 6) || (tmp && n_ok <= 3))
+            fprintf(stderr, "  [glfb] texel buffer %u: read-back of %d bytes %s (%u read, %u "
+                            "failed so far)\n", buffer, size,
+                    tmp ? "ok" : "FAILED — nothing uploaded, the texture keeps what it had",
+                    n_ok, n_fail);
+    }
     if (!tmp) return;
+    if (len <= 0) klfb_tbm_respecify(buffer, (size_t)size, tmp);   // seed the kept copy
     g_real_TexImage2D(GL_TEXTURE_2D_, 0, (int32_t)internalformat, W, H, 0, fmt, type, tmp);
     if (g_real_TexParameteri) {
         g_real_TexParameteri(GL_TEXTURE_2D_, 0x2801, 0x2600);   // MIN_FILTER NEAREST
@@ -8243,7 +8986,34 @@ static void (*g_real_TexBufferRange)(uint32_t, uint32_t, uint32_t, intptr_t, int
 // Re-copy a written backing buffer's CURRENT bytes into its emulated 2D texture,
 // so texelFetch sees fresh data (the whole point of GL_TEXTURE_BUFFER). Binds the
 // texture on the active unit, uploads, and restores whatever the guest had bound.
+// KL_GLFB_TB_REPORT=1: every texture standing in for a texel buffer, with the
+// buffer behind it, how many bytes are kept for that buffer and how many of
+// them are not zero — printed after 300 and after 3000 refreshes. "Is the data
+// there" for all of them at once, which the per-upload lines cannot say.
+static void klfb_tb_report(void) {
+    fprintf(stderr, "  [glfb] texel buffers: %u texture(s) over buffers, %u buffer(s) kept\n",
+            g_tb_assoc_n, g_tbm_n);
+    pthread_mutex_lock(&g_tbm_mu);
+    for (unsigned i = 0; i < g_tb_assoc_n && i < 96; i++) {
+        int k = klfb_tbm_ix(g_tb_assoc[i].buffer);
+        size_t size = k >= 0 ? g_tbm[k].size : 0, nz = 0;
+        if (k >= 0 && g_tbm[k].bytes)
+            for (size_t b = 0; b < size; b++) nz += g_tbm[k].bytes[b] != 0;
+        fprintf(stderr, "  [glfb]   tex %u <- buffer %u fmt 0x%x range %ld+%ld: %zu bytes kept, "
+                        "%zu non-zero%s\n",
+                g_tb_assoc[i].tex, g_tb_assoc[i].buffer, g_tb_assoc[i].ifmt,
+                (long)g_tb_assoc[i].off, (long)g_tb_assoc[i].len, size, nz,
+                k < 0 ? "  (not kept)" : "");
+    }
+    pthread_mutex_unlock(&g_tbm_mu);
+}
 static void klfb_tb_refresh_for_buffer(uint32_t buffer) {
+    {
+        static int rep = -1; static unsigned n;
+        if (rep < 0) rep = kl_env_on("KL_GLFB_TB_REPORT", 0);
+        if (rep) { unsigned c = ++n; if (c == 300 || c == 3000 || c == 30000) klfb_tb_report(); }
+    }
+    if (!g_real_BindTexture) g_real_BindTexture = asym("glBindTexture");
     if (!buffer || !g_real_BindTexture) return;
     int u = g_tb_active_unit;
     if (u < 0 || u >= KLFB_TB_UNITS) u = 0;
@@ -8268,9 +9038,17 @@ static void klfb_tb_bind(uint32_t internalformat, uint32_t buffer,
         unsigned i = 0;
         for (; i < g_tb_assoc_n; i++) if (g_tb_assoc[i].tex == tex) break;   // one entry per texture
         if (i == g_tb_assoc_n && g_tb_assoc_n < KLFB_TB_ASSOC) g_tb_assoc_n++;
-        if (i < KLFB_TB_ASSOC) { g_tb_assoc[i].tex = tex; g_tb_assoc[i].buffer = buffer; g_tb_assoc[i].ifmt = internalformat;
-                                 g_tb_assoc[i].off = off; g_tb_assoc[i].len = len; }
+        if (i < KLFB_TB_ASSOC) {
+            g_tb_assoc[i].tex = tex; g_tb_assoc[i].buffer = buffer; g_tb_assoc[i].ifmt = internalformat;
+            g_tb_assoc[i].off = off; g_tb_assoc[i].len = len;
+        } else {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [glfb] texel buffers: more than %d textures over buffers — "
+                                "the rest are not kept fresh\n", KLFB_TB_ASSOC);
+        }
     }
+    klfb_tbm_want(buffer);
     klfb_texbuffer_upload(internalformat, buffer, off, len);
 }
 static void klfb_TexBuffer(uint32_t target, uint32_t internalformat, uint32_t buffer) {
@@ -8278,7 +9056,12 @@ static void klfb_TexBuffer(uint32_t target, uint32_t internalformat, uint32_t bu
 }
 static void klfb_TexBufferRange(uint32_t target, uint32_t internalformat, uint32_t buffer,
                                 intptr_t offset, intptr_t size) {
-    (void)target; klfb_tb_bind(internalformat, buffer, offset, size);
+    (void)target;
+    static int said;
+    if (said < 4) { said++;
+        fprintf(stderr, "  [glfb] glTexBufferRange(fmt 0x%x, buffer %u, offset %ld, size %ld)\n",
+                internalformat, buffer, (long)offset, (long)size); }
+    klfb_tb_bind(internalformat, buffer, offset, size);
 }
 
 // glBindBuffer: remember the buffer bound per target, so a later glBufferSubData
@@ -8296,6 +9079,8 @@ static void klfb_BufferSubData(uint32_t target, intptr_t offset, intptr_t size, 
     if (!g_real_BufferSubData_t) g_real_BufferSubData_t = asym("glBufferSubData");
     if (g_real_BufferSubData_t) g_real_BufferSubData_t(target, offset, size, data);
     int s = klfb_tb_tgtslot(target);
+    if (s >= 0 && offset >= 0 && size > 0)
+        klfb_tbm_write(g_tb_bound_buf[s], (size_t)offset, (size_t)size, data);
     if (s >= 0) klfb_tb_refresh_for_buffer(g_tb_bound_buf[s]);
 }
 // glGetUniformLocation, so the built-in-name rename above stays invisible to the
@@ -8359,10 +9144,13 @@ static void klfb_locs_say(uint32_t prog, char *out, size_t n) {
     if (!any) snprintf(out + at, n - at, " nothing (it never asked)");
     pthread_mutex_unlock(&g_compile_lock);
 }
-static void (*g_real_BindSampler)(uint32_t, uint32_t);
 static void klfb_BindSampler(uint32_t u, uint32_t s) {
     if (a_glGetError) while (a_glGetError()) {}
-    if (g_real_BindSampler) g_real_BindSampler(u, s);
+    // Remembered per unit, and withheld while the unit shows a texel-buffer
+    // stand-in (see klfb_BindTexture).
+    int held = 0;
+    if (u < KLFB_TB_UNITS) { g_tb_sampler[u] = s; held = g_tb_unit[u]; }
+    if (g_real_BindSampler && !held) g_real_BindSampler(u, s);
     klfb_err_say("glBindSampler", s);
 }
 // The uniform family, every entry point of it, for one reason: each one carries
@@ -8384,8 +9172,22 @@ static void klfb_BindSampler(uint32_t u, uint32_t s) {
                                       (klfb_remap_loc(l), a, b, c))
 #define KLFB_U4(fn, T) KLFB_UNIFORM_N(fn, T, 4, (int32_t l, T a, T b, T c, T d), \
                                       (klfb_remap_loc(l), a, b, c, d))
-#define KLFB_UV(fn, T) KLFB_UNIFORM_N(fn, T, 0, (int32_t l, int32_t n, const T *v), \
-                                      (klfb_remap_loc(l), n, v))
+// The vector forms also answer for a refusal when ERRSCAN is on: the error alone
+// says a write was rejected, and which uniform it was aimed at is the question.
+static int glfb_errscan(void);
+static void klfb_uniform_refused(const char *fn, int32_t loc, int32_t count, uint32_t err);
+#define KLFB_UV(fn, T)                                                        \
+    static void (*g_real_##fn)(int32_t, int32_t, const T *);                  \
+    static void klfb_##fn(int32_t l, int32_t n, const T *v) {                 \
+        if (!g_real_##fn) return;                                             \
+        if (!glfb_errscan() || !a_glGetError) {                               \
+            g_real_##fn(klfb_remap_loc(l), n, v); return;                     \
+        }                                                                     \
+        while (a_glGetError()) {}                                             \
+        g_real_##fn(klfb_remap_loc(l), n, v);                                 \
+        uint32_t e = a_glGetError();                                          \
+        if (e) klfb_uniform_refused("gl" #fn, l, n, e);                       \
+    }
 #define KLFB_UM(fn)    KLFB_UNIFORM_N(fn, float, 0, \
                                       (int32_t l, int32_t n, uint8_t t, const float *v), \
                                       (klfb_remap_loc(l), n, t, v))
@@ -8404,6 +9206,39 @@ KLFB_UM(UniformMatrix2fv) KLFB_UM(UniformMatrix3fv) KLFB_UM(UniformMatrix4fv)
 KLFB_UM(UniformMatrix2x3fv) KLFB_UM(UniformMatrix3x2fv)
 KLFB_UM(UniformMatrix2x4fv) KLFB_UM(UniformMatrix4x2fv)
 KLFB_UM(UniformMatrix3x4fv) KLFB_UM(UniformMatrix4x3fv)
+
+// A refused glUniform*v, described: the program, the location and count the
+// guest used, and what the linker actually has at that location and nearby.
+static void klfb_uniform_refused(const char *fn, int32_t loc, int32_t count, uint32_t err) {
+    static int said;
+    if (said >= 16) return;
+    said++;
+    static void (*r_gpi)(uint32_t, uint32_t, int32_t *);
+    static void (*r_gau)(uint32_t, uint32_t, int32_t, int32_t *, int32_t *, uint32_t *, char *);
+    if (!r_gpi) r_gpi = asym("glGetProgramiv");
+    if (!r_gau) r_gau = asym("glGetActiveUniform");
+    int32_t cur = 0;
+    if (a_glGetIntegerv) a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &cur);
+    fprintf(stderr, "  [glfb] %s(loc %d, count %d) REFUSED 0x%x — current program %d "
+                    "(tracked %u), thread %p\n",
+            fn, loc, count, err, cur, g_cur_prog, (void *)pthread_self());
+    if (!cur || !r_gpi || !r_gau) return;
+    int32_t nu = 0;
+    r_gpi((uint32_t)cur, 0x8B86 /* ACTIVE_UNIFORMS */, &nu);
+    for (int32_t i = 0; i < nu && i < 48; i++) {
+        char name[96]; int32_t len = 0, size = 0; uint32_t type = 0;
+        name[0] = 0;
+        r_gau((uint32_t)cur, (uint32_t)i, sizeof name, &len, &size, &type, name);
+        int32_t at = klfb_actual_loc((uint32_t)cur, name);
+        fprintf(stderr, "  [glfb]   uniform %-28s type 0x%04x size %d at %d%s\n",
+                name, type, size, at,
+                (loc >= at && loc < at + (size > 0 ? size : 1)) ? "   <== the target" : "");
+    }
+    char told[1500]; told[0] = 0;
+    klfb_locs_say((uint32_t)cur, told, sizeof told);
+    fprintf(stderr, "  [glfb]   program %d%s\n", cur, told);
+    while (a_glGetError()) {}
+}
 
 static void (*g_real_Uniform1i)(int32_t, int32_t);
 static void klfb_Uniform1i(int32_t loc, int32_t v) {
@@ -8520,6 +9355,7 @@ static void klfb_GenerateMipmap(uint32_t t) {
 static const struct { const char *name; void *thunk; void **real; } g_thunks[] = {
     {"glActiveTexture", (void *)klfb_ActiveTexture, (void **)&g_real_ActiveTexture},
     {"glUseProgram",  (void *)klfb_UseProgram,  (void **)&g_real_UseProgram},
+    {"glGetQueryObjectuiv", (void *)klfb_GetQueryObjectuiv, (void **)&g_real_GetQueryObjectuiv},
     {"glBindTexture", (void *)klfb_BindTexture, (void **)&g_real_BindTexture},
     {"glTexBuffer",      (void *)klfb_TexBuffer,      (void **)&g_real_TexBuffer},
     {"glTexBufferRange", (void *)klfb_TexBufferRange, (void **)&g_real_TexBufferRange},
@@ -8998,11 +9834,23 @@ static void glfb_report_incomplete_fb(const char *what) {
 void kl_gl_trace_log(const char *name) {
     unsigned n = __atomic_fetch_add(&g_trace_calls, 1, __ATOMIC_RELAXED);
     if (glfb_errscan() && a_glGetError) {
-        static unsigned said;   // plain: __atomic_* reject _Atomic-qualified operands
+        // A budget per CALL NAME, not one for the run: forty reports in all were
+        // spent on the first thing that failed every frame, and whatever failed
+        // after it was never named. Racy across threads, which costs a line.
+        static struct { const char *name; unsigned n; } seen[48];
         uint32_t e = a_glGetError();
-        if (e && (!g_err_only || e == g_err_only) &&
-            __atomic_load_n(&said, __ATOMIC_RELAXED) < 40) {
-            __atomic_fetch_add(&said, 1, __ATOMIC_RELAXED);
+        int say = 0;
+        if (e && (!g_err_only || e == g_err_only)) {
+            const char *who = g_err_prev ? g_err_prev : "(nothing yet)";
+            for (unsigned i = 0; i < 48; i++) {
+                if (!seen[i].name) seen[i].name = who;
+                if (seen[i].name == who || !strcmp(seen[i].name, who)) {
+                    say = seen[i].n++ < 6;
+                    break;
+                }
+            }
+        }
+        if (say) {
             fprintf(stderr, "  [glfb] ERRSCAN GL error 0x%x generated by %s "
                     "(before #%u %s)\n",
                     e, g_err_prev ? g_err_prev : "(nothing yet)", n, name);
@@ -9185,9 +10033,14 @@ unsigned kl_glfb_present(const char *dir) {
     if (g_gpu_fence) {
         pthread_once(&g_tls_once, klfb_tls_init);
         klfb_thread_gl *tg = pthread_getspecific(g_tls_key);
-        if (tg && tg->ctx) return klfb_gpu_frame_now();
-        g_capture_pending = 1;
-        return g_presented;
+        if (!(tg && tg->ctx)) { g_capture_pending = 1; return g_presented; }
+        unsigned fenced = klfb_gpu_frame_now();
+        // With KL_GLFB_OUT the PNG capture runs as well. It used to be skipped
+        // whenever a fence was registered, which is always in the app — so the
+        // one instrument that shows what the guest drew into its eye textures
+        // was inert exactly where a black picture needs it (the simulator,
+        // Tales from the Galaxy's Edge, 2026-10-11).
+        if (!dir) return fenced;
     }
     static int every = -1;
     if (every < 0) {

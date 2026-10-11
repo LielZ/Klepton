@@ -329,5 +329,8 @@ void klj_guest_version(long *code, const char **name);
 // Fields of the Horizon Platform reply object (kl_jni_net.c); 0 when obj is not one.
 int klj_horizon_message_field(void *obj, const char *cls, const char *name,
                               const char *sig, klj_val *out);
+// Fields of UE4's MediaPlayer14$VideoTrackInfo (kl_jni_ue4.c); 0 when obj is not one.
+int klj_ue4_media_track_field(void *obj, const char *cls, const char *name,
+                              const char *sig, klj_val *out);
 
 #endif /* KL_JNI_INT_H */

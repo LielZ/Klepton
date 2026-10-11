@@ -498,6 +498,16 @@ set -e
 APP="build/dd-sim-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xrsimulator/$PRODUCT.app"
 [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
 [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
+# The build above signs nothing (CODE_SIGNING_ALLOWED=NO), and the linker's own
+# ad-hoc signature is only on what the linker made: the app's binary, ANGLE,
+# MoltenVK. The guest's translated libraries come out of klepton-ld without one,
+# and an arm64 simulator refuses to map unsigned code — dlopen of the first
+# library in the chain failed, with a message cut off before its reason
+# (visionOS 27 simulator, 2026-10-11). Ad-hoc is all a simulator asks for.
+for F in "$APP"/Frameworks/*.framework; do
+  [ -d "$F" ] || continue
+  codesign -dv "$F" >/dev/null 2>&1 || codesign -f -s - "$F" >/dev/null 2>&1 || true
+done
 
 echo "[4/5] installing + staging…"
 xcrun simctl install "$UDID" "$APP"

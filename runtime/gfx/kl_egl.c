@@ -341,9 +341,25 @@ static const char *const g_gl_extensions[] = {
     // ("no usable vertex shader variant") and render black. A different engine that
     // isn't built for it is better left on its own per-eye path. klgl_want_multiview()
     // gates BOTH doors (this list and GL_MAX_VIEWS_OVR); klgl_ext_count() drops these
-    // entries when it returns 0, so THESE TWO MULTIVIEW ENTRIES MUST STAY LAST.
+    // entries when it returns 0, so THESE MULTIVIEW ENTRIES (and the one after them) MUST STAY LAST.
     "GL_OVR_multiview",
     "GL_OVR_multiview2",
+    // The multisampled form, for one kind of guest only (klgl_want_multiview_ms):
+    // Unreal's Android GL layer switches mobile multiview on only when all THREE
+    // names are in the string and both entry points resolve. The entry point it
+    // gets for this one is ours and attaches without multisampling — see
+    // klgl_FramebufferTextureMultisampleMultiviewOVR.
+    "GL_OVR_multiview_multisampled_render_to_texture",
+    // Texture buffers, for the same one kind of guest (klgl_want_multiview_ms).
+    // Unreal decides whether buffer resource views exist from THIS NAME, not
+    // from the ES level it is told: without it RHICreateShaderResourceView
+    // makes no texture at all, while the cooked shaders still read their bone
+    // matrices out of a samplerBuffer — nothing is bound there, every bone is
+    // zero, and every skinned mesh collapses to a point. Maestro: no musicians
+    // and no score book, their instruments hanging in the air (glTexBuffer was
+    // never called once in a whole run). What answers it is kl_glfb's 2D
+    // stand-in (klfb_TexBuffer), which does not need the real extension.
+    "GL_EXT_texture_buffer",
 };
 
 // Which targets actually render with GLES single-pass multiview. Advertise the
@@ -363,10 +379,27 @@ static int klgl_want_multiview(void) {
     // doom3quest (id Tech 4 / d3es): its GLSL is written for multiview outright —
     // every program opens with `layout(num_views=2) in;` and the VR framebuffer is
     // attached with glFramebufferTextureMultiviewOVR, with no per-eye fallback.
+    // ...and whoever is served the Array eye layout on GL through OVRPlugin
+    // (kl_ovrp_gl_array — Maestro, a UE4 project cooked for mobile multiview).
+    extern int kl_ovrp_gl_array(void);
     return strncmp(t, "ieytd", 5) == 0 ||
            strcmp(t, "hl2") == 0 ||
            strcmp(t, "portal") == 0 ||
-           strcmp(t, "doom3quest") == 0;
+           strcmp(t, "doom3quest") == 0 ||
+           kl_ovrp_gl_array();
+}
+
+// Who is also shown GL_OVR_multiview_multisampled_render_to_texture: a guest
+// served the Array eye layout on GL through OVRPlugin (kl_ovrp_gl_array). That is
+// Unreal on GLES, and FAndroidOpenGL::ProcessExtensions sets its multiview flag
+// from `multiview && multiview2 && multiview_multisampled` plus both function
+// pointers. Shown only two of the three, Maestro still asked OVRPlugin for an
+// Array eye texture (the project is cooked that way), compiled every shader with
+// `#define gl_ViewID_OVR 0`, allocated no scene colour for the layered target,
+// and read a NULL texture in FMobileSceneRenderer::RenderForward.
+static int klgl_want_multiview_ms(void) {
+    extern int kl_ovrp_gl_array(void);
+    return kl_ovrp_gl_array();
 }
 
 // ...and none of it is offered below ES 3. Steam Link is told GLES 2.0
@@ -376,8 +409,11 @@ static int klgl_want_multiview(void) {
 static int klgl_base_count(void) {
     if (g_es_major < 3) return 0;
     int n = (int)(sizeof g_gl_extensions / sizeof g_gl_extensions[0]);
-    // Hide the two trailing OVR_multiview entries from targets that don't use it.
-    if (!klgl_want_multiview()) n -= 2;
+    // Hide the trailing OVR_multiview entries from targets that don't use them:
+    // all three, or just the multisampled one.
+    // ...and the texture-buffer name behind them goes with the multisampled one.
+    if (!klgl_want_multiview()) n -= 4;
+    else if (!klgl_want_multiview_ms()) n -= 2;
     return n;
 }
 
@@ -414,6 +450,25 @@ static const char *klgl_ext_at(int i) {
     return i < klgl_base_count() ? g_gl_extensions[i] : klgl_ext_extra();
 }
 
+// ANGLE's Metal backend exports glFramebufferTextureMultisampleMultiviewOVR and
+// refuses it (no implicit-resolve layered pass). For a guest that was told the
+// extension exists, the attachment is made WITHOUT multisampling instead: the
+// same two-view attachment, one sample. The picture loses its anti-aliasing and
+// nothing else; refusing would leave the eye framebuffer incomplete.
+static void klgl_FramebufferTextureMultisampleMultiviewOVR(uint32_t target, uint32_t attachment,
+                                                           uint32_t texture, int32_t level,
+                                                           int32_t samples, int32_t base_view,
+                                                           int32_t num_views) {
+    static void (*plain)(uint32_t, uint32_t, uint32_t, int32_t, int32_t, int32_t);
+    if (!plain) plain = kl_egl_sym("glFramebufferTextureMultiviewOVR");
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [gl] glFramebufferTextureMultisampleMultiviewOVR(samples=%d) is "
+                        "attached as plain multiview — this backend has no multisampled "
+                        "layered pass (said once)\n", samples);
+    if (plain) plain(target, attachment, texture, level, base_view, num_views);
+}
+
 // The GL identity, per target. An Unreal guest creates a throwaway GLES context
 // before it has chosen an RHI, purely to read GL_RENDERER, and matches its
 // DEVICE PROFILE on the answer — and the profile is what turns Vulkan on. Moss
@@ -435,7 +490,10 @@ static const char *klgl_identity(int renderer) {
 }
 
 static const char *klgl_GetString(uint32_t name) {
-    static char ver[64], glsl[64], exts[512];
+    // `exts` holds the whole list: at 256 bytes the three multiview names did not
+    // fit behind the rest and the last was cut in half — a guest reading the
+    // string (Unreal on Android does) never saw it.
+    static char ver[64], glsl[64], exts[1024];
     switch (name) {
     // Who the GPU says it is. Honest by default; KL_GL_VENDOR / KL_GL_RENDERER
     // override, and one target needs a different default — see klgl_identity.
@@ -573,6 +631,33 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     // glGetStringi will hand out makes the guest read past the end or stop
     // short, and either one is silent.
     if (pname == GL_NUM_EXTENSIONS) { params[0] = klgl_ext_count(); return 1; }
+    // The ES 3.1 storage limits, for a title that is refused on their absence.
+    // Unity derives "random write" support from these, and every shader built at
+    // `#pragma target 4.5` (requirement mask: compute, randomwrite, msaatex...)
+    // is marked unsupported when they read 0 — which is what the generic answer
+    // below gives — and drawn with the magenta error shader instead. Sniper Elite
+    // VR (x2544573735586536) builds its whole menu UI (SEVRQuest/DefaultUI) that
+    // way, so its menu panel was one magenta quad. A UI shader stores nothing; the
+    // values are the ES 3.1 spec minimums, the least that keeps the 3.2 claim in
+    // GL_VERSION consistent, and they are per target because every other title
+    // here was verified against the zeros.
+    {
+        const char *t = kl_driver_target_name();
+        if (t && strcmp(t, "x2544573735586536") == 0) {
+            static const struct { uint32_t pname; int32_t value; } es31[] = {
+                {0x8F38 /* MAX_IMAGE_UNITS                     */, 4},
+                {0x90D6 /* MAX_VERTEX_SHADER_STORAGE_BLOCKS    */, 4},
+                {0x90DA /* MAX_FRAGMENT_SHADER_STORAGE_BLOCKS  */, 4},
+                {0x90DB /* MAX_COMPUTE_SHADER_STORAGE_BLOCKS   */, 4},
+                {0x90DC /* MAX_COMBINED_SHADER_STORAGE_BLOCKS  */, 8},
+                {0x90DD /* MAX_SHADER_STORAGE_BUFFER_BINDINGS  */, 8},
+                {0x92DC /* MAX_ATOMIC_COUNTER_BUFFER_BINDINGS  */, 1},
+                {0x90EB /* MAX_COMPUTE_WORK_GROUP_INVOCATIONS  */, 128},
+            };
+            for (size_t i = 0; i < sizeof es31 / sizeof es31[0]; i++)
+                if (es31[i].pname == pname) { params[0] = es31[i].value; return 1; }
+        }
+    }
     for (size_t i = 0; i < sizeof g_gl_int / sizeof g_gl_int[0]; i++)
         if (g_gl_int[i].pname == pname) {
             params[0] = g_gl_int[i].value;
@@ -1841,7 +1926,8 @@ void *kl_egl_sym(const char *name) {
     // glFramebufferTextureMultiviewOVR when this one is missing, where ANGLE's
     // exported-but-disabled entry point would raise INVALID_OPERATION and leave
     // its eye framebuffer incomplete.
-    if (strcmp(name, "glFramebufferTextureMultisampleMultiviewOVR") == 0) return NULL;
+    if (strcmp(name, "glFramebufferTextureMultisampleMultiviewOVR") == 0)
+        return klgl_want_multiview_ms() ? (void *)klgl_FramebufferTextureMultisampleMultiviewOVR : NULL;
     void *own = kl_egl_lookup(name);              // eglXxx resolved through here too
     if (own) return own;
     // With KL_GLFB=1 the host's real GL answers everything except the capability

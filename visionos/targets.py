@@ -979,6 +979,22 @@ DEFAULT = "beatsaber"
 # device.
 GENERIC_ENV = "KLEPTON_GENERIC_TARGET"
 
+# Where a generic target's guest looks for its OBB, where the engine guess in
+# _generic_row() is wrong for that one game. Keyed on the target name, so no
+# other title changes.
+#
+# Sniper Elite VR (com.JustAddWater.SniperEliteVR, x2544573735586536) is Unity,
+# but its levels are not one main.<version>.<package>.obb: they are ~27 loose
+# AssetBundles (common_assets, bridge_scenes, quest2.hd, ...) that the store
+# delivers into Android's own obb directory, <external>/Android/obb/<package>/,
+# and that is where they are staged. The game asks Context.getObbDir() for that
+# directory and opens the bundles from it; answering the Unity default
+# <files>/obb gave it an empty directory, every "Unable to open archive file",
+# and a loading screen that never ends.
+GENERIC_OBB = {
+    "x2544573735586536": "Android/obb/com.JustAddWater.SniperEliteVR",
+}
+
 
 def _generic_row(name):
     import os, re
@@ -1013,6 +1029,7 @@ def _generic_row(name):
         # A NativeActivity names its library in the manifest; without that there
         # is nothing to go on, and libmain is the least surprising guess.
         kind, entry, obb = "native", ("lib" + native_lib) if native_lib else "libmain", android_obb
+    obb = GENERIC_OBB.get(name, obb)
     display = os.environ.get("KLEPTON_GENERIC_DISPLAY", "") or name
     display = "".join(c for c in display if c.isprintable())[:60].strip() or name
     return {

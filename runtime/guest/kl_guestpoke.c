@@ -208,6 +208,20 @@ static const struct poke_cap_row k_poke_caps[] = {
     // the other 2019 builds. BEFORE the "2019.4" row because the match is a
     // prefix test and takes the first hit; that row is Beat Saber's build.
     { "2019.4.36f1", 0x112bec0, 0xe8, 1, "x5361030930653377" },
+    // Unity 2019.4.18f1 — Sniper Elite VR 1.03 (x2544573735586536, 2026-10-11).
+    // ~640k "Invalid texture unit!" in a short session at the cap of 32: the
+    // menu drew, but every level surface came out black and unlit (its
+    // TexArray/MegaMaterial world shaders sample above unit 31). Measured by
+    // the recipe above against this build's libunity:
+    //   0x1231fe4  "OpenGL Error: Invalid texture unit!"
+    //   0x6e5788   bl 0x53b558            ; the singleton getter
+    //   0x6e578c   ldr w8, [x0, #0xe8]    ; the cap
+    //   0x6e5790   cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x53b558   adrp x8, 0x1684000 / ldr x0, [x8, #0xf40]
+    // 0x1684f40 lands in the RW LOAD's BSS (va 0x15a8908, filesz 0x6f778 <
+    // memsz 0x16cfe0), a singleton pointer filled at runtime. BEFORE the
+    // "2019.4" row for the same prefix reason as the row above.
+    { "2019.4.18f1", 0x1684f40, 0xe8, 1, "x2544573735586536" },
     // Unity 2019.4 — Beat Saber 1.28/1.6.0, the long-standing reference build.
     // Getter 0x313710 serves *(base + 0x122e340); cap at +0xe8.
     { "2019.4", 0x122e340, 0xe8, 0 },

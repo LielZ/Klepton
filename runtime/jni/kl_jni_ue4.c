@@ -23,6 +23,7 @@
 #include "kl_env.h"
 #include "kl_ovrp.h"
 #include "kl_avdec.h"
+#include "kl_obbmap.h"
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_va.h"
@@ -525,6 +526,17 @@ static klj_val klj_MsgBox_show(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.j = 0};
 }
 
+// AndroidThunkJava_GetNetworkConnectionType() -> ENetworkConnectionType, as
+// UE4's GameActivity numbers it: 0 none, 1 airplane mode, 2 cell, 3 WiFi,
+// 4 WiMAX, 5 Bluetooth, 6 Ethernet. A Vision Pro reaches the network over
+// WiFi and nothing else, and this runtime has no notion of the link being
+// down, so the answer is WiFi — which is also what a Quest gives. Tales from
+// the Galaxy's Edge asks once its content has been found (2026-10-11).
+static klj_val klj_GA_networkConnectionType(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 3};
+}
+
 // ---- Unreal Engine 4: com.epicgames.ue4.MediaPlayer14 ----------------------
 //
 // UE4's Java media player, and the thing standing between RE4 and its opening
@@ -561,6 +573,8 @@ typedef struct {
     unsigned long long buf_serial;
     int        last_w, last_h;   // for didResolutionChange
     int        res_changed;
+    unsigned long long tex_serial;   // the frame last put into the guest's texture
+    unsigned   tex_uploads;
 } klj_media;
 
 static klj_media *klj_media_of(void *self) {
@@ -585,7 +599,24 @@ static void klj_media_open(klj_media *m, const char *what, long long off,
     // depending on which MediaSource built the URL.
     const char *p = m->source;
     if (strncmp(p, "file://", 7) == 0) p += 7;
-    m->dec = kl_avdec_open(p, off, len);
+    // The guest names the container by ITS path. Where that is a file of its
+    // own the translation is all there is to it; where the container is itself
+    // an entry of the OBB — Tales from the Galaxy's Edge keeps its movies in
+    // Taco-Android_ASTC.pak, which is stored inside main.*.obb and reaches the
+    // guest through the OBB read-through — the range is into that entry, so it
+    // is rebased onto the OBB. Without this the open failed, setDataSource
+    // answered false, and the title sat in front of a movie that never ran.
+    char kp[1024], host[1024];
+    const char *gp = kl_guest_path(p, kp, sizeof kp);
+    long long base = 0, whole = 0;
+    if (access(gp, R_OK) != 0 && kl_obbmap_locate(gp, host, sizeof host, &base, &whole)) {
+        if (len <= 0) len = whole - off;
+        KLJ_LOG("MediaPlayer14: %s is an entry of the OBB — reading %lld bytes at "
+                "%lld + %lld of it", p, len, base, off);
+        gp = host;
+        off += base;
+    }
+    m->dec = kl_avdec_open(gp, off, len);
     if (!m->dec)
         KLJ_LOG("MediaPlayer14: could not open %s (offset %lld, %lld bytes) — "
                 "setDataSource answers false and the guest's own no-media path "
@@ -797,15 +828,41 @@ static klj_val klj_MP14_getVideoLastFrameData(void *env, void *self,
     return (klj_val){.l = m->buffer};
 }
 
-// (int) -> Z: "is there a frame at all". The int is the external texture the
-// GLES path would have rendered into and is not one here.
+// (int destTexture) -> Z: "is there a frame", and on GLES also "put it there".
+//
+// On Android the Java player draws its SurfaceTexture into the 2D texture the
+// engine names — this is how a GLES guest without the external-texture route
+// gets its movie (FAndroidMediaPlayer's render-thread GetVideoLastFrame, with
+// the native name of the sample's own texture). Here the frame is plain
+// pixels, so it is uploaded into that texture, once per new frame. A Vulkan
+// guest (RE4) passes no texture and reads getVideoLastFrameData instead; for
+// it this stays the question it was.
+//
+// Tales from the Galaxy's Edge is the GLES guest this was written for: its two
+// opening movies, and a picture that stayed black behind them (2026-10-11).
 static klj_val klj_MP14_getVideoLastFrame(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)a; (void)n;
+    (void)env;
     klj_media *m = klj_media_of(self);
     if (!m || !m->dec) return (klj_val){.j = 0};
     unsigned long long serial = 0;
-    const void *px = kl_avdec_frame(m->dec, NULL, NULL, NULL, &serial);
-    return (klj_val){.j = px != NULL && serial != 0};
+    int w = 0, h = 0;
+    const void *px = kl_avdec_frame(m->dec, &w, &h, NULL, &serial);
+    if (!px || !serial) return (klj_val){.j = 0};
+    if (w != m->last_w || h != m->last_h) {
+        m->res_changed = 1;
+        m->last_w = w; m->last_h = h;
+    }
+    uint32_t tex = n > 0 ? (uint32_t)a[0].j : 0;
+    if (!m->vulkan && tex && serial != m->tex_serial) {
+        extern int kl_glfb_upload_picture(uint32_t, int, int, const void *, int);
+        if (kl_glfb_upload_picture(tex, w, h, px, !m->swizzle)) {
+            m->tex_serial = serial;
+            if (m->tex_uploads++ == 0)
+                KLJ_LOG("MediaPlayer14: first frame %dx%d into the guest's texture %u "
+                        "(GLES path)", w, h, tex);
+        }
+    }
+    return (klj_val){.j = 1};
 }
 
 // Latched and cleared by the read, which is what "did it change" means — a
@@ -857,10 +914,54 @@ static klj_val klj_MP14_tracks_caption(void *env, void *self, const klj_val *a, 
     return (klj_val){.l = klj_new_array('L',
         "com/epicgames/ue4/MediaPlayer14$CaptionTrackInfo", 0)};
 }
+// The video track: one, when a decoder is open — it decodes exactly one.
+//
+// An empty list here was "no selectable tracks", and for a guest that asks
+// (needTrackInfo, the ctor's third bool) that is not a neutral answer: UE4's
+// FAndroidMediaPlayer selects video track 0 only if the list has one, and
+// fetches frames only for a selected track. With none the movie opened,
+// "played" and ended without one frame being asked for (Tales from the
+// Galaxy's Edge, 2026-10-11). A guest that does not ask is given a made-up
+// track by the engine itself, which is why RE4 never needed this.
+//
+// The fields are the eight FJavaAndroidMediaPlayer reads off each element:
+// Index, MimeType, DisplayName, Language, BitRate, Width, Height, FrameRate.
+// Width and Height are the decoder's; the frame rate is not something kl_avdec
+// reports, and 30 is what the engine itself assumes when it has no track info.
+#define KLJ_MP14_VTRACK "com/epicgames/ue4/MediaPlayer14$VideoTrackInfo"
+typedef struct { int w, h; } klj_media_vtrack;
+
+int klj_ue4_media_track_field(void *obj, const char *cls, const char *name,
+                              const char *sig, klj_val *out) {
+    if (strcmp(cls, KLJ_MP14_VTRACK) != 0) return 0;
+    klj_object *o = klj_as_object(obj);
+    const klj_media_vtrack *t = (o && strcmp(o->cls, KLJ_MP14_VTRACK) == 0) ? o->data : NULL;
+    *out = (klj_val){0};
+    if (!t) return 1;
+    if      (strcmp(name, "Width") == 0)       out->j = (uint64_t)(uint32_t)t->w;
+    else if (strcmp(name, "Height") == 0)      out->j = (uint64_t)(uint32_t)t->h;
+    else if (strcmp(name, "FrameRate") == 0) { if (sig[0] == 'F') out->d = 30.0; else out->j = 30; }
+    else if (strcmp(name, "MimeType") == 0)    out->l = kl_jni_new_string("video/avc");
+    else if (strcmp(name, "DisplayName") == 0) out->l = kl_jni_new_string("Video Track 0 (Stream 0)");
+    else if (strcmp(name, "Language") == 0)    out->l = kl_jni_new_string("und");
+    // Index and BitRate: 0 — the first track, and a rate nobody measured.
+    return 1;
+}
+
 static klj_val klj_MP14_tracks_video(void *env, void *self, const klj_val *a, int n) {
-    (void)self; (void)a; (void)n;
-    return (klj_val){.l = klj_new_array('L',
-        "com/epicgames/ue4/MediaPlayer14$VideoTrackInfo", 0)};
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    int have = m && m->dec && kl_avdec_width(m->dec) > 0 && kl_avdec_height(m->dec) > 0;
+    void *list = klj_new_array('L', KLJ_MP14_VTRACK, have ? 1 : 0);
+    klj_array *arr = klj_arr(list);
+    if (have && arr) {
+        klj_media_vtrack *t = calloc(1, sizeof *t);
+        if (t) {
+            t->w = kl_avdec_width(m->dec); t->h = kl_avdec_height(m->dec);
+            ((void **)arr->data)[0] = klj_new_object_data(KLJ_MP14_VTRACK, t);
+        }
+    }
+    return (klj_val){.l = list};
 }
 static klj_val klj_MP14_selectTrack(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -1003,6 +1104,8 @@ const klj_binding klj_bind_ue4[] = {
     {"com/epicgames/ue4/MediaPlayer14", "updateVideoFrame",
      "(I)Lcom/epicgames/ue4/MediaPlayer14$FrameUpdateInfo;", klj_MP14_updateVideoFrame},
     {"com/epicgames/ue4/MediaPlayer14", "selectTrack", "(I)V", klj_MP14_selectTrack},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetNetworkConnectionType", "()I",
+                                                klj_GA_networkConnectionType},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsOculusMobileApplication",
      "()Z", klj_GA_isOculusMobile},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_HasMetaDataKey",

@@ -707,6 +707,22 @@ static int kl_socket(int domain, int type, int protocol) {
     }
     int fd = socket(domain, type, protocol);
     if (fd >= 0) kl_grow_sock_buffers(fd);
+    // A failed send on a non-stream socket must come back as an error, never as
+    // SIGPIPE. Linux never raises SIGPIPE for datagram sockets; Darwin does
+    // whenever a send fails with EPIPE, unless SO_NOSIGPIPE is set. Beat Saber
+    // 1.40 (Unity 2022.3) dies this way seconds into boot: Unity's Ping sends on
+    // its ICMP datagram socket, gets "Broken pipe", and the SIGPIPE lands in
+    // Unity's own handler (13 is not refused by klb_fatal_signal), which reads
+    // the Darwin ucontext as Linux, dumps garbage registers and faults at 0x0 in
+    // libunity. SO_NOSIGPIPE here restores the Linux behaviour: the engine gets
+    // the EPIPE it already logs and carries on. Stream sockets are untouched
+    // (Linux does raise SIGPIPE there without MSG_NOSIGNAL, handled per call in
+    // kl_msg_flags). KL_NET_DGRAM_NOSIGPIPE=0 reverts.
+    if (fd >= 0 && (type & 0xf) != SOCK_STREAM) {
+        static int nosig = -1;
+        if (nosig < 0) nosig = kl_env_on("KL_NET_DGRAM_NOSIGPIPE", 1);
+        if (nosig) kl_no_sigpipe(fd);
+    }
     // Darwin traffic-class marking for the guest's UDP sockets. Steam Link's
     // AV stream is plain UDP; stamped NET_SERVICE_TYPE_RV ("responsive
     // multimedia - interactive media such as screen sharing", Apple's own
@@ -2600,7 +2616,13 @@ void *kl_shim_lookup(const char *name) {
     // `ovrp_` is OVRPlugin's prefix and a different library (kl_ovrp), so the
     // fourth character is checked: `ovr_` and `ovrID` are the platform's, and
     // `ovrp_` is not claimed by this tier.
-    if (!strncmp(name, "ovr_", 4) || !strncmp(name, "ovrID", 5))
+    // ...and so are the SDK's enum helpers, which are spelled without the
+    // underscore (ovrMessageType_ToString, ovrLeaderboardFilterType_FromString):
+    // `ovr` followed by a capital – which covers `ovrID` as well. Maestro calls
+    // the first to log a failed request, and as an unresolved import that was
+    // the end of the run.
+    if (!strncmp(name, "ovr_", 4) ||
+        (!strncmp(name, "ovr", 3) && name[3] >= 'A' && name[3] <= 'Z'))
         return kl_ovrplat_sym(name);
 
     // Tier 12: OVRPlugin as an ELF import. Newer Unreal dlopens libOVRPlugin.so

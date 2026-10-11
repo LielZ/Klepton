@@ -12,6 +12,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <mach/mach.h>   // vm_read_overwrite — probe a guest pointer without faulting
 #include "klepton.h"
 #include "kl_ovrp.h"
@@ -824,14 +825,39 @@ static uint64_t klovrp_GetFoveationEyeTrackedSupported(int *out) {
 // layer (multiview off) — olar spun ~86k CalculateEyeLayerDesc retries and the
 // watchdog killed it. So these titles MUST have multiview to boot at all; the
 // black-world fix has to live inside the multiview path, not by disabling it.
+// The Array eye layout for a GLES guest: one GL_TEXTURE_2D_ARRAY per stage, a
+// layer per eye, drawn single-pass through GL_OVR_multiview — and copied a layer
+// at a time into the compositor's own eye textures at ovrp_EndFrame4, because an
+// array texture cannot be re-pointed at an MTLTexture (kl_glfb_mirror_eye_layer;
+// the same route an OpenXR guest's array swapchain takes).
+//
+// Per target, default off. A UE4 project cooked with vr.MobileMultiView asks for
+// the Array layout whatever it is told here and has shaders for nothing else:
+// Maestro (x6963344583787383) got a refusal, kept a NULL eye texture, and crashed
+// in FMobileSceneRenderer::RenderForward on its first frame. twd2 is the other
+// kind of UE guest — it takes DoubleWide when multiview reads false, and that is
+// its proven path — so this is not switched on by engine. KL_OVRP_GL_ARRAY
+// overrides in either direction; kl_egl.c offers GL_OVR_multiview to the same
+// targets (klgl_want_multiview), since one without the other is a guest told it
+// may render single-pass into storage it cannot attach.
+int kl_ovrp_gl_array(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_OVRP_GL_ARRAY", t && strcmp(t, "x6963344583787383") == 0);
+    }
+    return v;
+}
+
 int kl_ovrp_multiview(void) {
     // GLES (ANGLE) guests have NO multiview and their eye layer is served only as
     // Stereo/DoubleWide — so multiview MUST read false for them, or a UE guest
     // (twd2) requests an Array eye layout that GetLayerTexture2 refuses on the GL
     // path, and the guest spins forever recalculating the layer it can never get.
-    // Only the Vulkan path serves Array. (Dropping this guard once regressed twd2
-    // into exactly that non-booting CalculateLayerDesc loop.)
-    if (!kl_vulkan_guest_active()) return 0;
+    // Only the Vulkan path serves Array — and the GL targets named in
+    // kl_ovrp_gl_array. (Dropping this guard once regressed twd2 into exactly
+    // that non-booting CalculateLayerDesc loop.)
+    if (!kl_vulkan_guest_active()) return kl_ovrp_gl_array();
     return kl_env_on("KL_OVRP_MULTIVIEW", 1);
 }
 
@@ -1324,6 +1350,13 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
         // pass queued under a millisecond, and its player asked for a sharper
         // picture: 2560 gives 2816x2816.
         if (t && strcmp(t, "cs1") == 0) cap_dflt = 2560;
+        // Maestro: Unreal on GL asks for 4x multisampled multiview, which this
+        // backend can only give it single-sampled, and it then renders at 0.9
+        // of whatever it is told — so at the usual cap the picture is both
+        // aliased and under the display's own density (its owner: "the
+        // resolution could be higher"). A light scene; the larger target is
+        // the anti-aliasing it has.
+        if (t && strcmp(t, "x6963344583787383") == 0) cap_dflt = 4000;
     }
     int cap = kl_env_int("KL_OVRP_EYE_MAX", cap_dflt);
     if (cap > 0 && (w > cap || h > cap)) {
@@ -3095,6 +3128,9 @@ static int klovrp_submit_stage(const void *layer_submits, int count);
 static void klovrp_census_submits(const void *layer_submits, int count);
 // ...and the overlay list a compositor draws on top of the eye picture.
 static void klovrp_record_overlays(const void *layer_submits, int count);
+static void klovrp_mirror_array_eyes(const void *layer_submits, int count);
+static void klovrp_mirror_enq_gl(void);
+static void klovrp_enq_age(void);
 
 // `viewports` is that pair, or NULL where a caller cannot know — ovrp_EndFrame
 // (1.28's legacy VRDevice, which has no layers at all) and every non-Unity
@@ -3341,6 +3377,8 @@ static uint64_t klovrp_end_frame_impl(int guest_frame_index, const int *viewport
 // actually hit.
 static uint64_t klovrp_EndFrame(int guest_frame_index) {
     ovrp_hit("ovrp_EndFrame");
+    klovrp_enq_age();
+    klovrp_mirror_enq_gl();
 // No layer list on this path — 1.28's legacy VRDevice hands its eye
     // textures down through ovrp_SetupEyeTexture2 and never describes a layer,
     // so it can only ever have rendered into the whole thing.
@@ -3483,6 +3521,10 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
     // Before this, all of it was dropped here. After the wait for the same
     // reason the record is: these name stages of their own.
     klovrp_record_overlays(layer_submits, layer_submit_count);
+    // GL array eyes reach the compositor by copy, and the copy has to land
+    // before the record announces the stage (the same ordering argument as the
+    // Vulkan branch above: nothing else puts the compositor behind it).
+    klovrp_mirror_array_eyes(layer_submits, layer_submit_count);
     int vp[8], of[2] = { 0, 0 };
     int have = klovrp_submit_viewports(layer_submits, layer_submit_count, vp, of);
     return klovrp_end_frame_impl(guest_frame_index, have ? vp : NULL,
@@ -4275,6 +4317,31 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
         }
         klovrp_dump_vrdevice();
         klovrp_hand_sweep(&head, &hand);
+        // KL_OVRP_HANDS_TAP=<seconds>: from that many seconds after the first
+        // hand read, move the RIGHT hand down and up in front of the head, once
+        // every 1.2 s — a hand tapping a surface at waist height, for a host
+        // run that has nobody to do it (Maestro's "tap the podium twice").
+        // KL_OVRP_HANDS_TAP_FOR=<seconds> ends it (default 12). Diagnostic.
+        {
+            static double tap_from = -2.0, tap_for, t0;
+            if (tap_from < -1.5) {
+                tap_from = kl_env_float("KL_OVRP_HANDS_TAP", -1.0f);
+                tap_for  = kl_env_float("KL_OVRP_HANDS_TAP_FOR", 12.0f);
+                t0 = kl_ovrp_predicted_display_time();
+            }
+            double el = kl_ovrp_predicted_display_time() - t0 - tap_from;
+            if (tap_from >= 0.0 && h == 1 && el >= 0.0 && el < tap_for) {
+                double ph = fmod(el, 1.2) / 1.2;
+                float dy = -0.20f - 0.75f * (float)(0.5 - 0.5 * cos(2.0 * 3.14159265358979 * ph));
+                float ox, oy, oz;
+                klovrp_qrot(&head, 0.12f, dy, -0.45f, &ox, &oy, &oz);
+                hand = head;
+                hand.px = head.px + ox; hand.py = head.py + oy; hand.pz = head.pz + oz;
+                static int said;
+                if (!said++) fprintf(stderr, "  [ovrp] hand tap script: right hand now moving "
+                                             "between 0.20 and 0.95 m below the head\n");
+            }
+        }
         p = &hand;
     }
     float *f = out;
@@ -6128,6 +6195,69 @@ static int klovrp_submit_stage(const void *layer_submits, int count) {
     return -1;
 }
 
+// The GL Array eye layout's way onto the compositor (kl_ovrp_gl_array): the
+// stage the guest names in its eye submit is an array texture of ours, and each
+// of its two layers is copied into the provider-backed eye texture of that
+// stage. With source 0 the stage IS the compositor's slot, which is the keying
+// every other OVRPlugin eye uses. Runs on the thread that calls ovrp_EndFrame4 —
+// the guest's own GL thread, where its context is current.
+static void klovrp_mirror_array_eyes(const void *layer_submits, int count) {
+    const ovrp_layer_submit *const *list = layer_submits;
+    if (!list || count <= 0 || kl_vulkan_guest_active()) return;
+    for (int i = 0; i < count; i++) {
+        const ovrp_layer_submit *s = list[i];
+        if (!s) continue;
+        struct klovrp_layer *l = klovrp_layer(s->layer_id);
+        if (!l || !l->is_eye || l->desc.layout != KLOVRP_LAYOUT_ARRAY) continue;
+        int stage = s->texture_stage;
+        if ((unsigned)stage >= KLOVRP_MAX_STAGES || !l->tex[stage][0]) return;
+        const char *fname = NULL;
+        uint32_t glfmt = klovrp_gl_format(l->desc.format, &fname);
+        if (!glfmt) glfmt = KL_OVRP_TEXFMT_EYE;
+        int w = l->desc.texture_size.w, h = l->desc.texture_size.h;
+        for (int eye = 0; eye < 2; eye++) {
+            int slot = kl_glfb_mirror_eye_layer(eye, stage, 0, l->tex[stage][0], eye, w, h, glfmt);
+            static int said[2];
+            if (slot < 0 && !said[0]++)
+                fprintf(stderr, "  [ovrp] array eye %d stage %d could not be copied to the "
+                                "compositor — that eye stays as it was\n", eye, stage);
+            else if (slot >= 0 && !said[1]++)
+                fprintf(stderr, "  [ovrp] array eyes: stage %d of GL array texture %u copied a "
+                                "layer per eye into the compositor's slot %d (%dx%d)\n",
+                        stage, l->tex[stage][0], slot, w, h);
+        }
+        // The copies are in ANGLE's stream; the record that points the compositor
+        // at this stage is published right after. Order the two.
+        kl_glfb_frame_fence();
+        // KL_OVRP_EYE_DUMP=<seconds>: photograph both layers of the stage the guest
+        // just submitted, every that many seconds, into <files>/eyedump — what the
+        // guest drew, before any of ours touches it.
+        {
+            static int every = -2;
+            static time_t next_at;
+            static unsigned seq;
+            if (every == -2) every = kl_env_int("KL_OVRP_EYE_DUMP", 0);
+            time_t now = time(NULL);
+            if (every > 0 && now >= next_at && seq < 6) {
+                extern const char *kl_jni_files_dir(void);
+                const char *base = kl_jni_files_dir();
+                char dir[600], path[700];
+                snprintf(dir, sizeof dir, "%s/eyedump", base ? base : ".");
+                mkdir(dir, 0755);
+                next_at = now + every;
+                for (int eye = 0; eye < 2; eye++) {
+                    snprintf(path, sizeof path, "%s/eye%d_%03u.png", dir, eye, seq);
+                    int r = kl_glfb_dump_tex(path, l->tex[stage][0], eye, w, h);
+                    fprintf(stderr, "  [ovrp] eye dump #%03u eye %d stage %d -> %s (%d)\n",
+                            seq, eye, stage, path, r);
+                }
+                seq++;
+            }
+        }
+        return;
+    }
+}
+
 static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[8],
                                    int of[2]) {
     const ovrp_layer_submit *const *list = layer_submits;
@@ -6561,11 +6691,80 @@ static int g_enq_n;
 // what the boundary test looks at (see klovrp_EnqueueSubmitLayer2).
 static int g_enq_seen[KLOVRP_MAX_LAYERS], g_enq_seen_n;
 #define KLOVRP_SUBMIT_HIDDEN 0x200
+// The layers the enqueue path last published, for klovrp_mirror_enq_gl.
+static int g_enq_pub[KLOVRP_MAX_LAYERS], g_enq_pub_n;
+static unsigned long long g_enq_pub_tex[KLOVRP_MAX_LAYERS];   // texL as submitted
+static pthread_mutex_t g_enq_pub_mu = PTHREAD_MUTEX_INITIALIZER;
 static void klovrp_enq_flush(void) {
     // An EMPTY set is published too: a frame in which every panel was hidden
     // has to take the previous frame's panels down, not leave them standing.
     kl_ovrp_overlays_external(g_enq, g_enq_n);
+    pthread_mutex_lock(&g_enq_pub_mu);
+    g_enq_pub_n = 0;
+    for (int i = 0; i < g_enq_n; i++) {
+        g_enq_pub_tex[g_enq_pub_n] = g_enq[i].tex;
+        g_enq_pub[g_enq_pub_n++] = g_enq[i].layer_id;
+    }
+    pthread_mutex_unlock(&g_enq_pub_mu);
     g_enq_n = 0;
+}
+// The enqueue path's panels on a GLES guest. klovrp_record_overlays copies an
+// EndFrame4 layer's image into compositor-visible storage (kl_glfb_mirror_layer)
+// but the enqueue path never did, so on GLES every enqueued panel reached the
+// compositor with no MTLTexture and was dropped ("no placement or no MTLTexture
+// — not composited"). Sniper Elite VR shows its narrated intro video on such a
+// panel (a 6 m Quad, submitted through ovrp_EnqueueSubmitLayer2 from Unity's
+// main thread), so that scene was black. The copy has to run where the guest's
+// GL context is current and the panel has just been filled — its render thread,
+// at the frame's end — so it is done from EndFrame, not from the enqueue call.
+// ...and taking them down again on that same path. ovrp_EndFrame4 ages the
+// enqueue set (g_enq_frames_since, klovrp_enq_owns_overlays) but the legacy
+// ovrp_EndFrame never did, and the published set is otherwise only replaced by
+// the next enqueue. A guest that simply stops enqueueing a panel — Sniper Elite
+// VR's loading screen, once the level is in — left it standing in front of the
+// player for good. After KLOVRP_ENQ_LIVE_FRAMES end-of-frames with no enqueue,
+// publish the empty set once, the same decision EndFrame4's path makes.
+static void klovrp_enq_age(void) {
+    if (g_enq_frames_since >= 1000000u) return;          // never enqueued
+    if (++g_enq_frames_since != KLOVRP_ENQ_LIVE_FRAMES) return;
+    pthread_mutex_lock(&g_enq_pub_mu);
+    int had = g_enq_pub_n;
+    g_enq_pub_n = 0;
+    pthread_mutex_unlock(&g_enq_pub_mu);
+    if (!had) return;
+    g_enq_n = 0;
+    kl_ovrp_overlays_external(g_enq, 0);
+    static int said;
+    if (said++ < 8)
+        fprintf(stderr, "  [ovrp] enqueued panels: none submitted for %d frames — "
+                        "taken down\n", KLOVRP_ENQ_LIVE_FRAMES);
+}
+
+static void klovrp_mirror_enq_gl(void) {
+    if (kl_vulkan_guest_active() || !kl_glfb_has_mtl_layer_provider()) return;
+    int ids[KLOVRP_MAX_LAYERS], n;
+    unsigned long long tex[KLOVRP_MAX_LAYERS];
+    pthread_mutex_lock(&g_enq_pub_mu);
+    n = g_enq_pub_n;
+    memcpy(ids, g_enq_pub, sizeof(int) * (size_t)n);
+    memcpy(tex, g_enq_pub_tex, sizeof tex[0] * (size_t)n);
+    pthread_mutex_unlock(&g_enq_pub_mu);
+    for (int i = 0; i < n; i++) {
+        struct klovrp_layer *l = klovrp_layer(ids[i]);
+        if (!l || l->is_eye) continue;
+        // The texture the guest NAMED in this submit (texL) is the picture: an
+        // OVROverlay showing a video or a render texture passes its own GL name
+        // there and never draws into the swapchain image we handed it (Sniper
+        // Elite VR: storage GL 44, every submit names GL 191). On GLES texL is
+        // a GL texture name; the swapchain image is only the fallback.
+        uint32_t src = (tex[i] > 0 && tex[i] < 0x100000u) ? (uint32_t)tex[i] : l->tex[0][0];
+        if (!src) continue;
+        const char *fn = NULL;
+        uint32_t gf = klovrp_gl_format(l->desc.format, &fn);
+        if (!gf) gf = KL_OVRP_TEXFMT_EYE;
+        kl_glfb_mirror_layer(ids[i], 0, src, -1,
+                             l->desc.texture_size.w, l->desc.texture_size.h, gf);
+    }
 }
 //
 // **...and five more arguments, on the stack.** The 1.34 form this name always
@@ -6874,9 +7073,13 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
     // to render it with. A guest only reaches here asking for Array if
     // kl_ovrp_multiview() said yes, so a refusal here would be the two answers
     // disagreeing — it is kept as the guard for exactly that.
+    int gl_array = l->is_eye && l->desc.layout == KLOVRP_LAYOUT_ARRAY &&
+                   !kl_vulkan_guest_active() && kl_ovrp_gl_array();
     if (l->is_eye && l->desc.layout == KLOVRP_LAYOUT_ARRAY &&
         kl_vulkan_guest_active() && kl_ovrp_multiview()) {
         /* served below */
+    } else if (gl_array) {
+        /* served below, as a GL array texture */
     } else if (l->is_eye && l->desc.layout != KLOVRP_LAYOUT_STEREO &&
                l->desc.layout != KLOVRP_LAYOUT_DOUBLEWIDE) {
         static int said;
@@ -6947,6 +7150,61 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
         return OVRP_SUCCESS;
     }
 
+    // The Array layout on GL (kl_ovrp_gl_array): ONE two-layer array texture per
+    // stage, and both eyes are handed the same name — the guest addresses the eye
+    // by layer (glFramebufferTextureMultiviewOVR). Plain GL storage: nothing can
+    // bind an array to the compositor's texture, so it is copied at EndFrame4.
+    if (gl_array) {
+        uint32_t *slot = &l->tex[stage][0];
+        if (!*slot) {
+            static void (*gl_GenTextures)(int32_t, uint32_t *);
+            static void (*gl_BindTexture)(uint32_t, uint32_t);
+            static void (*gl_TexStorage3D)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t);
+            static void (*gl_TexParameteri)(uint32_t, uint32_t, int32_t);
+            static void (*gl_GetIntegerv)(uint32_t, int32_t *);
+            if (!gl_GenTextures) {
+                gl_GenTextures   = kl_egl_sym("glGenTextures");
+                gl_BindTexture   = kl_egl_sym("glBindTexture");
+                gl_TexStorage3D  = kl_egl_sym("glTexStorage3D");
+                gl_TexParameteri = kl_egl_sym("glTexParameteri");
+                gl_GetIntegerv   = kl_egl_sym("glGetIntegerv");
+            }
+            uint32_t name = 0;
+            if (gl_GenTextures) gl_GenTextures(1, &name);
+            if (!name || !gl_BindTexture || !gl_TexStorage3D) {
+                fprintf(stderr, "  [ovrp] GetLayerTexture2(layer %d stage %d): no GL array "
+                                "texture could be made — no GL context here\n", layer_id, stage);
+                return OVRP_FAIL_NOT_INITIALIZED;
+            }
+            int w = l->desc.texture_size.w, h = l->desc.texture_size.h;
+            const char *fname = NULL;
+            uint32_t glfmt = klovrp_gl_format(l->desc.format, &fname);
+            if (!glfmt) glfmt = KL_OVRP_TEXFMT_EYE;
+            // The guest's own array binding is put back: this runs in the middle
+            // of its texture set-up, on its context.
+            int32_t prev = 0;
+            if (gl_GetIntegerv) gl_GetIntegerv(0x8C1D /* TEXTURE_BINDING_2D_ARRAY */, &prev);
+            gl_BindTexture(0x8C1A /* TEXTURE_2D_ARRAY */, name);
+            gl_TexStorage3D(0x8C1A, 1, glfmt, w, h, 2);
+            if (gl_TexParameteri) {
+                gl_TexParameteri(0x8C1A, 0x2801 /* MIN_FILTER */, 0x2601 /* LINEAR */);
+                gl_TexParameteri(0x8C1A, 0x2800 /* MAG_FILTER */, 0x2601);
+                gl_TexParameteri(0x8C1A, 0x2802 /* WRAP_S */, 0x812F /* CLAMP_TO_EDGE */);
+                gl_TexParameteri(0x8C1A, 0x2803 /* WRAP_T */, 0x812F);
+            }
+            gl_BindTexture(0x8C1A, (uint32_t)prev);
+            *slot = name;
+            l->tex[stage][1] = name;
+            g_eye_storage_w = w; g_eye_storage_h = h;
+            fprintf(stderr, "  [ovrp] GetLayerTexture2: eye layer %d stage %d = GL array texture %u "
+                            "(%dx%d x2 layers, %s / GL %#x) — both eyes share it, copied to the "
+                            "compositor at EndFrame\n",
+                    layer_id, stage, name, w, h, fname ? fname : "?", glfmt);
+        }
+        *color = *slot;
+        return OVRP_SUCCESS;
+    }
+
     // DoubleWide (TWD2, UE4 GLES): both eyes are halves of ONE wide texture. Key
     // the storage on a canonical eye (0) so a single texture is allocated, then
     // register it under BOTH (eye, stage) keys below — the compositor already
@@ -6965,7 +7223,16 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
         }
         uint32_t name = 0;
         if (gl_GenTextures) gl_GenTextures(1, &name);
+        // No context on this thread (the guest asked from one that holds
+        // none): make the storage under a borrowed share-group context instead
+        // of refusing the layer. See kl_glfb_borrow_context.
+        int borrowed = 0;
+        if (!name && gl_GenTextures && kl_glfb_borrow_context()) {
+            borrowed = 1;
+            gl_GenTextures(1, &name);
+        }
         if (!name) {
+            if (borrowed) kl_glfb_return_context();
             fprintf(stderr, "  [ovrp] GetLayerTexture2(layer %d stage %d eye %d): "
                             "glGenTextures produced no name — no GL context here\n",
                     layer_id, stage, eye);
@@ -7029,6 +7296,7 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
         // reads — see the comment there. kl_glfb keys the eye
         // textures by (eye, stage) and nothing else, so this call has just
         // OVERWRITTEN whatever the previous eye layer put in those slots.
+        if (borrowed) kl_glfb_return_context();
         if (l->is_eye) { g_eye_storage_w = w; g_eye_storage_h = h; }
         fprintf(stderr, "  [ovrp] GetLayerTexture2: %s %d stage %d = GL %u "
                         "(%dx%d %s / GL %#x%s)\n",
@@ -7689,6 +7957,18 @@ static int32_t klovrp_GetDeviceExtensionsVk(const char **names, int *count) {
 // classified deliberately.
 static int32_t klovrp_hand_unsupported(void) { return OVRP_FAIL_UNSUPPORTED; }
 
+// ovrp_GetHandTrackingEnabled(ovrpBool* out): is the SYSTEM's hand tracking
+// switched on? No — hands do not reach a guest through this plugin here (the
+// state and skeleton queries above all refuse), so the truthful answer is a
+// successful "false". Maestro (UE4, OculusInput) asks once at start and has a
+// controller path for that answer; unanswered, it stopped on the trampoline.
+static int32_t klovrp_GetHandTrackingEnabled(int *out) {
+    ovrp_hit("ovrp_GetHandTrackingEnabled");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = 0;
+    return OVRP_SUCCESS;
+}
+
 static int32_t klovrp_GetSkeleton2(int skeleton_type, void *out) {
     if (skeleton_type < 0 || skeleton_type > 3 || !out) return OVRP_FAIL_INVALID_PARAM;
     return OVRP_FAIL_UNSUPPORTED;
@@ -7733,6 +8013,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     // here when it may not anywhere else in this file.
     {"ovrp_GetSkeleton",  (void *)klovrp_hand_unsupported},
     {"ovrp_GetSkeleton3", (void *)klovrp_hand_unsupported},
+    {"ovrp_GetHandTrackingEnabled", (void *)klovrp_GetHandTrackingEnabled},
     {"ovrp_GetHandState",  (void *)klovrp_hand_unsupported},
     {"ovrp_GetHandState2", (void *)klovrp_hand_unsupported},
     {"ovrp_GetMesh",  (void *)klovrp_hand_unsupported},

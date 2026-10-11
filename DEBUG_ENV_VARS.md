@@ -40,6 +40,21 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   unimplemented calls into third-party analytics SDKs (`com/gameanalytics/…`, `com/amplitude/…`).
   Default 1: such calls are dropped and answer zero/NULL/void, since there is
   no host to report to. Max Mustard aborted on `GameAnalytics.addErrorEvent`.
+- `KL_PLAT_USER=0|1` — (`runtime/xr/kl_ovrplat.c`) hand out a synthetic
+  OFFLINE user for `ovr_GetLoggedInUserID` / `ovr_User_GetLoggedInUser`.
+  "Who is playing", not an ownership answer. Default on for the titles listed
+  in `klplat_user_default` — the ones that quit or wait without a user — and
+  off for every other.
+- `KL_PLAT_IAP_EMPTY=0|1` — (`runtime/xr/kl_ovrplat.c`) answer
+  `ovr_IAP_GetProductsBySKU` and `ovr_IAP_GetViewerPurchases` with an EMPTY
+  list instead of refusing the request. For a title whose start waits for the
+  answer; nothing is reported as for sale or as bought. Default on for Tales
+  from the Galaxy's Edge (`x3484270071659289`) alone.
+- `KL_PLAT_OBB_ASSETS=0|1` — (`runtime/xr/kl_ovrplat.c`) report the loose
+  container files in the OBB directory (`*.pak`, `*.utoc`, `*.ucas`) to
+  `ovr_AssetFile_GetList` as installed asset files. They are the store's asset
+  files for such a title, on disk because the store delivered them; a file
+  that is not there is not listed. Default on for `x3484270071659289` alone.
 - `KL_HZ_ENTITLEMENT=0` — (`runtime/jni/kl_jni_net.c`) leave the Horizon
   Platform request `entitlements` / `get_is_viewer_entitled` without a reply,
   as every other Horizon request is. Default 1: that one request — the
@@ -147,6 +162,15 @@ answers GL and kl_glfb never initializes.
   luma. `KL_GLFB_DRAW_PROBE_N` overrides the quota (0 = unlimited),
   `KL_GLFB_DRAW_PROBE_MIN` lowers the vert floor (the frame's last draws are
   small, and one of them may be the one you're hunting).
+- The draw probe also prints, per probed draw, the state it ran with: vertex
+  count, program, viewport, scissor, colour mask, blend factors, depth
+  function/write/attachment, cull mode and the 2D/external textures on units
+  0–5. "Nothing lit" has a dozen causes that look alike from the framebuffer.
+- `KL_GLFB_X_NO_DEPTH=1`, `KL_GLFB_X_NO_CULL=1` — experiments, not fixes:
+  switch the depth test / face culling off before every draw. Separates "every
+  fragment was rejected" from the other reasons a scene leaves nothing behind.
+- `KL_GLFB_X_CLEAR_MAGENTA=1` — experiment: every `glClearColor` becomes opaque
+  magenta. Does nothing for a guest that clears with `glClearBuffer*` (UE4).
 - `KL_GLFB_DRAW_PROBE_SKIP=<n>` — skip the first `n` eligible draws before
   spending the quota. The other end of `_N`'s problem: a guest whose STARTUP
   renders and whose steady state does not can only be caught after the
@@ -221,6 +245,11 @@ answers GL and kl_glfb never initializes.
   an OpenXR guest never calls `eglSwapBuffers` at all — measured 0 across a 45 s
   streaming run — so this knob, and both frontend seams with it, were silently
   inert on the whole VR path.
+  It also runs in the app now, beside the compositor's GPU fence (it used to
+  be skipped whenever a fence was registered, which in the app is always).
+  On the HOST an OVRPlugin guest's frame loop only advances with this set —
+  without a capture, a sink or a fence nothing presents — so give it a
+  directory and a large `KL_GLFB_OUT_EVERY` even when no picture is wanted.
 - `KL_GLFB_OUT_EVERY=N` — throttle the PNG capture to every Nth swap (default
   1). Applies to the file path only; a registered frame sink gets every swap.
 - `KL_GLFB_DUMP_FBOS=1` — alongside each `KL_GLFB_OUT` capture, write one PNG
@@ -337,6 +366,12 @@ answers GL and kl_glfb never initializes.
   a truncated sweep says how many addresses it dropped — a sweep that quietly
   covers half a /22 finds the machines at the bottom of the range and not the
   ones above them).
+- `KL_NET_DGRAM_NOSIGPIPE=0` — stop setting `SO_NOSIGPIPE` on the guest's
+  non-stream (datagram/raw) sockets. Default ON: Linux never raises SIGPIPE for
+  a datagram send, Darwin does on EPIPE, and the guest's SIGPIPE handler
+  (Unity's crash reporter) runs on a Darwin ucontext and faults. Beat Saber
+  1.40's Unity Ping hit exactly that at boot ("Ping: Error sending ICMP packet:
+  Broken pipe", then signal 13, then a fault at 0x0 in libunity).
 - `KL_GUEST_JIT=1` — allow the guest to map anonymous `PROT_EXEC` memory.
   Default REFUSED, loudly: AMFI will not execute an unsigned page, so a mapping
   that succeeds is a SIGKILL on the first branch into it, with no signal and no

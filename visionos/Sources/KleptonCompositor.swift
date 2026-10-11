@@ -1861,7 +1861,11 @@ final class KleptonCompositor {
         // and its buffers complete, so the wait is always encoded as before.
         cmdLock.lock(); let doneNow = cmdCompleted; cmdLock.unlock()
         let outstanding = cmdCommitted - doneNow
-        let haveGuestContent = projLayerCount > 0
+        // ...or eyes that are copied into place and fenced per frame
+        // (kl_glfb_frame_fence): there the fence value advances with every
+        // submitted frame and is always one ANGLE has already been handed, so
+        // waiting on it cannot be a wait on a guest that has gone quiet.
+        let haveGuestContent = projLayerCount > 0 || kl_glfb_frame_fenced() != 0
         if let ev = guestFrameEvent, glFence != 0, !noFence,
            haveGuestContent, outstanding <= maxFenceBacklog {
             cmd.encodeWaitForEvent(ev, value: glFence)

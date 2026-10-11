@@ -1174,11 +1174,75 @@ static int klplat_scan_delivered(void) {
     return g_ncourses;
 }
 
+// KL_PLAT_OBB_ASSETS — the title's own content files as its asset files.
+//
+// Some titles ship their content as the store's "asset files" beside the OBB —
+// Tales from the Galaxy's Edge: Season1Taco-…pak and two sound-bank paks, each
+// a required download with a store asset id of its own. The engine mounts them
+// like any pak; the GAME, separately, asks ovr_AssetFile_GetList which of them
+// are installed before it starts its first level, and with an empty answer it
+// waits (a black room behind a full fade, with sound).
+//
+// So for such a title the list is what is in the OBB directory: every loose
+// container file there, as installed. They are there because the store's own
+// tool delivered them to this account, which is the rule the index above
+// rests on too — a file the account is not entitled to is not delivered, and
+// a file that is not there is not listed (this title's paid second part).
+// The id is the store's where the index names one for the file; without, it
+// is a number made from the file name, which the title only hands back to
+// requests that are refused here anyway (download, delete).
+// Default on for x3484270071659289 alone; the switch overrides.
+static int klplat_obb_assets_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_PLAT_OBB_ASSETS", t && strcmp(t, "x3484270071659289") == 0);
+    }
+    return on;
+}
+
+static int klplat_scan_obb_assets(void) {
+    if (!klplat_obb_assets_on()) return g_ncourses;
+    const char *dir = kl_jni_obb_dir();
+    DIR *d = dir && dir[0] ? opendir(dir) : NULL;
+    if (!d) return g_ncourses;
+    int added = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && g_ncourses < KLPLAT_COURSE_MAX) {
+        const char *dot = strrchr(e->d_name, '.');
+        if (!dot || (strcmp(dot, ".pak") && strcmp(dot, ".utoc") && strcmp(dot, ".ucas"))) continue;
+        int have = 0;
+        for (int i = 0; i < g_ncourses; i++)
+            if (strcmp(g_courses[i].prefix, e->d_name) == 0) { have = 1; break; }
+        if (have) continue;                       // the index named it, with the store's id
+        klplat_course *c = &g_courses[g_ncourses];
+        if (strlen(e->d_name) >= sizeof c->prefix) continue;
+        int pw = snprintf(c->path, sizeof c->path, "%s/%s", dir, e->d_name);
+        if (pw < 0 || (size_t)pw >= sizeof c->path) continue;
+        struct stat st;
+        if (stat(c->path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) continue;
+        snprintf(c->prefix, sizeof c->prefix, "%s", e->d_name);
+        c->id = klplat_fnv(e->d_name) >> 12;      // fits the 53 bits a script-side number keeps
+        if (!c->id) c->id = 1;
+        c->iap_row = -1;
+        c->delivered = 1;
+        g_ncourses++;
+        added++;
+    }
+    closedir(d);
+    static int said = -1;
+    if (said != added) {
+        said = added;
+        fprintf(stderr, "  [plat] content files in the OBB directory reported as installed asset files: %d\n", added);
+    }
+    return g_ncourses;
+}
+
 static void klplat_scan_courses(void) {
     g_ncourses = 0;
     g_npurchases = 0;
     g_nsuffix = 0;
-    if (!klplat_is_walkabout()) { klplat_scan_delivered(); return; }
+    if (!klplat_is_walkabout()) { klplat_scan_delivered(); klplat_scan_obb_assets(); return; }
     // What the store confirmed is reported as it is, whether or not this
     // course table knows the SKU or the course's files are here.
     klplat_load_entitlements();
@@ -1445,8 +1509,30 @@ static uint64_t klplat_AssetDetails_GetLanguage_any(const void *h) {
     return 0;
 }
 
+// KL_PLAT_IAP_EMPTY — answer the two add-on LISTS (products by SKU, the
+// viewer's purchases) with an empty one instead of refusing the request.
+// Refusing (request id 0) is right for a title that goes on without its
+// store, and wrong for one whose start is a chain that waits for each answer:
+// Tales from the Galaxy's Edge (x3484270071659289) asks for its products, then
+// its purchases, then its asset files, and only then loads its first level.
+// An empty list says "nothing is for sale here and nothing was bought" —
+// less than the truth, never more: its paid second part stays locked.
+// Default on for that title alone; the switch overrides in either direction.
+static int klplat_iap_empty(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_PLAT_IAP_EMPTY", t && strcmp(t, "x3484270071659289") == 0);
+    }
+    return on;
+}
+
 static uint64_t klplat_iap_purchases(const char *what, uint32_t type) {
-    if (!klplat_is_walkabout()) return 0;
+    if (!klplat_is_walkabout()) {
+        if (!klplat_iap_empty()) return 0;
+        g_npurchases = 0;
+        return klplat_request_kind(what, type, 0, KLPLAT_KIND_PURCHASES);
+    }
     klplat_scan_courses();
     return klplat_request_kind(what, type, g_npurchases, KLPLAT_KIND_PURCHASES);
 }
@@ -1464,7 +1550,15 @@ static uint64_t klplat_IAP_GetViewerPurchasesDurableCache(void) {
 
 static uint64_t klplat_IAP_GetProductsBySKU(const char **skus, int count) {
     plat_hit("ovr_IAP_GetProductsBySKU");
-    if (!klplat_is_walkabout()) return 0;
+    if (!klplat_is_walkabout()) {
+        if (!klplat_iap_empty()) return 0;
+        g_nproducts = 0;
+        fprintf(stderr, "  [plat] ovr_IAP_GetProductsBySKU(%d sku%s%s%s) -> an empty list (KL_PLAT_IAP_EMPTY)\n",
+                count, count == 1 ? "" : "s", skus && count > 0 && skus[0] ? ", first: " : "",
+                skus && count > 0 && skus[0] ? skus[0] : "");
+        return klplat_request_kind("ovr_IAP_GetProductsBySKU", KLPLAT_MSG_IAP_PRODUCTS,
+                                   0, KLPLAT_KIND_PRODUCTS);
+    }
     klplat_scan_courses();
     g_nproducts = 0;
     if (skus && count > 0) {
@@ -1680,9 +1774,17 @@ static int klplat_user_default(void) {
     // entitlement request, GetLoggedInUser fails with "Request failed." and the
     // game renders black frames with no draws, never loading its first scene
     // (fix 9, 2026-10-11; the game does not run yet for other reasons).
+    // Tales from the Galaxy's Edge (x3484270071659289, UE4) waits as well: with
+    // no user its OnlineSubsystem never comes up, the entitlement reply it asked
+    // for is never popped, and it draws its black start room behind a full fade
+    // for as long as it is left running (seen on a Mac host, 2026-10-11).
     static const char *on[] = { "zix", "intotheradius", "redmatter2", "vampire", "twd2",
                                 "walkabout", "moss", "x5812519008825194", "x6963344583787383",
-                                "x2897337400373711", "x3635172946605196" };
+                                "x2897337400373711", "x3635172946605196", "x3484270071659289",
+                                // Sniper Elite VR: with no user its Init scene
+                                // activates, the loading screen fades out, and it
+                                // stops submitting frames for good.
+                                "x2544573735586536" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
@@ -1732,6 +1834,10 @@ static int plat_is_user_field(const char *name) {
         "ovr_User_GetPresenceDeeplinkMessage", "ovr_User_GetPresenceDestinationApiName",
         "ovr_User_GetPresenceLobbySessionId", "ovr_User_GetPresenceMatchSessionId",
         "ovr_User_GetManagedInfo",
+        // Newer SDKs' User model also reads the invite token (Sniper Elite VR's
+        // does, right after the GetLoggedInUser completion). An offline user
+        // has none; NULL is the SDK's "absent", as for the fields above.
+        "ovr_User_GetInviteToken",
     };
     for (size_t i = 0; i < sizeof f / sizeof f[0]; i++)
         if (strcmp(name, f[i]) == 0) return 1;
@@ -2115,8 +2221,37 @@ static uint64_t klplat_launch_details(const char *name) {
     return (uint64_t)(uintptr_t)g_launch_cookie;
 }
 
+// The STRING fields, for a title that hands them on unchecked. The real
+// platform answers an absent launch string with "" rather than NULL, and the
+// SDK's StringFromNative turns NULL into a C# null; a title that copies one into
+// another platform call then dies in CAPI.StringToNative ("StringFromNative:
+// null argument"). Sniper Elite VR (x2544573735586536) does exactly that while
+// setting up rich presence on its Init scene, and the exception kills the boot
+// sequence: the loading screen fades out and nothing is loaded after it, so the
+// headset stays black. Per target, because NULL is what every other title here
+// was verified against and some test the field against null, not "".
+static int plat_launch_strings_empty(void) {
+    static const char *on[] = { "x2544573735586536" };
+    const char *t = kl_driver_target_name();
+    if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
+        if (strcmp(t, on[i]) == 0) return 1;
+    return 0;
+}
+static int plat_is_launch_string(const char *name) {
+    static const char *const f[] = {
+        "ovr_LaunchDetails_GetDeeplinkMessage", "ovr_LaunchDetails_GetDestinationApiName",
+        "ovr_LaunchDetails_GetLaunchSource",    "ovr_LaunchDetails_GetLobbySessionID",
+        "ovr_LaunchDetails_GetMatchSessionID",  "ovr_LaunchDetails_GetTrackingID",
+    };
+    for (size_t i = 0; i < sizeof f / sizeof f[0]; i++)
+        if (strcmp(name, f[i]) == 0) return 1;
+    return 0;
+}
+
 static uint64_t klplat_launch_field(const char *name) {
     plat_hit(name);
+    if (plat_is_launch_string(name) && plat_launch_strings_empty())
+        return (uint64_t)(uintptr_t)"";   // present but empty, as the platform says it
     return 0;                 // the zero enum, the zero int and NULL, all at once
 }
 
@@ -2247,6 +2382,45 @@ static uint64_t klplat_JNI_OnLoad(void *vm, void *reserved) {
     return 0x00010006;                 // JNI_VERSION_1_6
 }
 
+// ovrMessageType_ToString(type) — the SDK's name for a message type, which a
+// guest asks for when it LOGS a message it did not expect. Maestro does that
+// with the error completion its leaderboard request gets here, and the import
+// was unresolved: the first failed request ended the run ("called unresolved
+// import"), a minute into play. The names are the SDK's own for the types this
+// file completes; anything else gets the SDK's spelling of "no idea".
+static const char *klplat_MessageType_ToString(uint32_t type) {
+    plat_hit("ovrMessageType_ToString");
+    switch (type) {
+    case KLPLAT_MSG_PLATFORM_INIT:          return "ovrMessage_Platform_InitializeAndroidAsynchronous";
+    case KLPLAT_MSG_ENTITLEMENT:            return "ovrMessage_Entitlement_GetIsViewerEntitled";
+    case KLPLAT_MSG_ACCESS_TOKEN:           return "ovrMessage_User_GetAccessToken";
+    case KLPLAT_MSG_ACHIEVEMENT_DEFS:       return "ovrMessage_Achievements_GetAllDefinitions";
+    case KLPLAT_MSG_LOGGED_IN_USER:         return "ovrMessage_User_GetLoggedInUser";
+    case KLPLAT_MSG_LEADERBOARD_GET_ENTRIES: return "ovrMessage_Leaderboard_GetEntries";
+    case KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY: return "ovrMessage_Leaderboard_WriteEntry";
+    case KLPLAT_MSG_IAP_PURCHASES:          return "ovrMessage_IAP_GetViewerPurchases";
+    case KLPLAT_MSG_IAP_PRODUCTS:           return "ovrMessage_IAP_GetProductsBySKU";
+    default:                                return "ovrMessage_Unknown";
+    }
+}
+
+static const char *klplat_enum_to_string(uint32_t value) {
+    (void)value;
+    return "Unknown";
+}
+
+// ovrID_FromString(out, text) — a decimal id out of a string, true when it
+// parsed. Imported beside the one above and just as unresolved.
+static uint64_t klplat_ID_FromString(uint64_t *out, const char *text) {
+    plat_hit("ovrID_FromString");
+    if (!out || !text || !*text) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(text, &end, 10);
+    if (!end || *end) return 0;
+    *out = (uint64_t)v;
+    return 1;
+}
+
 static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"JNI_OnLoad",                (void *)klplat_JNI_OnLoad},
     {"ovr_IsPlatformInitialized", (void *)klplat_IsPlatformInitialized},
@@ -2318,6 +2492,8 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_User_GetUserProof",                  (void *)klplat_User_GetUserProof},
     {"ovr_Achievements_GetAllDefinitions",     (void *)klplat_Achievements_GetAllDefinitions},
     // Leaderboards: error completions (see the handlers).
+    {"ovrMessageType_ToString",                (void *)klplat_MessageType_ToString},
+    {"ovrID_FromString",                       (void *)klplat_ID_FromString},
     {"ovr_Leaderboard_GetEntries",             (void *)klplat_Leaderboard_GetEntries},
     {"ovr_Leaderboard_WriteEntry",             (void *)klplat_Leaderboard_WriteEntry},
     {"ovr_Message_GetAchievementDefinitionArray", (void *)klplat_Message_GetPayload},
@@ -2405,6 +2581,14 @@ void *kl_ovrplat_sym(const char *name) {
     }
     for (size_t i = 0; i < sizeof g_plat_impl / sizeof g_plat_impl[0]; i++)
         if (strcmp(g_plat_impl[i].name, name) == 0) return g_plat_impl[i].fn;
+    // The SDK's other enum-to-text helpers (ovr<Enum>_ToString): a name for a
+    // log line, nothing a guest branches on. One answer serves them all rather
+    // than each ending a run the first time something is logged.
+    {
+        size_t n = strlen(name);
+        if (n > 9 && strcmp(name + n - 9, "_ToString") == 0 && strncmp(name, "ovr_", 4) != 0)
+            return kl_named_stub(name, (void *)klplat_enum_to_string);
+    }
     if (plat_is_unity_hook(name))
         return kl_named_stub(name, (void *)klplat_void);
     if (plat_is_drop(name))

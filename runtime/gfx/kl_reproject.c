@@ -118,10 +118,28 @@ void kl_reproject_set_srgb_decode(int on) {
             klr_srgb_forced(&forced) ? " (overridden by KL_SRGB_DECODE)" : "");
 }
 
+// Per target, where the measurement above cannot see it. Sniper Elite VR
+// (x2544573735586536, Unity 2019.4 in Gamma color space) writes sRGB code values
+// into an RGBA16F eye texture with GL_FRAMEBUFFER_SRGB never touched, so the
+// sRGB-format test that turns the decode on for Steam Link does not fire, and the
+// composite showed its code values as linear: every scene under a flat white
+// veil, shadows lifted to grey. Confirmed on device with KL_SRGB_DECODE=1, which
+// the env still overrides either way.
+static int klr_srgb_target_default(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (!t) return 0;                      // not known yet: ask again later
+        v = strcmp(t, "x2544573735586536") == 0;
+    }
+    return v;
+}
+
 int kl_reproject_srgb_decode(void) {
     int forced;
     if (klr_srgb_forced(&forced)) return forced;
-    return g_srgb_decode;
+    return g_srgb_decode || klr_srgb_target_default();
 }
 
 // The shader. Compiled from source at runtime by whichever compositor is

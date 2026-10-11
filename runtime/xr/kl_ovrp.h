@@ -719,6 +719,8 @@ void kl_ovrp_eye_told_tangents(int eye, float tan[4]);
 // Vulkan path it follows KL_OVRP_MULTIVIEW, because MoltenVK implements
 // VK_KHR_multiview and kl_vulkan.c can allocate the two-layer image.
 int kl_ovrp_multiview(void);
+// Whether this target is served the Array eye layout on GL (see kl_ovrp.c).
+int kl_ovrp_gl_array(void);
 
 // ---------------------------------------------------------------------------
 // The eye view, for a guest that is not OVRPlugin's

@@ -34,11 +34,19 @@ void kl_glfb_make_current(void);
 // The release half: call from eglMakeCurrent when the guest makes no context
 // current. Migration mode frees the root context for the next thread.
 void kl_glfb_release_current(void);
+// Bind a share-group context on a thread that holds none (1 if done), and undo it.
+int  kl_glfb_borrow_context(void);
+void kl_glfb_return_context(void);
 
 // Read the eye framebuffer back and write <dir>/frame_NNN.png. Returns the number
 // of frames presented so far. When a frame sink is registered the buffer goes
 // there instead (dir may then be NULL) and no PNG is written.
 unsigned kl_glfb_present(const char *dir);
+// Put a decoded picture into one of the guest's own 2D textures, on the thread
+// that is current on its context. `pixels` is w*h BGRA8 or RGBA8 (`bgra`), top
+// row first. The guest's bindings and unpack state are left as they were.
+// 1 if the upload was issued, 0 if there is no GL to issue it with.
+int kl_glfb_upload_picture(uint32_t tex, int w, int h, const void *pixels, int bgra);
 
 // The frontend seam, frame out. Registering a sink turns the per-swap capture
 // into a handoff: instead of PNG-encoding to KL_GLFB_OUT, the readback buffer
@@ -79,6 +87,11 @@ int  kl_glfb_has_gpu_fence(void);
 // Read from the compositor thread; monotonically increasing, so an unchanged
 // value means "no new guest frame since you last looked".
 uint64_t kl_glfb_gpu_fence_value(void);
+// For a guest whose eyes reach the compositor by copy and that never swaps:
+// publish a fence after the frame's copies (kl_glfb.c). kl_glfb_frame_fenced()
+// says whether one ever was, i.e. whether the fence value follows the frames.
+void kl_glfb_frame_fence(void);
+int  kl_glfb_frame_fenced(void);
 
 // Print the internalformats the guest allocated immutable texture storage with.
 // KL_GLFB_SKIP bisected the AGX abort to glTexStorage* + glTexSubImage*, which

@@ -1819,6 +1819,7 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
     {   // The Horizon Platform reply object: kl_jni_net.c owns its shape.
         klj_val hz;
         if (klj_horizon_message_field(obj, w->cls, w->name, w->sig, &hz)) return hz;
+        if (klj_ue4_media_track_field(obj, w->cls, w->name, w->sig, &hz)) return hz;
     }
     KLJ_LOG("no host value for field %s.%s %s", w->cls, w->name, w->sig);
     if (!g_permissive) {

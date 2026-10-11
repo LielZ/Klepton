@@ -2024,6 +2024,18 @@ const klj_binding klj_bind_services[] = {
     // it), so the ctor is a no-op and setExtra returns the builder for chaining.
     {"com/oculus/os/AnalyticsEvent", "<init>", "(Ljava/lang/String;)V", klj_void_noop},
     {"com/oculus/os/AnalyticsEvent", "setExtra", "(Ljava/lang/String;Ljava/lang/Object;)Lcom/oculus/os/AnalyticsEvent;", klj_AlertBuilder_self},
+    // Meta's app-metrics service. Sniper Elite VR binds its activity to it
+    // (static, through ReflectionHelper, so the signature is spelled with dots as
+    // OculusDeviceConfig's is) when a new game starts. There is no metrics
+    // service here, and binding to nothing is the honest no-op: the call returns
+    // void and the game carries on. Unimplemented, it stopped the run.
+    {"com/oculus/metrics/MetricsService", "bind", "(Lcom.unity3d.player.UnityPlayerActivity;)V", klj_void_noop},
+    // ...and the rest of that helper, which the same game calls as play begins.
+    // The boolean ones answer false ("nothing was recorded"), which is the truth
+    // with no service to record into.
+    {"com/oculus/metrics/MetricsService", "shutdown", "(Lcom.unity3d.player.UnityPlayerActivity;)V", klj_void_noop},
+    {"com/oculus/metrics/MetricsService", "appendCsvDebugString", "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z", klj_void_noop},
+    {"com/oculus/metrics/MetricsService", "setOverlayDebugString", "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z", klj_void_noop},
     {"android/os/Vibrator", "hasVibrator", "()Z", klj_Vibrator_hasVibrator},
     {"android/content/pm/PackageManager", "getInstallerPackageName", "(Ljava/lang/String;)Ljava/lang/String;", klj_PackageManager_getInstallerPackageName},
     {"android/content/res/Resources", "getSystem", "()Landroid/content/res/Resources;", klj_Resources_getSystem},
