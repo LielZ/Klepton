@@ -290,6 +290,52 @@ static klj_val klj_AudioManager_setStreamVolume(void *env, void *self, const klj
     return (klj_val){.j = 0};
 }
 
+// ---- audio focus (API 26+): AudioAttributes / AudioFocusRequest builders ----
+//
+// Newer Unity players ask for audio focus at startup the API-26 way:
+//   new AudioAttributes.Builder().setUsage(USAGE_GAME).setContentType(..).build()
+//   new AudioFocusRequest.Builder(AUDIOFOCUS_GAIN).setAudioAttributes(attrs)
+//       .setAcceptsDelayedFocusGain(..).setOnAudioFocusChangeListener(..).build()
+//   AudioManager.requestAudioFocus(request) == AUDIOFOCUS_REQUEST_GRANTED ?
+// Virtual Virtual Reality (1.8.48) is the first guest here to do it, and each
+// of those calls was a work item that ended the run right after the splash.
+// Nothing on the host competes for an Android audio stream, so focus is simply
+// granted; the builders only have to hand back objects of the right classes,
+// because nothing ever looks inside them. The listener is never called: focus
+// is never lost here.
+static klj_val klj_builder_self(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = self};
+}
+
+static klj_val klj_AudioAttributes_Builder_build(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object("android/media/AudioAttributes")};
+}
+
+// A constructor binding is called with the jclass and returns the new object.
+static klj_val klj_AudioFocusRequest_Builder_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    KLJ_LOG("AudioFocusRequest.Builder(focusGain %lld)", n > 0 ? (long long)(int32_t)a[0].j : -1);
+    return (klj_val){.l = kl_jni_new_object("android/media/AudioFocusRequest$Builder")};
+}
+
+static klj_val klj_AudioFocusRequest_Builder_build(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object("android/media/AudioFocusRequest")};
+}
+
+static klj_val klj_AudioManager_requestAudioFocus(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AudioManager.requestAudioFocus(request) -> AUDIOFOCUS_REQUEST_GRANTED");
+    return (klj_val){.j = 1};   // AUDIOFOCUS_REQUEST_GRANTED
+}
+
+static klj_val klj_AudioManager_abandonAudioFocusRequest(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};   // AUDIOFOCUS_REQUEST_GRANTED
+}
+
 static klj_val klj_UnityPlayer_getLaunchURL(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     // null, and that is the answer rather than a placeholder: the app was not
@@ -819,6 +865,20 @@ const klj_binding klj_bind_window[] = {
     {"android/media/AudioManager", "getStreamMinVolume", "(I)I", klj_AudioManager_getStreamMinVolume},
     {"android/media/AudioManager", "getStreamMaxVolume", "(I)I", klj_AudioManager_getStreamMaxVolume},
     {"android/media/AudioManager", "setStreamVolume", "(III)V", klj_AudioManager_setStreamVolume},
+    // Audio focus, the API-26 builder form (see klj_AudioManager_requestAudioFocus).
+    {"android/media/AudioAttributes$Builder", "setUsage", "(I)Landroid/media/AudioAttributes$Builder;", klj_builder_self},
+    {"android/media/AudioAttributes$Builder", "setContentType", "(I)Landroid/media/AudioAttributes$Builder;", klj_builder_self},
+    {"android/media/AudioAttributes$Builder", "build", "()Landroid/media/AudioAttributes;", klj_AudioAttributes_Builder_build},
+    {"android/media/AudioFocusRequest$Builder", "<init>", "(I)V", klj_AudioFocusRequest_Builder_init},
+    {"android/media/AudioFocusRequest$Builder", "setAudioAttributes",
+     "(Landroid/media/AudioAttributes;)Landroid/media/AudioFocusRequest$Builder;", klj_builder_self},
+    {"android/media/AudioFocusRequest$Builder", "setAcceptsDelayedFocusGain",
+     "(Z)Landroid/media/AudioFocusRequest$Builder;", klj_builder_self},
+    {"android/media/AudioFocusRequest$Builder", "setOnAudioFocusChangeListener",
+     "(Landroid/media/AudioManager$OnAudioFocusChangeListener;)Landroid/media/AudioFocusRequest$Builder;", klj_builder_self},
+    {"android/media/AudioFocusRequest$Builder", "build", "()Landroid/media/AudioFocusRequest;", klj_AudioFocusRequest_Builder_build},
+    {"android/media/AudioManager", "requestAudioFocus", "(Landroid/media/AudioFocusRequest;)I", klj_AudioManager_requestAudioFocus},
+    {"android/media/AudioManager", "abandonAudioFocusRequest", "(Landroid/media/AudioFocusRequest;)I", klj_AudioManager_abandonAudioFocusRequest},
     {"com/unity3d/player/UnityPlayer", "getLaunchURL", "()Ljava/lang/String;", klj_UnityPlayer_getLaunchURL},
     {"android/media/AudioManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", klj_AudioManager_getProperty},
     {"android/media/AudioManager", "isBluetoothA2dpOn", "()Z", klj_AudioManager_isBluetoothA2dpOn},

@@ -37,9 +37,16 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   `kl_egl.c`, `kl_ovrp.c`, `kl_ovrplat.c`. Scouting only — the guest carries
   on with answers we invented. Does not apply to the DRM entitlement guard.
 - `KL_JNI_DROP_ANALYTICS=0` — (`runtime/kl_jni.c`) restore the abort for
-  unimplemented calls into third-party analytics SDKs (`com/gameanalytics/…`).
+  unimplemented calls into third-party analytics SDKs (`com/gameanalytics/…`, `com/amplitude/…`).
   Default 1: such calls are dropped and answer zero/NULL/void, since there is
   no host to report to. Max Mustard aborted on `GameAnalytics.addErrorEvent`.
+- `KL_HZ_ENTITLEMENT=0` — (`runtime/jni/kl_jni_net.c`) leave the Horizon
+  Platform request `entitlements` / `get_is_viewer_entitled` without a reply,
+  as every other Horizon request is. Default 1: that one request — the
+  application's own licence check, the Horizon-SDK form of
+  `ovr_Entitlement_GetIsViewerEntitled` in `kl_ovrplat.c` — is answered with
+  success. Add-on, purchase and every other ownership request never is.
+  HARD BULLET waited for it behind a black picture.
 - `KL_DYLIB_DIR=<dir>` — (`runtime/kl_image.c`) prefer `<dir>/<name>.dylib`
   (klepton-ld output) over the ELF when loading each guest library — how
   `make bootdylib*` runs the translated images. Unset, the runtime ELF loader
@@ -281,6 +288,31 @@ answers GL and kl_glfb never initializes.
   same-format staging texture and then blitted to the guest's destination.
   Keep Talking and Nobody Explodes resolves RGBA8 into its SRGB8_ALPHA8 eye
   texture and showed solid pink without it.
+- `KL_GLFB_SHARED_MIGRATE=0|1` — a guest that moves its one GL context from
+  one thread to another (the old render thread releases it, the new one makes
+  it current) gets the SAME context on the new thread, with its framebuffers
+  and vertex arrays, instead of a fresh one. Unreal does this; the parked
+  context is handed to the next thread that asks, which is only right while
+  the guest has one context. Default 1 for `x2897337400373711` (The Walking
+  Dead: Saints & Sinners) and `x3484270071659289` (Tales from the Galaxy's
+  Edge), else 0.
+- `KL_GLFB_COPYIMAGE_EMU=0|1` — emulate `glCopyImageSubData`, which ANGLE on
+  Metal has under no name: compressed 2D uploads are kept on the CPU per
+  texture and level and a copy re-uploads from there; uncompressed copies go
+  through a read framebuffer. Costs memory equal to the compressed textures
+  resident. Default 1 for the same two titles (Unreal's texture streaming
+  needs it), else 0; the call itself always goes through a thunk that reads
+  its stack arguments the way the guest pushed them.
+- `KL_GLFB_ES32_ALIAS=0|1` — the ES 3.2 core names of the indexed blend and
+  enable calls (`glEnablei`, `glBlendFuncSeparatei`, `glColorMaski`, …) are
+  answered with ANGLE's OES/EXT functions; under their core names ANGLE's
+  ES 3.0 context refuses them. Default 1 for Unreal guests, else 0.
+- `KL_GLFB_ZERO_STRIDE=0|1` — a `glBindVertexBuffer` binding with stride 0 is
+  one element for every vertex, as ES 3.1 says, not a tightly packed array.
+  Default 1.
+- `KL_GLFB_EYE_CLEAR=0|1` — a provider-backed eye texture is cleared to opaque
+  black once when it is bound, so a first frame cannot show what the memory
+  held. Default 1 for Unreal guests, else 0.
 - `KL_GLFB_LOG_UNITS=1` — log texture-unit traffic (the "Invalid texture
   unit!" neighbourhood — see `KL_POKE_CAP` under Viewer).
 
@@ -513,6 +545,15 @@ The guest's own memory management, and the three seams that used to disable it.
   (or another spelling of external storage) as the absolute one, as it is on a
   device where the app's working directory is `/`. AC Nexus opens its animator
   controller bundle that way. Default 1 for `x5812519008825194`, else 0.
+- `KL_FS_JAR_FILE=0|1` — a path of the form `jar:file:///…` with no `!/`
+  entry part is read as the plain path it wraps; Unity's Android file layer
+  strips that scheme itself. Default 1 for `x3635172946605196` (BRINK
+  Traveler: every Addressables bundle location is written that way), else 0.
+- `KL_ELF_TLSDESC=0|1` — the loader serves `R_AARCH64_TLSDESC` relocations
+  (ELF thread-local storage, dynamic model) for a library's own TLS: a block
+  per thread and module, made at first use. Off, such a library does not
+  load, as before. Default 1 for `x3635172946605196`, else 0 — a title that
+  works may ship an optional library it has been running without.
 - `KL_MADV_DONTNEED=remap|reusable|zero|passthrough` — how a guest
   `madvise(MADV_DONTNEED)` is served. Default `remap`. **`MADV_DONTNEED` is 4 on
   Linux and Darwin and means different things**: Linux frees the pages, Darwin
@@ -1032,6 +1073,13 @@ puts the camera on the ground with its hands underneath it.
   left: with the sequence, `BeginFrame4` once then `DestroyLayer` reads as a
   teardown; without it, as a call count of 1. A print and nothing else — no
   register capture, no reads of guest memory.
+- `KL_OVRP_EYELESS_FRAMES=0|1` — an `ovrp_EndFrame4` submit list with no eye
+  layer turns the compositor's eye pass off until one is submitted again, so
+  such a frame shows its quads over black as on a Quest. Otherwise the eye
+  textures' last contents stay on screen; Skydance's BEHEMOTH submits quads
+  alone on its splash and level-loading screens, and what showed behind them
+  was undrawn eye storage, a magenta flicker. Default 1 for
+  `x5767635983306831`, else 0.
 - `KL_OVRP_LAYERS=1` — census the whole `ovrp_EndFrame4` submit list: one line
   per distinct `(layer, shape, stage, viewport, pose, flags)`, printed when it
   first appears and when it changes, plus the union's per-shape tail. Every
@@ -1087,6 +1135,22 @@ puts the camera on the ground with its hands underneath it.
   again with those locations reading zeroes from a buffer of the layer's own.
   Pipelines that compile are untouched. Default 1 for `x24882487241367228`
   (Alien: Rogue Incursion), else 0.
+- `KL_VK_SUBPASS_MS_SAMPLE=0|1` — a fragment shader that reads a
+  MULTISAMPLED subpass input (OpTypeImage Dim=SubpassData MS=1) with a bare
+  subpassLoad — an OpImageRead with no Sample operand, which the spec forbids
+  and Quest's driver tolerates — is given `Sample 0`. Without it SPIRV-Cross
+  emits `texture2d_ms_array::read(coord, layer)` and Metal refuses to compile
+  the pipeline. Default 1 for every Unreal guest, else 0 (seen with Pinball FX
+  VR: its UE depth-fetch attachment; every such PSO failed and UE called
+  ForceQuit about twenty times a run).
+- `KL_VK_NO_TRANSIENT=0|1` — create `TRANSIENT_ATTACHMENT` images as ordinary
+  ones, so MoltenVK never backs them with memoryless (tile-only) storage. A
+  memoryless attachment does not survive MoltenVK ending one Metal pass and
+  opening another inside a Vulkan pass (see `KL_VK_PASS_BARRIERS`); the pass
+  after the seam reads undefined tile memory, which shows as a picture drawn in
+  32x32 tiles, each all there or all missing. Costs the memory of the
+  multisampled scene targets. Default 1 for `x5767635983306831` (Skydance's
+  BEHEMOTH), else 0.
 - `KL_VK_PASS_BARRIERS=0|1|2` — what happens to a `vkCmdPipelineBarrier`
   recorded INSIDE a dynamic-rendering pass that only makes colour attachments
   readable as input attachments. MoltenVK answers one by ending the Metal pass
@@ -1254,7 +1318,22 @@ puts the camera on the ground with its hands underneath it.
   counted from the picture's top (the rect is moved to the texture's last rows
   before the compositors see it), which is where Unreal on Vulkan puts a
   viewport shorter than the texture. Makes no difference to a full-height rect.
-  Default 1 for `x24882487241367228`, else 0.
+  Default 1 for an Unreal guest on Vulkan under a store-built target
+  (`x<app id>`; seen with Alien: Rogue Incursion and Witchblood), else 0.
+- `KL_OVRP_SWAP_PER_FRAME=0|1` — whether EndFrame presents for a guest is
+  decided by "did it swap since the last EndFrame" instead of "has it ever
+  swapped". Saints & Sinners swaps for its pre-VR splash and never again,
+  which froze the GPU fence for the session (a ghost beside every object
+  while the head turns). Default 1 for Unreal guests, else 0.
+- `KL_OVRP_EYELEVEL_DEFAULT=0|1` — a guest that has not named a tracking
+  origin is taken as EyeLevel from the first head pose. Default 1 for
+  `x2897337400373711` (its title appeared at the player's feet), else 0.
+- `KL_OVRP_HEADLOCK_BIT0=0|1` — in the layer list EndFrame is handed, bit 0 of
+  a layer's flags means head-locked (beside 0x2, which is where the flag is
+  for `ovrp_EnqueueSubmitLayer`). Found independently for The Walking Dead:
+  Saints & Sinners (its fade and HUD sank to the floor) and Skydance's
+  BEHEMOTH (its transition fade darkened the lower half of the view). Default
+  1 for Unreal guests under a store-built target, else 0.
 - `KL_OVRP_TEXPTR_INDIRECT=0|1` — on a Vulkan guest, `ovrp_GetLayerTexturePtr`
   hands back a pointer to the layer's `VkImage` rather than the `VkImage`
   itself, which is what Unity's `Texture2D.CreateExternalTexture` reads a

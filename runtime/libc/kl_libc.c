@@ -1449,6 +1449,24 @@ static int kl_fs_rel_sdcard(void) {
     return v;
 }
 
+// KL_FS_JAR_FILE: read "jar:file:///sdcard/…" — a file URL with no "!/" entry
+// part — as the plain path it wraps. Unity's Android file layer strips that
+// scheme itself, so on a device the URL and the path are one file; here the URL
+// reaches stat() verbatim and names nothing. BRINK Traveler's Addressables build
+// every content-bundle location this way ("jar:file:///sdcard/Android/obb/…/
+// <hash>.bundle"), so it never opens one and waits on a black screen. A URL WITH
+// "!/" names an entry inside an archive and is left alone. Tied to the one target
+// it was measured on, like KL_FS_REL_SDCARD above.
+static int kl_fs_jar_file(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_FS_JAR_FILE", t && strcmp(t, "x3635172946605196") == 0);
+    }
+    return v;
+}
+
 static const char *kl_guest_path_inner(const char *path, char *buf, size_t cap) {
     if (!path) return path;
     // Windows-heritage guests (reVC / GTA Vice City) build paths with '\'
@@ -1495,6 +1513,14 @@ static const char *kl_guest_path_inner(const char *path, char *buf, size_t cap) 
     // picked "portal2" and force-loaded the Portal 2 map sp_a1_intro2, which is
     // absent from Portal 1 data -> black. There is no portal2 content; letting the
     // probe fail makes the launcher honor SOURCE_GAME=portal and load Portal 1.
+
+    // A file URL with no archive entry is the file it names (KL_FS_JAR_FILE).
+    if (strncmp(path, "jar:file:///", 12) == 0 && !strstr(path, "!/") && kl_fs_jar_file()) {
+        char plain[1024];
+        snprintf(plain, sizeof plain, "%s", path + 11);   // keep the path's leading '/'
+        snprintf(tmp, sizeof tmp, "%s", plain);
+        path = tmp;
+    }
     if (path[0] != '/' && g_ext_target[0] && kl_fs_rel_sdcard()) {
         for (size_t i = 0; i < sizeof g_ext_prefix / sizeof *g_ext_prefix; i++) {
             size_t n = strlen(g_ext_prefix[i]) - 1;          // without its leading '/'
@@ -2226,6 +2252,12 @@ static void klb_exit_report(const char *which, int status) {
 }
 void klb_exit(int status)  { klb_exit_report("exit", status);  exit(status); }
 void klb__exit(int status) { klb_exit_report("_exit", status); _exit(status); }
+// creat(path, mode) is open(path, O_CREAT|O_WRONLY|O_TRUNC, mode), through the
+// same path door as open. CSVR 1.0.5's server library imports it.
+int klb_creat(const char *path, unsigned mode) {
+    char kp[1024];
+    return open(kl_guest_path(path, kp, sizeof kp), O_CREAT | O_WRONLY | O_TRUNC, (mode_t)mode);
+}
 
 // ---------- misc ----------
 int    klb_FD_ISSET_chk(int fd, void *set) { return FD_ISSET(fd, (fd_set *)set); }

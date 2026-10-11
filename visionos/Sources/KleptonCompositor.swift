@@ -85,7 +85,9 @@ struct KleptonStageConfiguration: CompositorLayerConfiguration {
     /// The render quality to ask for, 0..1. Also read by the render loop, which
     /// has to set the *running* quality separately.
     static var requestedQuality: Float {
-        let e = ProcessInfo.processInfo.environment["KL_CP_QUALITY"]
+        // getenv, not ProcessInfo's dictionary: a game's own settings name it
+        // at the start of a boot (KleptonAlyx.swift), after the process began.
+        let e = getenv("KL_CP_QUALITY").map { String(cString: $0) }
         let v = e.flatMap { Float($0) } ?? 1.0
         return min(max(v, 0.0), 1.0)
     }
@@ -2925,8 +2927,11 @@ final class KleptonCompositor {
         var st = kl_interstitial()
         _ = kl_interstitial_get(&st)
         // Only while the guest shows no picture of its own: the card is what
-        // there is to look at instead, not something to lay over a level.
-        guard st.phase != 0, kl_ovrp_eye_layer_live() == 0 else {
+        // there is to look at instead, not something to lay over a level. The
+        // exception is the line that asks for the trigger: the game may draw
+        // again while it still waits — a faded-out picture — and the card is
+        // then the only thing that says what it waits for.
+        guard st.phase != 0, kl_ovrp_eye_layer_live() == 0 || st.message.0 != 0 else {
             cardWorldFromQuad = nil
             return 0
         }
@@ -3690,6 +3695,18 @@ final class KleptonCompositor {
         guard w > 0, h > 0 else {
             NSLog("[cp] no drawable size to push — the guest keeps its default eye size")
             return
+        }
+        // KL_CP_EYE_AT_FULL=1: the guest is offered the display's size at FULL
+        // render quality whatever quality the compositor runs at. The size
+        // above shrinks with the quality, and a guest that is offered less
+        // draws less — which is not what a lower compositor quality is asked
+        // for by a game whose picture size is chosen separately (Alyx: the
+        // offer is capped at a width below the display's anyway).
+        let q = KleptonStageConfiguration.requestedQuality
+        if q > 0.05, q < 1, klEnvOn("KL_CP_EYE_AT_FULL", default: false) {
+            NSLog("[cp] eye size offered as at full quality: \(w)x\(h) at quality \(q) -> "
+                  + "\(Int(Float(w) / q))x\(Int(Float(h) / q))")
+            w = Int(Float(w) / q); h = Int(Float(h) / q)
         }
         // The per-view viewport, logged rather than used. In a layered drawable
         // each view is a whole slice and the viewport is the full texture, so it

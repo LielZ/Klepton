@@ -410,14 +410,44 @@ void kl_jni_report(FILE *out) {
 // ---------------------------------------------------------------- JNIEnv impl
 // Implemented here are only the operations whose correct answer is forced, not
 // guessed. Reference management is the identity function because we have no GC
-// and a jobject is already a raw pointer; exception state is always "clear"
-// because nothing in this runtime can throw. Anything that would require us to
-// invent Java semantics stays an abort stub.
+// and a jobject is already a raw pointer. Exception state is one pending
+// Throwable per thread (klj_raise, Throw, ThrowNew, below): clear unless the
+// host raised one where Java would have — a ZipFile that is not there, a class
+// an APK does not ship — or the guest threw one itself. Anything that would
+// require us to invent Java semantics stays an abort stub.
 
 static void *klj_GetVersion(void *env) { (void)env; return (void *)(uintptr_t)KL_JNI_VERSION_1_6; }
 
+// Classes the APK does NOT ship, for a guest that probes for them. FindClass
+// here interns any name (see the Sentry note in kl_jni_services.c), which is
+// right for the Android framework and wrong for an application's OPTIONAL
+// dependency, where absence is the answer. Pistol Whip's Quest build carries
+// the PICO SDK's C# side but not its Java side (classes.dex has no
+// com/psmart/...): on a Quest `new AndroidJavaClass("com.psmart.aosoperation.
+// SysActivity")` throws and the game takes the Oculus path. Answered with a
+// class, it decides it is on a PICO, loads PxrPlatform (not in the APK),
+// throws DllNotFoundException and never starts the Oculus XR display —
+// frames run, every one black. Per target, like the ZipFile throw.
+int klj_class_absent(const char *name) {
+    // Not a guess for every guest: whether a class exists is a property of the
+    // APK, and the rule that would say it for all of them is the APK's own
+    // class list (classes*.dex), which nothing here reads yet.
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        if (!t) return 0;                                  // asked before the target is known: not settled yet
+        on = strcmp(t, "x2104963472963790") == 0;          // Pistol Whip
+    }
+    return on && name && strncmp(name, "com/psmart/", 11) == 0;
+}
+
 static void *klj_FindClass(void *env, const char *name) {
     (void)env;
+    if (klj_class_absent(name)) {
+        // JNI's FindClass returns NULL with NoClassDefFoundError pending.
+        klj_raise("java/lang/NoClassDefFoundError", name);
+        return NULL;
+    }
     pthread_mutex_lock(&g_lock);
     void *c = klj_intern_class_locked(name)->as_object;
     pthread_mutex_unlock(&g_lock);
@@ -490,10 +520,76 @@ void *kl_jni_class(const char *name) { return klj_FindClass(NULL, name); }
     return c;
 }
 
-static void *klj_ExceptionOccurred(void *env) { (void)env; return NULL; }
-static void  klj_ExceptionDescribe(void *env) { (void)env; }
-static void  klj_ExceptionClear(void *env)    { (void)env; }
- kl_jint klj_ExceptionCheck(void *env)  { (void)env; return 0; }
+// Pending Java exceptions, per thread as in a real VM. Almost nothing raises
+// one: a missing answer here has always been a NULL return, and that stays the
+// rule. klj_raise() is for the few calls whose THROW is the answer the guest
+// reads — Unity's OBB GUID check learns that patch.<code>.<package>.obb is
+// absent only from `new ZipFile()` throwing FileNotFoundException; with no
+// exception it takes the "patch exists" branch, reads its GUID as '' over the
+// main OBB's good one, and stops on "Application OBB has mismatching GUID".
+// With nothing raised these four are exactly the old constants.
+static __thread klj_object *t_pending_exc;
+
+void klj_raise(const char *cls, const char *msg) {
+    // The message rides in the object, for Throwable.getMessage/toString: the
+    // guest logs what it caught (Unity calls toString on it straight away).
+    void *o = klj_own(klj_new_object_data(cls, strdup(msg ? msg : "")), free);
+    pthread_mutex_lock(&g_lock);
+    klj_object *e = klj_as_object(o);
+    if (e) e->pinned++;                 // lives until ExceptionClear, not a frame pop
+    klj_object *old = t_pending_exc;
+    t_pending_exc = e;
+    if (old && old->pinned) old->pinned--;
+    pthread_mutex_unlock(&g_lock);
+    KLJ_LOG("throw %s: %s", cls, msg ? msg : "");
+}
+
+// The guest's own throws. Unity catches what klj_raise() threw, logs it, and
+// hands it on with Throw — for its caller to catch — so these set the same
+// per-thread state. Both return 0 (JNI_OK).
+static void klj_set_pending(klj_object *e) {
+    pthread_mutex_lock(&g_lock);
+    if (e) e->pinned++;
+    klj_object *old = t_pending_exc;
+    t_pending_exc = e;
+    if (old && old->pinned) old->pinned--;
+    pthread_mutex_unlock(&g_lock);
+}
+static kl_jint klj_Throw(void *env, void *obj) {
+    (void)env;
+    klj_object *e = klj_as_object(obj);
+    if (!e) return -1;
+    KLJ_LOG("Throw %s (from the guest)", e->cls);
+    klj_set_pending(e);
+    return 0;
+}
+static kl_jint klj_ThrowNew(void *env, void *clazz, const char *msg) {
+    (void)env;
+    const char *cls = klj_class_name(clazz);
+    klj_object *e = klj_as_object(klj_own(klj_new_object_data(cls, strdup(msg ? msg : "")), free));
+    if (!e) return -1;
+    KLJ_LOG("ThrowNew %s: %s (from the guest)", cls, msg ? msg : "");
+    klj_set_pending(e);
+    return 0;
+}
+
+static void *klj_ExceptionOccurred(void *env) { (void)env; return t_pending_exc; }
+static void  klj_ExceptionClear(void *env) {
+    (void)env;
+    klj_object *e = t_pending_exc;
+    if (!e) return;
+    t_pending_exc = NULL;
+    pthread_mutex_lock(&g_lock);
+    if (e->pinned) e->pinned--;
+    pthread_mutex_unlock(&g_lock);
+    KLJ_LOG("exception %s cleared by the guest", e->cls);
+}
+// Java's ExceptionDescribe prints and clears.
+static void  klj_ExceptionDescribe(void *env) {
+    if (t_pending_exc) KLJ_LOG("ExceptionDescribe: %s", t_pending_exc->cls);
+    klj_ExceptionClear(env);
+}
+ kl_jint klj_ExceptionCheck(void *env)  { (void)env; return t_pending_exc != NULL; }
 
 static __attribute__((noreturn)) void klj_FatalError(void *env, const char *msg) {
     (void)env;
@@ -631,18 +727,39 @@ static const struct { const char *cls, *super; } g_supers[] = {
     // objects actually are — which is also what makes IsInstanceOf answer
     // correctly for a guest that checks.
     {"java/security/cert/X509Certificate",     "java/security/cert/Certificate"},
+    // What klj_raise() throws, so a guest that catches the base class (or asks
+    // IsInstanceOf IOException) recognises it.
+    {"java/io/FileNotFoundException",          "java/io/IOException"},
+    {"java/lang/NoClassDefFoundError",         "java/lang/LinkageError"},
+    {"java/lang/ClassNotFoundException",       "java/lang/ReflectiveOperationException"},
+    {"java/lang/ReflectiveOperationException", "java/lang/Exception"},
+    {"java/lang/LinkageError",                 "java/lang/Error"},
+    {"java/lang/Error",                        "java/lang/Throwable"},
+    {"java/util/zip/ZipException",             "java/io/IOException"},
+    {"java/io/IOException",                    "java/lang/Exception"},
+    // ...and what a guest throws of its own accord (ThrowNew), or catches by
+    // the base class: without these a RuntimeException was no Throwable here,
+    // its message was lost, and a catch of java.lang.Exception passed it by.
+    {"java/lang/IllegalStateException",        "java/lang/RuntimeException"},
+    {"java/lang/IllegalArgumentException",     "java/lang/RuntimeException"},
+    {"java/lang/NullPointerException",         "java/lang/RuntimeException"},
+    {"java/lang/UnsupportedOperationException","java/lang/RuntimeException"},
+    {"java/lang/IndexOutOfBoundsException",    "java/lang/RuntimeException"},
+    {"java/lang/SecurityException",            "java/lang/RuntimeException"},
+    {"java/lang/ClassCastException",           "java/lang/RuntimeException"},
+    {"java/lang/RuntimeException",             "java/lang/Exception"},
+    {"java/lang/NoSuchMethodError",            "java/lang/LinkageError"},
+    {"java/lang/NoSuchFieldError",             "java/lang/LinkageError"},
+    {"java/lang/UnsatisfiedLinkError",         "java/lang/LinkageError"},
+    {"java/lang/Exception",                    "java/lang/Throwable"},
     {NULL, NULL},
 };
 
-static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
-    (void)env;
-    if (!obj) return 1;                       // null is an instance of everything
-    klj_object *o = klj_as_object(obj);
-    if (!o) return 0;
-    const char *want = klj_class_name(clazz);
+// Whether `cls` is `want` or reaches it through g_supers. Shared by
+// IsInstanceOf and IsAssignableFrom so the two can never disagree.
+static int klj_class_is_a(const char *cls, const char *want) {
     if (strcmp(want, "java/lang/Object") == 0) return 1;
-
-    for (const char *cur = o->cls; cur; ) {
+    for (const char *cur = cls; cur; ) {
         if (strcmp(cur, want) == 0) return 1;
         const char *next = NULL;
         for (int i = 0; g_supers[i].cls; i++)
@@ -650,6 +767,49 @@ static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
         cur = next;
     }
     return 0;
+}
+
+static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
+    (void)env;
+    if (!obj) return 1;                       // null is an instance of everything
+    klj_object *o = klj_as_object(obj);
+    if (!o) return 0;
+    return klj_class_is_a(o->cls, klj_class_name(clazz));
+}
+
+// Can an object of clazz1 be cast to clazz2? Unity's reflection layer asks
+// this while matching argument types (HARD BULLET reaches it right after
+// loading liblck_core, on the main-menu path).
+static kl_jint klj_IsAssignableFrom(void *env, void *clazz1, void *clazz2) {
+    (void)env;
+    kl_jint r = klj_class_is_a(klj_class_name(clazz1), klj_class_name(clazz2));
+    KLJ_LOG("IsAssignableFrom(%s, %s) -> %d",
+            klj_class_name(clazz1), klj_class_name(clazz2), r);
+    return r;
+}
+
+// What a class answers a method with ITSELF — its own binding or an ancestor's,
+// never java/lang/Object's catch-all. For Object.toString, which is resolved on
+// Object and called on whatever the object is.
+static const klj_binding *klj_find_binding(const char *cls, const char *name, const char *sig);
+klj_impl klj_own_impl(const char *cls, const char *name, const char *sig) {
+    for (const char *cur = cls; cur && strcmp(cur, "java/lang/Object") != 0; ) {
+        const klj_binding *b = klj_find_binding(cur, name, sig);
+        if (b) return b->fn;
+        const char *next = NULL;
+        for (int i = 0; g_supers[i].cls; i++)
+            if (strcmp(g_supers[i].cls, cur) == 0) { next = g_supers[i].super; break; }
+        cur = next;
+    }
+    return NULL;
+}
+
+// The message of an exception klj_raise() made, or NULL for any other object.
+const char *klj_throwable_message(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    if (!o || !o->data) return NULL;
+    return klj_IsInstanceOf(NULL, obj, klj_class_object("java/lang/Throwable"))
+        ? (const char *)o->data : NULL;
 }
 
 // Strings. A jstring never crosses into real Java, so we are free to define the
@@ -1153,8 +1313,11 @@ static klj_val klj_call_common(void *env, void *self, void *mid, char want,
     // one row per method, because the guest's C# wrapper reaches for whichever
     // entry its own error hook or event fires next. Max Mustard
     // (x5269080709783454) aborted here on GameAnalytics.addErrorEvent right
-    // after its splash. KL_JNI_DROP_ANALYTICS=0 restores the abort.
-    static const char *const k_dropped[] = { "com/gameanalytics/" };
+    // after its splash; HARD BULLET (x8116626111777808) on
+    // AmplitudePlugin.setLibraryName when Start is pressed in its main menu.
+    // KL_JNI_DROP_ANALYTICS=0 restores the abort.
+    static const char *const k_dropped[] = { "com/gameanalytics/",
+                                             "com/amplitude/" };
     for (unsigned i = 0; i < sizeof k_dropped / sizeof *k_dropped; i++)
         if (strncmp(w->cls, k_dropped[i], strlen(k_dropped[i])) == 0 &&
             kl_env_on("KL_JNI_DROP_ANALYTICS", 1)) {
@@ -1653,6 +1816,10 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
         }
         return (klj_val){.l = eos_consts[idx]};
     }
+    {   // The Horizon Platform reply object: kl_jni_net.c owns its shape.
+        klj_val hz;
+        if (klj_horizon_message_field(obj, w->cls, w->name, w->sig, &hz)) return hz;
+    }
     KLJ_LOG("no host value for field %s.%s %s", w->cls, w->name, w->sig);
     if (!g_permissive) {
         fprintf(stderr, "[jni] this is a work item — add it to g_fields.\n");
@@ -1709,6 +1876,15 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/content/DialogInterface", "BUTTON_NEUTRAL",  -3),
     KLJ_FINT("android/media/AudioManager", "GET_DEVICES_OUTPUTS", 2),
     KLJ_FINT("android/media/AudioManager", "STREAM_MUSIC", 3),
+    // Audio focus and AudioAttributes (AOSP values), read by the API-26
+    // requestAudioFocus path in runtime/jni/kl_jni_window.c.
+    KLJ_FINT("android/media/AudioManager", "AUDIOFOCUS_GAIN", 1),
+    KLJ_FINT("android/media/AudioManager", "AUDIOFOCUS_REQUEST_FAILED", 0),
+    KLJ_FINT("android/media/AudioManager", "AUDIOFOCUS_REQUEST_GRANTED", 1),
+    KLJ_FINT("android/media/AudioAttributes", "USAGE_MEDIA", 1),
+    KLJ_FINT("android/media/AudioAttributes", "USAGE_GAME", 14),
+    KLJ_FINT("android/media/AudioAttributes", "CONTENT_TYPE_MUSIC", 2),
+    KLJ_FINT("android/media/AudioAttributes", "CONTENT_TYPE_SONIFICATION", 4),
     // MediaFormat colour constants — Unity's AndroidVideoMedia reads these off
     // the decoded video format to set up the output colour conversion. Values
     // are the AOSP MediaFormat definitions.
@@ -2203,6 +2379,8 @@ static void klj_build_tables(void) {
     ENV(GetVersion,           klj_GetVersion);
     ENV(FindClass,            klj_FindClass);
     ENV(GetObjectClass,       klj_GetObjectClass);
+    ENV(Throw,                klj_Throw);
+    ENV(ThrowNew,             klj_ThrowNew);
     ENV(ExceptionOccurred,    klj_ExceptionOccurred);
     ENV(ExceptionDescribe,    klj_ExceptionDescribe);
     ENV(ExceptionClear,       klj_ExceptionClear);
@@ -2219,6 +2397,7 @@ static void klj_build_tables(void) {
     ENV(DeleteWeakGlobalRef,  klj_ref_release);
     ENV(IsSameObject,         klj_IsSameObject);
     ENV(IsInstanceOf,         klj_IsInstanceOf);
+    ENV(IsAssignableFrom,     klj_IsAssignableFrom);
     ENV(NewString,            klj_NewString);
     ENV(GetStringChars,       klj_GetStringChars);
     ENV(ReleaseStringChars,   klj_ReleaseStringChars);

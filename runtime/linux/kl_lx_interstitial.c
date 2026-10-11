@@ -43,10 +43,23 @@ int kl_interstitial_get(kl_interstitial *out) {
     return gen;
 }
 
-// The guest is drawing again: whatever it said about its loading screen is over,
-// whether or not it said so (Alyx sends no end_loading after the trigger).
+// The guest submitted an eye picture. That ends a loading screen that is only
+// loading — the guest is drawing again, whether or not it says so. It does NOT
+// end one that is asking for the trigger: after loading a saved game Alyx draws
+// again while it still waits, a faded-out picture with nothing on it, and
+// taking the card away at that first picture left the player in the dark with
+// no word of what was wanted (Vision Pro, 2026-10-11: the prompt at 11:55:31,
+// the game's picture a second later, end_loading at 11:55:40 when the trigger
+// finally came). The prompt stays until the game says end_loading, or — for a
+// game that never says it — until a trigger is pulled while the game draws.
 void kl_interstitial_done(void) {
     if (!g_state.phase) return;
+    int over = !g_state.message[0];
+    for (int hand = 0; hand < 2 && !over; hand++) {
+        float trigger = 0;
+        if (kl_ovrp_controller_input(hand, NULL, NULL, &trigger, NULL, NULL, NULL) && trigger > 0.5f) over = 1;
+    }
+    if (!over) return;
     pthread_mutex_lock(&g_mu);
     if (g_state.phase) { g_state.phase = 0; g_state.generation++; }
     pthread_mutex_unlock(&g_mu);

@@ -373,12 +373,45 @@ static int klgl_want_multiview(void) {
 // (kl_egl_set_gles_version) and has always run against an empty list; the
 // argument above is an ES 3.2 argument and does not carry over, so that target
 // stays exactly as it was rather than being changed by a fix it did not need.
-static int klgl_ext_count(void) {
+static int klgl_base_count(void) {
     if (g_es_major < 3) return 0;
     int n = (int)(sizeof g_gl_extensions / sizeof g_gl_extensions[0]);
     // Hide the two trailing OVR_multiview entries from targets that don't use it.
     if (!klgl_want_multiview()) n -= 2;
     return n;
+}
+
+// One more name, for Counter-Strike VR. Textures of any size are core in ES 3,
+// so GL_OES_texture_npot states nothing the level does not — but Xash's renderer
+// decides from the NAME (gl_opengl.c: GL_ARB_texture_non_power_of_two, else
+// GL_OES_texture_npot), and without it rescales every image to powers of two.
+// Its menu buttons are rows cut out of one tall strip, and after the rescale
+// each row carried a sliver of the next one under it; seen on the device and,
+// with the whole panel in view, in a host capture. A Quest names the extension.
+// Per target rather than for everyone: the list above is what every verified
+// game was verified against.
+//
+// GL_EXT_texture_buffer is the second such name (fix 16, sent in by a user,
+// 2026-10-11). Texture buffers are core in the ES 3.2 this runtime claims and
+// kl_glfb emulates glTexBuffer under all its names, so naming it states
+// nothing new — but older Unreal's FAndroidOpenGL::ProcessExtensions loads
+// glTexBufferEXT ONLY when the string is there, while its ES 3.1 RHI binds
+// SRVs as GL_TEXTURE_BUFFER regardless: without the name the pointer stays
+// NULL and the first SRV jumps to address 0, which is where Tales from the
+// Galaxy's Edge (x3484270071659289) died.
+static const char *klgl_ext_extra(void) {
+    const char *t = kl_driver_target_name();
+    if (!t) return NULL;
+    if (strcmp(t, "cs1") == 0) return "GL_OES_texture_npot";
+    if (g_es_major >= 3 && strcmp(t, "x3484270071659289") == 0) return "GL_EXT_texture_buffer";
+    return NULL;
+}
+static int klgl_ext_count(void) {
+    int n = klgl_base_count();
+    return n > 0 && klgl_ext_extra() ? n + 1 : n;
+}
+static const char *klgl_ext_at(int i) {
+    return i < klgl_base_count() ? g_gl_extensions[i] : klgl_ext_extra();
 }
 
 // The GL identity, per target. An Unreal guest creates a throwaway GLES context
@@ -394,13 +427,15 @@ static int klgl_ext_count(void) {
 // DefaultDeviceProfiles.ini / BaseDeviceProfiles.ini, not guessed.
 static const char *klgl_identity(int renderer) {
     const char *t = kl_driver_target_name();
-    if (t && strcmp(t, "moss") == 0)
+    // Saints & Sinners (x2897337400373711, UE 4.26) likewise: as "Klepton GLES"
+    // its weapons did not draw at all; as the Quest 2's GPU they do.
+    if (t && (strcmp(t, "moss") == 0 || strcmp(t, "x2897337400373711") == 0))
         return renderer ? "Adreno (TM) 650" : "Qualcomm";
     return renderer ? "Klepton GLES" : "Klepton";
 }
 
 static const char *klgl_GetString(uint32_t name) {
-    static char ver[64], glsl[64], exts[256];
+    static char ver[64], glsl[64], exts[512];
     switch (name) {
     // Who the GPU says it is. Honest by default; KL_GL_VENDOR / KL_GL_RENDERER
     // override, and one target needs a different default — see klgl_identity.
@@ -422,7 +457,7 @@ static const char *klgl_GetString(uint32_t name) {
         exts[0] = 0;
         for (int i = 0; i < n; i++) {
             if (i) strlcat(exts, " ", sizeof exts);
-            strlcat(exts, g_gl_extensions[i], sizeof exts);
+            strlcat(exts, klgl_ext_at(i), sizeof exts);
         }
         return exts;
     }
@@ -433,7 +468,7 @@ static const char *klgl_GetString(uint32_t name) {
 
 static const char *klgl_GetStringi(uint32_t name, uint32_t index) {
     if (name == GL_EXTENSIONS && (int)index < klgl_ext_count())
-        return g_gl_extensions[index];
+        return klgl_ext_at((int)index);
     return "";           // consistent with GL_NUM_EXTENSIONS
 }
 

@@ -379,6 +379,23 @@ static klj_val klj_GA_forceQuit(void *env, void *self, const klj_val *a, int n) 
     kl_fault_print_frames(stderr, __builtin_frame_address(0));
     return (klj_val){0};
 }
+// AndroidThunkJava_RestartApplication(String) — on Android the activity schedules
+// its own relaunch through AlarmManager and exits. UE4 asks for it once its
+// first-run OpenGL program binary cache is complete (the relaunch only frees the
+// memory the precompile used), so a fresh install of The Walking Dead: Saints &
+// Sinners called it right after its logo and died on the missing method. There
+// is no relaunching an app from inside itself here, and the programs it just
+// compiled are already live in this process, so carry on instead: the same
+// "ignored, keep running" answer ForceQuit gets.
+static klj_val klj_GA_restartApplication(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AndroidThunkJava_RestartApplication() — the guest asked to relaunch "
+            "itself; ignored, the process keeps running");
+    fprintf(stderr, "  [ue4] RestartApplication caller stack (symbolise against the "
+                    "guest libUE4/libUnreal with tools/symof.py):\n");
+    kl_fault_print_frames(stderr, __builtin_frame_address(0));
+    return (klj_val){0};
+}
 static klj_val klj_GA_setDesiredViewSize(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     KLJ_LOG("AndroidThunkJava_SetDesiredViewSize(%d, %d) — recorded; the window "
@@ -445,6 +462,16 @@ static klj_val klj_GA_getSupportedRefreshRates(void *env, void *self, const klj_
 static klj_val klj_GA_getFontDirectory(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.l = kl_jni_new_string("/system/fonts/")};
+}
+
+// GameActivity.getAppPackageName(): the Java returns getPackageName(), i.e. the
+// guest's own package from its manifest — the same answer Context.getPackageName
+// gives in kl_jni_android.c. Tales from the Galaxy's Edge (x3484270071659289)
+// asks for it right after its first frame and stopped there without it.
+static klj_val klj_GA_getAppPackageName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    const char *pkg = kl_jni_guest_package();
+    return (klj_val){.l = kl_jni_new_string(pkg ? pkg : "")};
 }
 
 // UE4's own VR gate, and the same question Unity's is: GameActivity.onCreate
@@ -862,6 +889,18 @@ static klj_val klj_Sentry_init(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.l = NULL};
 }
 
+// The bridge's void scope setters (breadcrumbs, level, tags) after a no-op
+// init: they annotate reports that will never be sent. Breadcrumbs can arrive
+// every frame, so this logs once. The bridge's capture*/isCrashedLastRun
+// return values and are deliberately not answered here.
+static klj_val klj_Sentry_scope_noop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("SentryBridgeJava scope setter — no-op (no Sentry backend; logged once)");
+    return (klj_val){.l = NULL};
+}
+
 // A GameActivity void method we deliberately do nothing for. OLAR registers a
 // network-reachability listener; there is no Android connectivity service here
 // and the engine treats "never notified" as "no change," which is correct for a
@@ -875,6 +914,27 @@ static klj_val klj_GA_void_noop(void *env, void *self, const klj_val *a, int n) 
 // wanderer drives for its intro video is a whole family of its own — see
 // runtime/jni/kl_jni_electra.c, which wires it to kl_vtdec. It used to be a
 // single GetDecoderInformation stub returning NULL here to skip the video.
+
+// ---- Pinball FX VR's BluetoothHelper: no Android Bluetooth stack here ----
+//
+// Pinball FX VR (x7255396864545733) ships its own Java helper,
+// com/zenstudios/PinballFX_VR/BluetoothHelper, and asks it right after its
+// first textures load which Bluetooth input devices are connected, as an
+// array of names. There is no Android Bluetooth stack on this host, so the
+// answer is the one a device with nothing connected would give: an empty
+// String[] (not NULL, which a caller iterating .length would trip over).
+// Without this row the static call aborted at boot ("no host implementation")
+// just after the permission prompts — the crash the user saw.
+// The class is the game's own, so this row cannot affect any other title.
+static klj_val klj_PFXVR_getConnectedInputDevices(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("PinballFX_VR BluetoothHelper.getConnectedInputDevices() -> [] "
+                "(no Android Bluetooth stack on this host)");
+    return (klj_val){.l = klj_new_array('L', KLJ_CLASS_STRING, 0)};
+}
 
 const klj_binding klj_bind_ue4[] = {
     {"android/view/Display", "getRefreshRate", "()F", klj_Display_getRefreshRate},
@@ -967,6 +1027,8 @@ const klj_binding klj_bind_ue4[] = {
      "(Ljava/lang/String;)Ljava/lang/String;", klj_GA_intentExtraAbsent},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_InitHMDs", "()V", klj_GA_initHMDs},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ForceQuit", "()V", klj_GA_forceQuit},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_RestartApplication",
+     "(Ljava/lang/String;)V", klj_GA_restartApplication},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetDesiredViewSize", "(II)V",
      klj_GA_setDesiredViewSize},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetNativeDisplayRefreshRate",
@@ -983,6 +1045,8 @@ const klj_binding klj_bind_ue4[] = {
      "()[I", klj_GA_getSupportedRefreshRates},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetFontDirectory",
      "()Ljava/lang/String;", klj_GA_getFontDirectory},
+    {"com/epicgames/ue4/GameActivity", "getAppPackageName",
+     "()Ljava/lang/String;", klj_GA_getAppPackageName},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_AddNetworkListener",
      "()V", klj_GA_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_InitializeWithPermission",
@@ -1006,6 +1070,17 @@ const klj_binding klj_bind_ue4[] = {
      "(Ljava/lang/String;Ljava/util/HashMap;)V", klj_Sentry_init},
     {"io/sentry/unreal/SentryBridgeJava", "setTag",
      "(Ljava/lang/String;Ljava/lang/String;)V", klj_Sentry_init},
+    // The newer sentry-unreal bridge (UE5; Skydance's BEHEMOTH, x5767635983306831)
+    // takes the options as a string plus a native handle for its callbacks.
+    {"io/sentry/unreal/SentryBridgeJava", "init",
+     "(Landroid/app/Activity;Ljava/lang/String;J)V", klj_Sentry_init},
+    {"io/sentry/unreal/SentryBridgeJava", "addBreadcrumb",
+     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/util/HashMap;Lio/sentry/SentryLevel;)V",
+     klj_Sentry_scope_noop},
+    {"io/sentry/unreal/SentryBridgeJava", "setLevel",
+     "(Lio/sentry/SentryLevel;)V", klj_Sentry_scope_noop},
+    {"io/sentry/unreal/SentryBridgeJava", "removeTag",
+     "(Ljava/lang/String;)V", klj_Sentry_scope_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_PushSensorEvents", "()V",
      klj_GA_pushSensorEvents},
     // UE4's three BroadcastReceivers. `startReceiver` is where the state is
@@ -1028,5 +1103,7 @@ const klj_binding klj_bind_ue4[] = {
     {"com/epicgames/ue4/MessageBox01", "addButton",  "(Ljava/lang/String;)V", klj_MsgBox_addButton},
     {"com/epicgames/ue4/MessageBox01", "clear",      "()V", klj_MsgBox_clear},
     {"com/epicgames/ue4/MessageBox01", "show",       "()I", klj_MsgBox_show},
+    {"com/zenstudios/PinballFX_VR/BluetoothHelper", "getConnectedInputDevices",
+     "()[Ljava/lang/String;", klj_PFXVR_getConnectedInputDevices},
     {0}
 };

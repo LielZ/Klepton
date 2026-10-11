@@ -385,7 +385,8 @@ typedef struct {
 } kl_interstitial;
 // Fills *out and returns the generation.
 int kl_interstitial_get(kl_interstitial *out);
-// The guest submitted an eye picture: the loading screen, if any, is over.
+// The guest submitted an eye picture: a loading screen that is not asking for
+// the trigger is over (kl_lx_interstitial.c has the rest).
 void kl_interstitial_done(void);
 
 // 1 while the guest has a live Equirect loading layer (AC Nexus's video
@@ -435,6 +436,11 @@ void kl_loadingvideo_stop(void);
 // knob.
 void kl_ovrp_frame_begin_external(void);
 void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8);
+// ...and its two halves (see kl_ovrp.c): close the record now, file it later.
+// `prepare` answers 1 when there is a record to file.
+int  kl_ovrp_frame_end_prepare(int stage, const float *pose7, const float *tan8,
+                               kl_ovrp_render_pose *out);
+void kl_ovrp_frame_end_commit(const kl_ovrp_render_pose *rec);
 
 // ...and the same for the OTHER layers, which for an OpenXR guest is the whole
 // of `xrEndFrame`'s list that is not a projection layer.

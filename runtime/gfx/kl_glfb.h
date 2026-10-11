@@ -255,6 +255,22 @@ void *kl_glfb_mtl_device(void);
 int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
                                  int w, int h, uint32_t internal_fmt);
 
+// DoubleWide: make (eye, stage) read the same MTLTexture and slice as
+// (from_eye, stage) without re-binding any GL name. Returns 0 if from_eye has no
+// Metal storage at that stage.
+int kl_glfb_share_eye_mtl_texture(int eye, int stage, int from_eye);
+
+// The guest's eye layer is DoubleWide: both eyes side by side in one texture.
+// Foveation is then refused (kl_glfb_foveation_wanted answers 0) — the rate map
+// is ONE eye's display curve stretched over the whole width, so its sharp zone
+// lands between the eyes and the per-eye crops of the result are wrong.
+void kl_glfb_set_eye_doublewide(int on);
+
+// A non-eye layer was destroyed: its mirror and Metal-binding rows are given
+// back for a later layer id — by the thread that mirrors layers, not by the
+// caller's.
+void kl_glfb_forget_layer(int layer);
+
 // The MTLTexture currently backing (eye, stage), or NULL — what the compositor
 // pass samples, and what a test reads back to check the guest's frame arrived.
 void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice);

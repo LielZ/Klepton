@@ -58,11 +58,15 @@ const klj_binding klj_bind_fmod[] = {
     {FMODCLS, "init",                "(Ljava/lang/Object;)V",  klf_void},
     // FMOD for Unity calls init through AndroidJavaClass, and Unity builds the
     // signature from the activity's Class.getName() — dots, not slashes (Max
-    // Mustard). Matched as the string the guest asks for, like OculusDeviceConfig.
+    // Mustard). Matched as the string the guest asks for, like OculusDeviceConfig;
+    // a guest that asks with slashes (BRINK Traveler, fix 9) meets the same row,
+    // klj_sig_eq reads the two alike.
     {FMODCLS, "init",                "(Lcom.unity3d.player.UnityPlayerActivity;)V", klf_void},
     {FMODCLS, "close",               "()V",                    klf_void},
     {FMODCLS, "getContext",          "()Landroid/content/Context;", klf_getContext},
     {FMODCLS, "getContext",          "()Ljava/lang/Object;",   klf_getContext},
+    // No Bluetooth output path here, so no extra latency for FMOD to budget.
+    {FMODCLS, "isBluetoothOn",       "()Z",                    klf_false},
     // Output format + fast-path capabilities the native mixer queries.
     {FMODCLS, "getOutputSampleRate", "()I",                    klf_sampleRate},
     {FMODCLS, "getOutputBlockSize",  "()I",                    klf_blockSize},

@@ -466,13 +466,125 @@ static klj_val klj_ctor_object(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     return (klj_val){.l = kl_jni_new_object(klj_class_name(self))};
 }
-static klj_val klj_horizon_zero_i(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.j = 0};   // no queued platform messages
-}
 static klj_val klj_horizon_session_id(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 0x484F52495A4F4Ell};   // a fixed, non-zero synthetic session id
+}
+
+// ---- Horizon Platform: the application's own entitlement ----
+//
+// The Horizon-SDK twin of the ovr_Entitlement_GetIsViewerEntitled carve-out in
+// runtime/xr/kl_ovrplat.c, and drawn on the SAME line for the SAME reason:
+// Klepton runs an APK unpacked from a copy of the app the user already bought
+// (avpplay confirms the purchase with Meta before every install), so "is the
+// viewer entitled to THIS application" has a true answer, and it is yes.
+// Answering it describes that purchase; it does not manufacture one.
+//
+// Exactly ONE request is answered: service "entitlements", method
+// "get_is_viewer_entitled". Matched by exact string, never by substring, so
+// every other entitlement, IAP, purchase, DLC/asset or ownership request keeps
+// the old behaviour — an id is handed back and no reply ever comes. That is
+// strictly more restrictive than the truth, as kl_ovrplat.c's refusals are.
+//
+// HARD BULLET (x8116626111777808) gates its first scene on this reply: without
+// it the frame loop runs and the eye shows a black void indefinitely, while the
+// guest polls getMessageCount every frame. KL_HZ_ENTITLEMENT=0 restores the
+// silence for an A/B.
+//
+// The guest correlates the reply with the id makeRequest returned, so each
+// answered request gets its own id; unanswered ones keep the shared synthetic
+// session id they always had.
+#define KLJ_HZ_MAX_PENDING 8
+static pthread_mutex_t g_hz_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_hz_pending[KLJ_HZ_MAX_PENDING];
+static int      g_hz_npending;
+static uint64_t g_hz_next_id = 0x484F525A00000001ull;
+
+static int klj_hz_is_app_entitlement(const char *service, const char *method) {
+    return service && method &&
+           strcmp(service, "entitlements") == 0 &&
+           strcmp(method, "get_is_viewer_entitled") == 0;
+}
+
+static klj_val klj_horizon_make_request(void *env, void *self, const klj_val *a, int n) {
+    const char *s0 = n > 0 ? klj_str(a[0].l) : NULL, *s1 = n > 1 ? klj_str(a[1].l) : NULL;
+    const char *s3 = n > 3 ? klj_str(a[3].l) : NULL;
+    if (klj_hz_is_app_entitlement(s0, s1) && kl_env_on("KL_HZ_ENTITLEMENT", 1)) {
+        pthread_mutex_lock(&g_hz_lock);
+        uint64_t id = g_hz_next_id++;
+        int queued = g_hz_npending < KLJ_HZ_MAX_PENDING;
+        if (queued) g_hz_pending[g_hz_npending++] = id;
+        pthread_mutex_unlock(&g_hz_lock);
+        KLJ_LOG("HorizonPlatformCore.makeRequest(\"%s\", \"%s\") -> id 0x%llx — the "
+                "application's own entitlement; reply queued%s", s0, s1,
+                (unsigned long long)id, queued ? "" : " (queue full, dropped)");
+        return (klj_val){.j = id};
+    }
+    KLJ_LOG("HorizonPlatformCore.makeRequest(\"%.120s\", \"%.120s\", %d, \"%.200s\", %d) — no reply will come",
+            s0 ? s0 : "(null)", s1 ? s1 : "(null)", n > 2 ? (int)a[2].j : 0,
+            s3 ? s3 : "(null)", n > 4 ? (int)a[4].j : 0);
+    return klj_horizon_session_id(env, self, a, n);
+}
+
+// popMessage(session, flag) -> Object: hand back the oldest queued reply, or
+// NULL when there is none. The real class lives in Horizon OS, not the APK, so
+// its shape is learned from what the guest reads off it; until then the object
+// is inert and the first field or method the guest asks for is named in the log.
+#define KLJ_HZ_MSG_CLASS "horizonos/supplement/hzplatformclientcore/HorizonMessage"
+static struct { void *obj; uint64_t id; } g_hz_msgs[KLJ_HZ_MAX_PENDING];
+static unsigned g_hz_nmsgs;
+
+// The reply's fields, read by the guest with GetFieldID/Get*Field. Measured on
+// HARD BULLET (2026-10-11), in read order: requestId J, statusCode I,
+// statusMessage String, data String, cookie I. requestId is the id makeRequest
+// returned; statusCode 0 is success, which for this request IS the answer (as
+// Entitlement_GetIsViewerEntitled is in kl_ovrplat.c: no payload), and the
+// rest are empty. Any field is logged by name and type and anything not
+// named here answers 0/NULL, so a new shape shows up in one run.
+int klj_horizon_message_field(void *obj, const char *cls, const char *name,
+                              const char *sig, klj_val *out) {
+    if (strcmp(cls, KLJ_HZ_MSG_CLASS) != 0) return 0;
+    uint64_t id = 0;
+    pthread_mutex_lock(&g_hz_lock);
+    for (unsigned i = 0; i < KLJ_HZ_MAX_PENDING; i++)
+        if (g_hz_msgs[i].obj == obj) id = g_hz_msgs[i].id;
+    pthread_mutex_unlock(&g_hz_lock);
+    *out = (klj_val){0};
+    if (strcmp(name, "requestId") == 0 && sig[0] == 'J') out->j = id;
+    else if (strcmp(name, "errorCode") != 0)
+        KLJ_LOG("HorizonMessage.%s %s read — not modelled yet, answering 0/NULL", name, sig);
+    KLJ_LOG("HorizonMessage(0x%llx).%s %s -> 0x%llx", (unsigned long long)id, name, sig,
+            (unsigned long long)out->j);
+    return 1;
+}
+static klj_val klj_horizon_pop_message(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    pthread_mutex_lock(&g_hz_lock);
+    uint64_t id = 0;
+    if (g_hz_npending > 0) {
+        id = g_hz_pending[0];
+        memmove(g_hz_pending, g_hz_pending + 1, (size_t)(--g_hz_npending) * sizeof g_hz_pending[0]);
+    }
+    pthread_mutex_unlock(&g_hz_lock);
+    if (!id) return (klj_val){.l = NULL};
+    void *msg = kl_jni_new_object(KLJ_HZ_MSG_CLASS);
+    pthread_mutex_lock(&g_hz_lock);
+    g_hz_msgs[g_hz_nmsgs % KLJ_HZ_MAX_PENDING] = (typeof(g_hz_msgs[0])){msg, id};
+    g_hz_nmsgs++;
+    pthread_mutex_unlock(&g_hz_lock);
+    KLJ_LOG("HorizonPlatformCore.popMessage(flag=%d) -> entitlement reply for id 0x%llx",
+            n > 1 ? (int)a[1].j : -1, (unsigned long long)id);
+    return (klj_val){.l = msg};
+}
+
+// getMessageCount(session): how many replies are waiting — only ever the
+// entitlement replies queued above.
+static klj_val klj_horizon_message_count(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    pthread_mutex_lock(&g_hz_lock);
+    int c = g_hz_npending;
+    pthread_mutex_unlock(&g_hz_lock);
+    return (klj_val){.j = (uint64_t)c};
 }
 
 
@@ -585,9 +697,11 @@ const klj_binding klj_bind_net[] = {
     {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "makeSession",
      "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;I)J", klj_horizon_session_id},
     {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "makeRequest",
-     "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;I)J", klj_horizon_session_id},
+     "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;I)J", klj_horizon_make_request},
     {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "getMessageCount",
-     "(J)I", klj_horizon_zero_i},
+     "(J)I", klj_horizon_message_count},
+    {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "popMessage",
+     "(JZ)Ljava/lang/Object;", klj_horizon_pop_message},
     {"com/unity3d/player/UnityPlayer", "hidePreservedContent", "()V", klj_UnityPlayer_hidePreservedContent},
     {"com/unity3d/player/UnityPlayer", "executeMainThreadJobs", "()V", klj_UnityPlayer_executeMainThreadJobs},
     {"com/unity3d/player/UnityPlayer", "applyWindowUIChanges", "(Z)V", klj_void_noop},

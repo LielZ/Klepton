@@ -86,10 +86,14 @@ int kl_app_target_wants_full(void) {
     // starts. Default those to .full immersion from boot: the native OpenXR kind
     // (vicecity) and the folder-fed launcher games — hl1 (GLES3JNI) and
     // cs1/hl2/portal (SDL2). KL_FULL=0 forces .mixed back for development.
+    // Skydance's BEHEMOTH (x5767635983306831) by name: its splash and level-
+    // loading screens submit quads with no eye layer (KL_OVRP_EYELESS_FRAMES),
+    // which a Quest shows over black and .mixed showed over the room.
     return g_target && (g_target->kind == KL_GUEST_NATIVE ||
                         g_target->kind == KL_GUEST_GLES3JNI ||
                         g_target->kind == KL_GUEST_LINUX ||
-                        g_target->kind == KL_GUEST_SDL2);
+                        g_target->kind == KL_GUEST_SDL2 ||
+                        !strcmp(g_target->name, "x5767635983306831"));
 }
 int kl_app_target_owns_frame_loop(void) {
     return g_target ? kl_driver_owns_frame_loop() : 0;
@@ -102,6 +106,11 @@ static char g_apk[1024];
 static char g_dylibs[1024];
 static char g_log[1024];
 static char g_status[512] = "not configured";
+// The pipeline recorder's folder (runtime/gfx/kl_fossilize.cpp): a pipeline list
+// that came with the game, what this device recorded beside it, and how the
+// game makes its Vulkan device.
+static char g_fozdir[1100];
+static int  g_preparing;
 const char *kl_app_assets_dir(void) { return g_assets[0] ? g_assets : NULL; }
 
 // Where the run has got to, for the heartbeat below; the driver reports its own
@@ -178,6 +187,10 @@ int kl_app_configure(const char *resources, const char *container) {
     static char crash[1024];
     snprintf(crash, sizeof crash, "%s/klepton-crash.log", container);
     kl_fault_set_crash_path(crash);
+    // A Linux process's staged tree is lx/, and the list comes with it
+    // (visionos/stage_sync.py).
+    snprintf(g_fozdir, sizeof g_fozdir, target_is_linux() ? "%s/lx/klfz" : "%s/klfz", container);
+    setenv("KL_VK_FOZ_DIR", g_fozdir, 0);
 
     // Check before running, not after failing. A missing asset tree otherwise
     // surfaces three layers up inside Unity as something that reads like a shim
@@ -691,6 +704,59 @@ static int steamlink_vr_begin(void) {
     return 0;
 }
 
+// "Preparing graphics": every pipeline a list holds is compiled before the game
+// starts, on a device made as the game makes its own, so that the game finds
+// each one in the system's Metal cache instead of waiting for the compiler in
+// the middle of a frame (runtime/gfx/kl_fossilize.cpp has the story). Minutes
+// the first time, seconds after it. Here rather than at the game's own device
+// because here the window is still up and can say what is happening; the
+// immersive space opens when boot is done.
+//
+// How the game makes its device is written down by the game's own first run
+// (KL_VK_DEVICE_INFO), and that record is the one that counts. Before there is
+// one, a copy that came with the list stands in; the game's own replay then
+// runs once more at its device, which costs seconds if the stand-in was right
+// and is the cure if it was not.
+int  kl_foz_prewarm(const char *info_path);
+void kl_foz_prewarm_exact(int exact);
+int  kl_foz_progress(unsigned *done, unsigned *total, double *elapsed);
+int  kl_foz_databases(void);
+
+static void prepare_graphics(void) {
+    if (!kl_env_on("KL_VK_FOZ_PREWARM", 1) || !kl_env_str("KL_VK_FOZ_REPLAY", NULL)) return;
+    int n = kl_foz_databases();
+    if (n <= 0) {
+        printf("  [app] preparing graphics: no pipeline list in %s — the game compiles as it goes "
+               "and records what it compiled\n", g_fozdir);
+        return;
+    }
+    char own[1200], stand_in[1200];
+    snprintf(own, sizeof own, "%s/device-info.json", g_fozdir);
+    snprintf(stand_in, sizeof stand_in, "%s/device-info.default.json", g_fozdir);
+    app_phase("preparing graphics");
+    g_preparing = 1;
+    int exact = 1;
+    int rc = kl_foz_prewarm(own);
+    if (rc == -2) { exact = 0; rc = kl_foz_prewarm(stand_in); }
+    g_preparing = 0;
+    if (rc == 0) kl_foz_prewarm_exact(exact);
+    unsigned done = 0, total = 0; double s = 0;
+    kl_foz_progress(&done, &total, &s);
+    printf("  [app] preparing graphics: %s (%d list(s), %u of %u pipelines, %.1f s, on %s)\n",
+           rc == 0 ? "done" : rc == -2 ? "no usable record of the game's device yet — left to the game's own start"
+                                       : "could not — left to the game's own start",
+           n, done, total, s, rc ? "nothing" : exact ? "the game's own device settings" : "the stand-in device settings");
+    fflush(NULL);
+}
+
+int kl_app_prepare_progress(unsigned *done, unsigned *total) {
+    unsigned d = 0, t = 0;
+    int st = g_preparing ? kl_foz_progress(&d, &t, NULL) : 0;
+    if (done) *done = d;
+    if (total) *total = t;
+    return g_preparing && st == 1;
+}
+
 int kl_app_boot(void) {
     // Once, and never concurrently. The Boot button invites a second press, and
     // the second entry is not merely redundant: the runtime's JNI tables are
@@ -761,6 +827,8 @@ int kl_app_boot(void) {
     // Before the chain runs, so nothing it starts reads a default we meant to
     // replace.
     if (kl_app_target_is_steamlink()) steamlink_policy();
+
+    prepare_graphics();
 
     // The door's own sequence, in kl_driver: the chain and its entry point for
     // Steam Link, Unreal and OpenJK; libmain -> NativeLoader.load -> initJni for
@@ -960,6 +1028,22 @@ int kl_app_guest_state(void) {
     return s;
 }
 
+// An SDL guest is an engine with a shutdown of its own, and that shutdown is
+// where it writes what the player changed: Counter-Strike VR saved neither the
+// player's name nor any setting, because this app's answer to being backgrounded
+// is exit(0) and the engine never heard about it. Android destroys the activity
+// first, and SDL turns that into SDL_QUIT.
+int kl_app_guest_quit_done(void) {
+    extern int kl_sdl2_main_returned(void);
+    return g_target && g_target->kind == KL_GUEST_SDL2 ? kl_sdl2_main_returned() : 0;
+}
+int kl_app_guest_request_quit(void) {
+    extern int kl_sdl2_send_quit(void);
+    if (!g_target || g_target->kind != KL_GUEST_SDL2) return 0;
+    if (kl_app_guest_state() <= 0) return 0;
+    return kl_sdl2_send_quit();
+}
+
 static void guest_set_state(int s) {
     pthread_mutex_lock(&g_guest.mu);
     g_guest.state = s;
@@ -1137,7 +1221,16 @@ int kl_app_guest_start(void) {
     // OVRPlugin, and pairing a door with the wrong one is a guest that blocks
     // forever on a pose nobody publishes to it.
     // ...and a Linux process reaching OpenXR through xrizer is the same again.
-    if (kl_app_target_is_steamlink() || target_is_jkxr() || target_is_linux())
+    // ...and Counter-Strike VR (Xash through SDL2, its own OpenXR loop). Unpaced,
+    // its xrWaitFrame returned at once and the engine drew as fast as it could:
+    // 390 to 612 frames a second submitted in a round on the device, against a
+    // panel showing 120. The first sign was the compositor starved to 35-48 Hz
+    // at the larger eye size; at the smaller one everything looked healthy for
+    // five minutes and then the system halved the app's cadence to 60 Hz and
+    // kept it there, with the compositor's own pass idle — a headset shedding
+    // load it should never have been given.
+    if (kl_app_target_is_steamlink() || target_is_jkxr() || target_is_linux() ||
+        (g_target->name && strcmp(g_target->name, "cs1") == 0))
         kl_openxr_set_frame_pacer(guest_pace_wait);
     // ...and the same clock on the OVRPlugin side, for the other guest that
     // owns its loop. ovrp_WaitToBeginFrame is this API's xrWaitFrame. It is

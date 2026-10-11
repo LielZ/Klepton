@@ -67,7 +67,7 @@ RUNTIME_SHIP := $(LX_SRC) runtime/guest/kl_linuxproc.c \
            runtime/xr/kl_ovrplat.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
            runtime/gfx/kl_vulkan.c runtime/gfx/kl_mtl_foveate.m \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
-           runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_sdl2.c \
+           runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_xashservers.c runtime/guest/kl_sdl2.c \
            runtime/guest/kl_gles3jni.c runtime/guest/kl_driver.c \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
            runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
@@ -495,6 +495,34 @@ build/m_linux: mains/m_linux.c runtime/linux/kl_lx.h $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ mains/m_linux.c $(RUNTIME) $(LDLIBS)
 
+# Valve's Fossilize (vendor-fossilize/, MIT) and the recorder/replayer built on
+# it, runtime/gfx/kl_fossilize.cpp (KL_VK_FOZ_RECORD / KL_VK_FOZ_REPLAY): the
+# only C++ in the runtime, compiled into the same archives. Whatever links an
+# archive takes the C++ library with it (-lc++); the host mains, which are one
+# cc command over the C sources, link without it and kl_vulkan.c finds the
+# recorder absent (a weak reference).
+FZ_DIR := vendor-fossilize
+FZ_SRC := $(FZ_DIR)/fossilize.cpp $(FZ_DIR)/fossilize_db.cpp $(FZ_DIR)/varint.cpp $(FZ_DIR)/path.cpp \
+          $(FZ_DIR)/fossilize_application_filter.cpp runtime/gfx/kl_fossilize.cpp
+FZ_DEPS := $(FZ_SRC) $(FZ_DIR)/miniz/miniz.c $(wildcard $(FZ_DIR)/*.hpp) runtime/gfx/kl_vk_pipe_hooks.h
+FZ_INC := -I$(FZ_DIR) -I$(FZ_DIR)/rapidjson/include -I$(FZ_DIR)/khronos -I$(FZ_DIR)/miniz -Iruntime/gfx
+FZ_CXX := clang++ -std=c++17 -g -O2 -arch arm64 -fno-exceptions -Wno-unused-parameter -Wno-deprecated-declarations $(FZ_INC)
+# $(1) = platform directory, $(2) = its target flags
+define FZ_COMPILE
+	@for s in $(FZ_SRC); do \
+	  $(FZ_CXX) $(2) -c $$s -o build/$(1)/fz_$$(basename $$s .cpp).o || exit 1; done
+	@clang -g -O2 -arch arm64 $(2) -c $(FZ_DIR)/miniz/miniz.c -o build/$(1)/fz_miniz.o
+endef
+
+# The pipeline replay on this Mac, with no guest (tests/t_foz.c). The one host
+# binary with the C++ recorder in it.
+build/t_foz: tests/t_foz.c $(RUNTIME) $(RUNTIME_HDRS) $(FZ_DEPS)
+	@mkdir -p build/fzhost
+	@for s in $(FZ_SRC); do \
+	  $(FZ_CXX) -c $$s -o build/fzhost/fz_$$(basename $$s .cpp).o || exit 1; done
+	@clang -g -O2 -arch arm64 -c $(FZ_DIR)/miniz/miniz.c -o build/fzhost/fz_miniz.o
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tests/t_foz.c $(RUNTIME) build/fzhost/*.o $(LDLIBS) -lc++
+
 # The whole sysroot, ad-hoc signed — Apple silicon maps no unsigned code even on
 # the host. A few hundred libraries; tools/lx_translate.sh runs them in parallel.
 .PHONY: lx-rt lx-boot
@@ -822,7 +850,7 @@ xros: $(XROS_GATES) build/Klepton.xcframework swiftcheck
 swiftcheck:
 	@xcrun -sdk xros swiftc -typecheck -target arm64-apple-xros26.0 \
 	  -import-objc-header visionos/Sources/Klepton-Bridging-Header.h \
-	  $(RUNTIME_INC) visionos/Sources/*.swift 2>&1 | grep -E '^[^ ].*error:' && exit 1; \
+	  $(RUNTIME_INC) visionos/Sources/*.swift visionos/SteamCloudKit/Sources/SteamCloudKit/*.swift 2>&1 | grep -E '^[^ ].*error:' && exit 1; \
 	  echo "  swiftcheck: the visionOS app typechecks against runtime/*.h"
 
 # The archives are real targets with real prerequisites, not side effects of a
@@ -836,22 +864,24 @@ swiftcheck:
 # runs the PREVIOUS constant while the source says otherwise. That is the same
 # stale-artifact trap the xcframework rule below already records; the fix there
 # stopped at the archives and left this behind it.
-build/xros/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
+build/xros/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS) $(FZ_DEPS)
 	@mkdir -p build/xros
 	@rm -f $@
 	@for s in $(RUNTIME_SHIP); do \
 	  o=build/xros/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
 	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) \
 	    -c $$s -o $$o || exit 1; done
+	$(call FZ_COMPILE,xros,-target arm64-apple-xros1.0 -isysroot $(XROS_SDK))
 	@ar rcs $@ build/xros/*.o
 
-build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
+build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS) $(FZ_DEPS)
 	@mkdir -p build/xrsim
 	@rm -f $@
 	@for s in $(RUNTIME_SHIP); do \
 	  o=build/xrsim/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
 	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) \
 	    -c $$s -o $$o || exit 1; done
+	$(call FZ_COMPILE,xrsim,-target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK))
 	@ar rcs $@ build/xrsim/*.o
 
 # The gate: link each archive into a dylib with -all_load, so a symbol that is
@@ -859,14 +889,14 @@ build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
 # a function nothing calls yet.
 build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz -lc++ -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
 	   -framework CoreFoundation -framework AVFoundation -framework Foundation -framework Metal \
 	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz -lc++ -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
 	   -framework CoreFoundation -framework AVFoundation -framework Foundation -framework Metal \
 	   -install_name @rpath/libklepton.dylib

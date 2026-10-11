@@ -148,6 +148,10 @@ void       *klj_want(void *clazz, const char *name, const char *sig, char kind);
 klj_val     klj_call(void *env, void *self, void *mid, kl_va *va, char want);
 void        klj_field_store(void *obj, void *fid, klj_val v);
 kl_jint     klj_ExceptionCheck(void *env);
+void        klj_raise(const char *cls, const char *msg);   // pending Java exception, this thread
+const char *klj_throwable_message(void *obj);              // NULL unless klj_raise made it
+klj_impl    klj_own_impl(const char *cls, const char *name, const char *sig);   // a class's own answer, never Object's
+int         klj_class_absent(const char *name);           // a class this APK does not ship (internal name)
 void       *klj_GetObjectClass(void *env, void *obj);
 kl_jint     klj_PushLocalFrame(void *env, kl_jint cap);
 void       *klj_PopLocalFrame(void *env, void *result);
@@ -322,5 +326,8 @@ unsigned klj_drain_soft_input(void);
 void *klj_box_int(int32_t v);
 void klj_deliver_message(void *message);
 void klj_guest_version(long *code, const char **name);
+// Fields of the Horizon Platform reply object (kl_jni_net.c); 0 when obj is not one.
+int klj_horizon_message_field(void *obj, const char *cls, const char *name,
+                              const char *sig, klj_val *out);
 
 #endif /* KL_JNI_INT_H */

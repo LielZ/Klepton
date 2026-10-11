@@ -352,7 +352,10 @@ static uint64_t klplat_called(const char *name) {
 #define KLPLAT_MSG_ASSET_LIST     1258057588u   //   .AssetFile_GetList (KL_PROBE_ENUM, this APK)
 #define KLPLAT_MSG_ACCESS_TOKEN     0x06A85ABEu  // .User_GetAccessToken (Message<string>)
 #define KLPLAT_MSG_ACHIEVEMENT_DEFS 0x03D3458Du  // .Achievements_GetAllDefinitions (empty array)
+#define KLPLAT_MSG_ACHIEVEMENT_PROG 0x4F9FDE1Du  // .Achievements_GetAllProgress (empty array)
 #define KLPLAT_MSG_LOGGED_IN_USER  0x436F345Du  // .User_GetLoggedInUser (Message<User>)
+#define KLPLAT_MSG_USER_PROOF      0x22810483u  // .User_GetUserProof (BRINK Traveler's
+                                                //   global-metadata, beside GetLoggedInUser's)
 #define KLPLAT_MSG_IAP_CHECKOUT    0x3F9B0D0Du  // .IAP_LaunchCheckoutFlow (KL_PROBE_ENUM, 1.28)
 #define KLPLAT_MSG_APP_CANCEL_DL   0x7C2060DEu  // .Application_CancelAppDownload (Cave Crave's
                                                 //   global-metadata, beside GetVersion's)
@@ -1593,6 +1596,17 @@ static uint64_t klplat_User_GetAccessToken(void) {
                               KLPLAT_MSG_ACCESS_TOKEN, 0, tok);
 }
 
+// The user proof — a one-time nonce from Meta's servers that a game backend
+// checks to verify who is playing. There is no service here to issue one, and a
+// made-up nonce would be a lie, so the answer is a FAILURE. But not 0: the SDK
+// meets a 0 request with "Request failed" and never calls OnComplete, and BRINK
+// Traveler waits on that callback on a black screen forever. An ERROR completion
+// is the same truth delivered to the callback, so the game's own error path runs.
+static uint64_t klplat_User_GetUserProof(void) {
+    plat_hit("ovr_User_GetUserProof");
+    return klplat_request_err("ovr_User_GetUserProof", KLPLAT_MSG_USER_PROOF);
+}
+
 // Achievement *definitions* — the catalogue the game's achievement manager reads
 // at startup. No Oculus service here defines any, so the honest answer is an EMPTY
 // set, the same shape ovr_AssetFile_GetList's empty list takes. Delivered as a
@@ -1607,6 +1621,20 @@ static uint64_t klplat_Achievements_GetAllDefinitions(void) {
     plat_hit("ovr_Achievements_GetAllDefinitions");
     return klplat_request("ovr_Achievements_GetAllDefinitions",
                           KLPLAT_MSG_ACHIEVEMENT_DEFS, 0);
+}
+
+// ...and the player's achievement *progress*, the other half of the same
+// startup read. Same answer for the same reason: an empty set (IsError false, an
+// AchievementProgressArray of size 0, i.e. "nothing achieved yet"), not the bare
+// 0 that lands the guest on "Request failed". Virtual Virtual Reality (1.8.48)
+// logs exactly that right after its logos and then sits on a black screen.
+// Progress records what a player has DONE, not what they own; no entitlement is
+// invented. Read through GetAchievementProgressArray (-> the message payload)
+// and the existing Array_GetSize answer (plat_is_empty_array -> 0).
+static uint64_t klplat_Achievements_GetAllProgress(void) {
+    plat_hit("ovr_Achievements_GetAllProgress");
+    return klplat_request("ovr_Achievements_GetAllProgress",
+                          KLPLAT_MSG_ACHIEVEMENT_PROG, 0);
 }
 
 // Who is signed in — the ASYNC request form (the synchronous ovr_GetLoggedInUserID
@@ -1646,8 +1674,15 @@ static int klplat_user_default(void) {
     // to the OnlineSubsystem's login-complete delegate; with no user the login
     // fails and the game calls FGenericPlatformMisc::RequestExit(true) — abort —
     // right after its first controller poll, before a frame is drawn.
+    // Saints & Sinners as a store install (x2897337400373711) is twd2's
+    // predecessor and gets the same offline user as twd2 (fix 15, 2026-10-11).
+    // BRINK Traveler (x3635172946605196) is the same chain in Unity: after the
+    // entitlement request, GetLoggedInUser fails with "Request failed." and the
+    // game renders black frames with no draws, never loading its first scene
+    // (fix 9, 2026-10-11; the game does not run yet for other reasons).
     static const char *on[] = { "zix", "intotheradius", "redmatter2", "vampire", "twd2",
-                                "walkabout", "moss", "x5812519008825194", "x6963344583787383" };
+                                "walkabout", "moss", "x5812519008825194", "x6963344583787383",
+                                "x2897337400373711", "x3635172946605196" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
@@ -1975,8 +2010,12 @@ static const char *const g_plat_request[] = {
 //     GetDefinitionsByName, GetProgressByName and the two ArrayPage walkers)
 //     return an ovrRequest. This is not an ownership question: achievements
 //     record what the player has done, not what they have bought, and 0 says
-//     the request could not be made rather than reporting any progress. The
-//     entitlement families are unaffected — plat_is_drm runs first.
+//     the request could not be made rather than reporting any progress. Two
+//     of them have answers of their own further down, both empty: the
+//     definitions (AC Nexus gates its menu on that list arriving) and all
+//     progress (Virtual Virtual Reality waits for it; fix 19, 2026-10-11) —
+//     "there is nothing, and nothing is unlocked". The entitlement families
+//     are unaffected — plat_is_drm runs first.
 //   ovr_GroupPresence_* — "who are you playing with", the multiplayer presence
 //     the invite/roster panels read. Ownership does not enter into it, and the
 //     trailing underscore keeps this clear of ovr_GroupPresenceOptions_* below,
@@ -2276,11 +2315,14 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     // than the bare 0 that lands the guest on its "Request failed" path. The
     // exact-match binding here overrides the ovr_Achievements_ prefix rule.
     {"ovr_User_GetAccessToken",                (void *)klplat_User_GetAccessToken},
+    {"ovr_User_GetUserProof",                  (void *)klplat_User_GetUserProof},
     {"ovr_Achievements_GetAllDefinitions",     (void *)klplat_Achievements_GetAllDefinitions},
     // Leaderboards: error completions (see the handlers).
     {"ovr_Leaderboard_GetEntries",             (void *)klplat_Leaderboard_GetEntries},
     {"ovr_Leaderboard_WriteEntry",             (void *)klplat_Leaderboard_WriteEntry},
     {"ovr_Message_GetAchievementDefinitionArray", (void *)klplat_Message_GetPayload},
+    {"ovr_Achievements_GetAllProgress",        (void *)klplat_Achievements_GetAllProgress},
+    {"ovr_Message_GetAchievementProgressArray", (void *)klplat_Message_GetPayload},
     // The logged-in user (async) and the User accessors its completion feeds.
     // Gated by KL_PLAT_USER inside the handler; the accessors are inert unless a
     // user was handed out. The exact-match binding overrides ovr_User_GetLoggedInUser's

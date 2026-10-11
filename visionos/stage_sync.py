@@ -57,6 +57,7 @@ import argparse
 import json
 import os
 import pathlib
+import hashlib
 import re
 import shutil
 import subprocess
@@ -242,7 +243,65 @@ def build_mirror(name, phase, mirror):
         for at, target in sorted(links):
             f.write(f"{at}\t{target}\n")
     missing = sorted(s for s in loaded if not (mirror / s).is_file())
+    if phase != "base":
+        pipeline_list(name, mirror, stats)
     return stats, len(links), missing
+
+
+def pipeline_list(name, mirror, stats):
+    """The game's Vulkan pipelines, for the app to compile before the game starts.
+
+    lx/<name>.pipelines is a recipe: a pipeline list with every shader module
+    replaced by where it is in the game's own shader packs (Glovebox's format
+    and, for Alyx, Glovebox's list — github.com/glovebox-vr/glovebox, MIT).
+    tools/alyx_pipelines.py makes the list of it from this copy of the game,
+    which takes a quarter of a minute, so the result is kept beside the build
+    products under a name that changes with the recipe and with the packs. It
+    goes to lx/klfz/<name>.foz, where the app looks (runtime/gfx/
+    kl_fossilize.cpp), with lx/<name>-device-info.json beside it: how the game
+    makes its Vulkan device, for a first start that has no record of its own.
+
+    A game without the list is a game that compiles as it goes, as before, so
+    nothing here stops the staging.
+    """
+    recipe = HERE / "lx" / f"{name}.pipelines"
+    tool = ROOT / "tools" / "alyx_pipelines.py"
+    if not recipe.is_file() or not tool.is_file():
+        return
+    packs = sorted(p for d in ("core", "hlvr") for p in (GAME / d).glob("shaders_vulkan_*.vpk"))
+    if not packs:
+        print(f"[stage] no pipeline list: {GAME} has no shader packs")
+        return
+    h = hashlib.sha256()
+    for f in (recipe, tool):
+        h.update(f.read_bytes())
+    for p in packs:
+        st = p.stat()
+        h.update(f"{p.relative_to(GAME)}:{st.st_size}:{st.st_mtime_ns};".encode())
+    keep = HERE / "build" / "pipelines"
+    made = keep / f"{name}-{h.hexdigest()[:16]}.foz"
+    if not made.is_file():
+        keep.mkdir(parents=True, exist_ok=True)
+        for old in keep.glob(f"{name}-*.foz*"):
+            old.unlink()
+        t0 = time.time()
+        r = subprocess.run([sys.executable, "-I", str(tool), "build", str(recipe), str(GAME), str(made)],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not made.is_file():
+            why = (r.stderr.strip().splitlines() or r.stdout.strip().splitlines() or ["no reason given"])[-1]
+            print(f"[stage] no pipeline list: {why[:200]} — the game compiles its shaders as it goes")
+            return
+        print(f"[stage] pipeline list built from the game's shader packs "
+              f"({made.stat().st_size / 2**20:.1f} MB, {time.time() - t0:.0f} s)")
+    (mirror / "klfz").mkdir(parents=True, exist_ok=True)
+    link(made, mirror / "klfz" / f"{name}.foz")
+    n, size = 1, made.stat().st_size
+    info = HERE / "lx" / f"{name}-device-info.json"
+    if info.is_file():
+        shutil.copyfile(info, mirror / "klfz" / "device-info.default.json")
+        n, size = n + 1, size + info.stat().st_size
+    stats["files"] = stats.get("files", 0) + n
+    stats["bytes"] = stats.get("bytes", 0) + size
 
 
 def find_device():
@@ -300,7 +359,7 @@ def main():
         return 1
     # Small things first and one directory per call, so that an interrupted run
     # has finished whole parts and the long one is last.
-    parts = [p for p in ("links.tsv", "xrizer", "sysroot") if (mirror / p).exists()]
+    parts = [p for p in ("links.tsv", "klfz", "xrizer", "sysroot") if (mirror / p).exists()]
     game = mirror / "game"
     if game.is_dir():
         parts += sorted(f"game/{c.name}" for c in game.iterdir() if c.name != "hlvr")

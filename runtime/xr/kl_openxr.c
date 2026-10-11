@@ -51,6 +51,8 @@
 // checkout with no MoltenVK vendored (the stub half of kl_vulkan.c answers
 // "not supported" and the extension is then never advertised).
 #include "kl_vulkan.h"
+#include <pthread.h>
+#include <pthread/qos.h>
 #include "klepton.h"
 
 // ------------------------------------------------------- transcribed from the spec
@@ -2552,7 +2554,23 @@ static void klxr_pitches(float *grip, float *aim) {
     if (!init) {
         init = 1;
         grip_pitch = kl_env_float("KL_XR_GRIP_PITCH", KLXR_GRIP_PITCH_DEFAULT);
-        aim_pitch  = kl_env_float("KL_XR_AIM_PITCH", KLXR_AIM_PITCH_DEFAULT);
+        // The aim ray, per target where it has been MEASURED. With the default the
+        // ray is the frontend's hilt frame, and for a PS VR2 Sense controller held
+        // the way one points a pistol straight ahead that frame points 34 to 40
+        // degrees ABOVE the horizon (KL_XR_AIM_LOG on the device, 2026-10-11: three
+        // holds of several seconds each read +34, +39 and +40). Counter-Strike VR
+        // lays its weapon along the aim pose with no correction of its own, so its
+        // player had to tip the hand forward to shoot level — by "about 45", in
+        // his own estimate. 40 degrees more sits between the readings and that.
+        // Only for this target: Steam Link's pointer and the other aim users were
+        // tuned by eye against the default and have not been asked.
+        float aim_default = KLXR_AIM_PITCH_DEFAULT;
+        {
+            extern const char *kl_driver_target_name(void);
+            const char *t = kl_driver_target_name();
+            if (t && strcmp(t, "cs1") == 0) aim_default = -77.0f;
+        }
+        aim_pitch  = kl_env_float("KL_XR_AIM_PITCH", aim_default);
         fprintf(stderr, "  [xr] controller pose: grip pitched %.1f deg "
                         "(KL_XR_GRIP_PITCH), aim a further %.1f deg "
                         "(KL_XR_AIM_PITCH)\n",
@@ -2712,6 +2730,29 @@ static void klxr_pose_corrections(XrPosef *p, int is_aim, int hand) {
     XrQuaternionf before = p->orientation;
     klxr_pitch_about_x(p, grip_pitch);
     if (is_aim) klxr_pitch_about_x(p, aim_pitch);
+    // KL_XR_AIM_LOG=1: where each hand's aim ray points, once a second, as an
+    // angle above the horizon. The number a per-game aim pitch is read off: have
+    // the person hold the controller the way they would point a pistol straight
+    // ahead, and the elevation printed then is the error to take out.
+    if (is_aim && (hand == 0 || hand == 1)) {
+        static int on = -1;
+        if (on < 0) on = kl_env_on("KL_XR_AIM_LOG", 0);
+        if (on) {
+            static int64_t next[2];
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+            if (now >= next[hand]) {
+                next[hand] = now + 500;
+                XrVector3f f = klxr_qrot(p->orientation, (XrVector3f){ 0.0f, 0.0f, -1.0f });
+                float fy = f.y > 1.0f ? 1.0f : f.y < -1.0f ? -1.0f : f.y;
+                fprintf(stderr, "  [xr] aim %s: ray %+.1f deg above the horizon "
+                                "(grip pitch %.1f, aim pitch %.1f in force)\n",
+                        hand ? "R" : "L", (double)(asinf(fy) * 180.0f / 3.14159265f),
+                        (double)grip_pitch, (double)aim_pitch);
+            }
+        }
+    }
     // Hold the pivot still across whatever the two pitches just did.
     XrVector3f c = pivot;
     if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f) {
@@ -5439,6 +5480,152 @@ static void klxr_pose_trace_report(klxr_session *s) {
     memset(worst_m, 0, sizeof worst_m);
 }
 
+// ---------------------------------------------------------------------------
+// A frame published when the GPU has finished it, not when the guest has
+// (KL_VK_FRAME_ASYNC; default on for Half-Life: Alyx, kl_driver.c).
+//
+// xrEndFrame for a Vulkan guest used to wait for the guest's queue to go idle
+// and then publish (kl_vulkan_frame_done). That wait is on the guest's frame
+// thread, so its next frame could not begin until the GPU was done with this
+// one. Here xrEndFrame only MARKS the queue (kl_vulkan_frame_mark) and hands
+// what it was about to publish to one worker thread, which waits for the mark
+// and publishes in the same order as before: the Vulkan serial first, then the
+// frame's record, its layers and its panels.
+//
+// One frame may be in flight. The next xrEndFrame waits for it before taking
+// its own mark — that is where a GPU-bound guest now waits, one frame later and
+// with its own CPU work already done — and it is also what keeps a guest with a
+// three-image swapchain from drawing into the image a compositor is showing:
+// shown N, in flight N+1, being drawn N+2.
+//
+// A frame the GPU does not finish within a second is published anyway. A
+// picture that may be torn is better than a display that never changes again,
+// and the line says so.
+typedef struct {
+    int                 have_rec;
+    kl_ovrp_render_pose rec;
+    int                 have_pl, npl;
+    kl_ovrp_proj_layer  pl[8];
+    int                 nquads;
+    kl_ovrp_overlay     quads[4];
+    int                 eye_layer;
+} klxr_publication;
+
+static struct {
+    pthread_mutex_t  mu;
+    pthread_cond_t   cv;
+    int              started, busy;
+    klxr_publication next;
+    unsigned long    frames, late;
+    // What the change is for, measured: how long the guest still stood at
+    // xrEndFrame for the frame before, and how long the GPU needed after it.
+    uint64_t         held_ns, gpu_ns, since_ns;
+    unsigned         n;
+} g_defer = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, {0}, 0, 0, 0, 0, 0, 0 };
+
+static uint64_t klxr_defer_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+static void *klxr_defer_thread(void *unused) {
+    (void)unused;
+    pthread_setname_np("Klepton Frame Publish");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    for (;;) {
+        pthread_mutex_lock(&g_defer.mu);
+        while (!g_defer.busy) pthread_cond_wait(&g_defer.cv, &g_defer.mu);
+        klxr_publication p = g_defer.next;
+        pthread_mutex_unlock(&g_defer.mu);
+
+        uint64_t t0 = klxr_defer_now();
+        int done = kl_vulkan_frame_wait(1000);
+        uint64_t gpu = klxr_defer_now() - t0;
+        kl_vulkan_frame_publish();
+        if (p.have_rec) kl_ovrp_frame_end_commit(&p.rec);
+        if (p.have_pl) kl_ovrp_proj_layers_external(p.pl, p.npl);
+        kl_ovrp_overlays_external(p.quads, p.nquads);
+        kl_ovrp_eye_layer_external(p.eye_layer);
+        if (p.eye_layer) kl_interstitial_done();
+
+        pthread_mutex_lock(&g_defer.mu);
+        g_defer.frames++;
+        g_defer.gpu_ns += gpu;
+        if (++g_defer.n >= 300) {
+            uint64_t now = klxr_defer_now();
+            if (g_defer.since_ns)
+                fprintf(stderr, "  [xr] FRAME ASYNC over %u frames: %.1f ms a frame; the GPU "
+                                "finished %.1f ms after xrEndFrame; the guest stood %.1f ms "
+                                "at xrEndFrame for the frame before\n", g_defer.n,
+                        (double)(now - g_defer.since_ns) / 1e6 / g_defer.n,
+                        (double)g_defer.gpu_ns / 1e6 / g_defer.n,
+                        (double)g_defer.held_ns / 1e6 / g_defer.n);
+            g_defer.since_ns = now;
+            g_defer.n = 0; g_defer.gpu_ns = 0; g_defer.held_ns = 0;
+        }
+        if (!done && g_defer.late++ < 8)
+            fprintf(stderr, "  [xr] a frame was published before the GPU reported it "
+                            "finished (no answer within 1 s) — %lu of %lu so far\n",
+                    g_defer.late, g_defer.frames);
+        g_defer.busy = 0;
+        pthread_cond_broadcast(&g_defer.cv);
+        pthread_mutex_unlock(&g_defer.mu);
+    }
+    return NULL;
+}
+
+// Wait for the frame in flight, if there is one.
+static void klxr_defer_drain(void) {
+    pthread_mutex_lock(&g_defer.mu);
+    if (g_defer.busy) {
+        uint64_t t0 = klxr_defer_now();
+        while (g_defer.busy) pthread_cond_wait(&g_defer.cv, &g_defer.mu);
+        g_defer.held_ns += klxr_defer_now() - t0;
+    }
+    pthread_mutex_unlock(&g_defer.mu);
+}
+
+// 1 when this frame is to be published by the worker: the frame before it has
+// been published and the guest's queue carries this frame's mark.
+static int klxr_defer_begin(klxr_publication *pub) {
+    static int on = -1;
+    if (on < 0) {
+        on = kl_env_on("KL_VK_FRAME_ASYNC", 0);
+        if (on) fprintf(stderr, "  [xr] KL_VK_FRAME_ASYNC: frames are published by a worker "
+                                "when the GPU has finished them; xrEndFrame no longer waits\n");
+    }
+    if (!on) return 0;
+    klxr_defer_drain();
+    if (!kl_vulkan_frame_mark()) return 0;
+    memset(pub, 0, sizeof *pub);
+    return 1;
+}
+
+static void klxr_defer_submit(const klxr_publication *pub) {
+    pthread_mutex_lock(&g_defer.mu);
+    if (!g_defer.started) {
+        pthread_t t;
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        g_defer.started = pthread_create(&t, &a, klxr_defer_thread, NULL) == 0;
+        pthread_attr_destroy(&a);
+    }
+    if (g_defer.started) {
+        g_defer.next = *pub;
+        g_defer.busy = 1;
+        pthread_cond_broadcast(&g_defer.cv);
+        pthread_mutex_unlock(&g_defer.mu);
+        return;
+    }
+    pthread_mutex_unlock(&g_defer.mu);
+    // No worker: finish it here, the old way.
+    kl_vulkan_frame_wait(1000);
+    kl_vulkan_frame_publish();
+    if (pub->have_rec) kl_ovrp_frame_end_commit(&pub->rec);
+    if (pub->have_pl) kl_ovrp_proj_layers_external(pub->pl, pub->npl);
+    kl_ovrp_overlays_external(pub->quads, pub->nquads);
+    kl_ovrp_eye_layer_external(pub->eye_layer);
+    if (pub->eye_layer) kl_interstitial_done();
+}
+
 static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // The stall watch's heartbeat (runtime/diag/kl_stall.c; KL_STALL_MS).
     { extern void kl_stall_frame(void); kl_stall_frame(); }
@@ -5792,9 +5979,15 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     //
                     // So the quad is the CHORD of the section: as wide as the
                     // chord, at the chord's plane — which puts both vertical
-                    // edges exactly where the cylinder's are — and as tall as the
-                    // cylinder section (arc length / aspectRatio). Only the bow
-                    // of the middle is lost.
+                    // edges exactly where the cylinder's are. Only the bow of the
+                    // middle is lost.
+                    //
+                    // Its height follows from the chord, not from the arc. The
+                    // layer's aspectRatio is the shape of the PICTURE (arc length
+                    // over height), and a flat panel that is a chord wide and an
+                    // arc-over-aspect tall shows that picture squeezed sideways by
+                    // chord/arc — 10 % for a 90 degree section. CSVR's 4:3 menu
+                    // (radius 12 m, 90 degrees) came out 16.97 x 14.14 m, i.e. 6:5.
                     float r = cyl->radius, half = cyl->centralAngle * 0.5f;
                     if (!(r > 0)) r = 1.0f;
                     if (!(half > 0) || half > 1.5f) half = half > 1.5f ? 1.5f : 0.5f;
@@ -5806,7 +5999,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     qbuf.pose.position.y += off.y;
                     qbuf.pose.position.z += off.z;
                     qbuf.size.width  = w;
-                    qbuf.size.height = cyl->aspectRatio > 0 ? arc / cyl->aspectRatio : arc;
+                    qbuf.size.height = cyl->aspectRatio > 0 ? w / cyl->aspectRatio : arc;
                     q = &qbuf;
                 }
                 klxr_swapchain *sc = klxr_swapchain_of(q->subImage.swapchain);
@@ -6392,8 +6585,24 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // frame was submitted" into "the picture is complete" — the eye MTLTextures
     // are the guest's own images, so nothing of ours is in its submissions and
     // there is no MTLSharedEvent to wait on instead.
-    if (drawn_stage >= 0 && s->gfx == KLXR_GFX_VULKAN)
-        kl_vulkan_frame_done(drawn_stage);
+    //
+    // KL_VK_FRAME_ASYNC: the same completion without the stall. The guest's
+    // queue is marked here and everything this function would publish from
+    // here on is handed, whole, to a worker that publishes it once the GPU has
+    // reached the mark — so the guest's next frame is being built while this
+    // one is still being drawn (klxr_defer_*, above).
+    klxr_publication pub;
+    int defer = 0;
+    if (s->gfx == KLXR_GFX_VULKAN) {
+        if (drawn_stage >= 0) {
+            defer = klxr_defer_begin(&pub);
+            if (!defer) kl_vulkan_frame_done(drawn_stage);
+        } else {
+            // A frame without an eye picture publishes at once, and must not
+            // overtake the one before it.
+            klxr_defer_drain();
+        }
+    }
 
     // ...and this is the VR path's swap. kl_glfb's capture and the frontend
     // seams both hang off eglSwapBuffers, which an OpenXR guest never calls —
@@ -6439,10 +6648,17 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         klxr_pose_note(s, KLXR_POSE_SRC_SUBMIT, sub);
     }
     klxr_pose_trace_report(s);
-    if (drawn_stage >= 0)
-        kl_ovrp_frame_end_external(drawn_stage,
-                                   have_layer_pose ? layer_pose : NULL,
-                                   have_layer_pose ? layer_tan : NULL);
+    if (drawn_stage >= 0) {
+        if (defer)
+            pub.have_rec = kl_ovrp_frame_end_prepare(drawn_stage,
+                                                     have_layer_pose ? layer_pose : NULL,
+                                                     have_layer_pose ? layer_tan : NULL,
+                                                     &pub.rec);
+        else
+            kl_ovrp_frame_end_external(drawn_stage,
+                                       have_layer_pose ? layer_pose : NULL,
+                                       have_layer_pose ? layer_tan : NULL);
+    }
 
     // ...and this frame's PROJECTION layers, in the order the guest submitted
     // them, replaced whole for the same reason the panels below are. Filed only
@@ -6469,7 +6685,13 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         for (int k = 0; k < npl; k++)
             if (pl[k].slot[0] >= 0 || pl[k].slot[1] >= 0) { any_reachable = 1; break; }
         if (npl == 0 || any_reachable) {
-            kl_ovrp_proj_layers_external(pl, npl);
+            if (defer) {
+                pub.have_pl = 1;
+                pub.npl = npl;
+                if (npl > 0) memcpy(pub.pl, pl, (size_t)npl * sizeof *pl);
+            } else {
+                kl_ovrp_proj_layers_external(pl, npl);
+            }
         } else {
             static int said;
             if (!said++)
@@ -6519,6 +6741,13 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // how a guest taking a menu down is expressed. Unconditional rather than
     // guarded on nquads: leaving the previous frame's list standing would keep
     // drawing a layer the guest has stopped submitting.
+    if (defer) {
+        pub.nquads = nquads;
+        if (nquads > 0) memcpy(pub.quads, quads, (size_t)nquads * sizeof *quads);
+        pub.eye_layer = proj_layers > 0;
+        klxr_defer_submit(&pub);
+        return KLXR_SUCCESS;
+    }
     kl_ovrp_overlays_external(quads, nquads);
     // The same statement for the eye, which had no way to be told "not this
     // frame" — see kl_ovrp.h. A guest that alternates between a projection pair

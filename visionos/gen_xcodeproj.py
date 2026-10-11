@@ -100,8 +100,18 @@ ENTITLEMENTS = os.environ.get("KLEPTON_ENTITLEMENTS", "1") != "0"
 #       survive. Do not diagnose a stream problem from its presence alone —
 #       runtime/xr/kl_openxr.c's KL_XR_PROFILE is the A/B for the change that
 #       actually altered what the client publishes.
+#   com.apple.developer.kernel.extended-virtual-addressing (KLEPTON_EVA=0 drops it)
+#       A paid-program capability. Xcode's own capability table (DVTPortal.framework,
+#       DVTPortalCachedPortalCapabilities.json; read in Xcode 27.1 on 2026-10-11) lists
+#       its validTeamTypes as the Developer Program and the Enterprise Program only,
+#       while Increased Memory Limit also names XCODE_FREE_PROGRAM, and Low-Latency
+#       Streaming the Developer Program alone. So a build for a free Personal Team
+#       drops this key and the streaming key and KEEPS the memory limit, which is the
+#       one that stopped the jetsam kills. What a guest loses without it is address
+#       space above the default ceiling, not resident memory.
 OPTIONAL_ENTITLEMENTS = {
     "com.apple.developer.low-latency-streaming": "KLEPTON_LOW_LATENCY",
+    "com.apple.developer.kernel.extended-virtual-addressing": "KLEPTON_EVA",
 }
 ENTITLEMENTS_FILE = "Klepton.entitlements"
 _dropped = [k for k, env in OPTIONAL_ENTITLEMENTS.items()
@@ -321,7 +331,13 @@ SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swif
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
          "KleptonChroma.swift", "KleptonMic.swift",
          "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonGameData.swift",
-         "KleptonAlyx.swift", "KleptonText.swift"]
+         "KleptonAlyx.swift", "KleptonText.swift", "KleptonSteamCloud.swift"]
+# Steam's connection, sign-in and Steam Cloud (SteamCloudKit/README.md: parts of
+# Glovebox's SteamLauncherKit, MIT), compiled into the app's own module. The
+# folder is a Swift package only so that its tests run on a Mac.
+SWIFT += [f"../SteamCloudKit/Sources/SteamCloudKit/{n}.swift" for n in (
+    "CMClient", "Transport", "Messages", "ProtoWire", "KeyValues", "Codec",
+    "SteamAuth", "SteamApps", "SteamCloud", "CloudGame")]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(
@@ -455,7 +471,7 @@ COMMON = f"""
 				// second target needed one. The failure is a link error naming
 				// VTDecompressionSession*, which reads as a missing SDK rather
 				// than as a build setting that was never updated.
-				OTHER_LDFLAGS = "-lz -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface";
+				OTHER_LDFLAGS = "-lz -lc++ -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface";
 				PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID};
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;

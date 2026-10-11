@@ -491,7 +491,83 @@ static const kl_gp_word k_alyx_player_by_userid[] = {
     { 0x1460bc8, 0x540000e0, 0x14000007, "b.eq -> b: the first player is the player" },
 };
 
+// Counter-Strike VR (Team Beef's CSVR 1.0.5, libxash.so) — where the flat HUD
+// sits inside the eye image.
+//
+// In VR game mode the engine shrinks every 2D element that is not full-screen
+// to a quarter and centres it (engine/client/cl_game.c, SPR_AdjustSize):
+//
+//     scale = 0.25;  offset = (1 - scale) / 2;        // 0.375
+//     x = x * scale + iWidth  * offset;   w *= scale;
+//     y = y * scale + iHeight * offset;   h *= scale;
+//
+// There is no cvar for either number and `hud_scale` is forced every frame, so
+// there is nothing to answer from outside. On a Vision Pro the result is a HUD
+// that fills the middle of the view; reported as too large and too high.
+//
+// The function exists once and is inlined at three more places (SPR_DrawGeneric,
+// CL_FillRGBA, CL_FillRGBABlend). Each copy loads the offset ONCE and uses it
+// for both axes, so lowering the HUD needs a third constant, i.e. one more
+// instruction than the copy has. The slot comes from the end of the block: it
+// closes with a `b` over the `scvtf` that the other branch uses to convert the
+// screen size, and converting the same integers a second time changes nothing —
+// so the body moves down one word, the `b` goes, and control falls through.
+//
+// New values: scale 0.1875 (three quarters of the old size), x offset 0.40625
+// (still centred), y offset 0.46875 (centred would be 0.40625; this is 1/16 of
+// the image lower). All three are exact fmov immediates.
+//
+// Untouched on purpose: the copy in CL_DrawLoadingOrPaused (0x115300), which
+// ends in a real backward branch and has no slot — the loading/pause plaque
+// stays centred at the old size — and the crosshair, which the client draws
+// through TriAPI at the projected aim point and never passes through here.
+static const kl_gp_word k_csvr_hud_place[] = {
+    // SPR_AdjustSize (fonts, VGUI)
+    { 0x1139d4, 0x1e2b1002, 0x1e2b5002, "fmov s2, #0.375 -> #0.40625 (x offset)" },
+    { 0x1139dc, 0x1e2a1004, 0x1e291004, "fmov s4, #0.25 -> #0.1875 (scale)" },
+    { 0x1139e8, 0x1e220822, 0x1e2bd002, "+ fmov s2, #0.46875 (y offset)" },
+    { 0x1139ec, 0x1f040ca3, 0x1e220822, "fmul s2, s1, s2 (moved down one)" },
+    { 0x1139f0, 0xbd0002c3, 0x1f040ca3, "fmadd s3, s5, s4, s3" },
+    { 0x1139f4, 0xbd4002a3, 0xbd0002c3, "str s3, [x22]" },
+    { 0x1139f8, 0x1f040862, 0xbd4002a3, "ldr s3, [x21]" },
+    { 0x1139fc, 0xbd0002a2, 0x1f040862, "fmadd s2, s3, s4, s2" },
+    { 0x113a00, 0xbd400282, 0xbd0002a2, "str s2, [x21]" },
+    { 0x113a04, 0x1e240842, 0xbd400282, "ldr s2, [x20]" },
+    { 0x113a08, 0xbd000282, 0x1e240842, "fmul s2, s2, s4" },
+    { 0x113a0c, 0xbd400262, 0xbd000282, "str s2, [x20]" },
+    { 0x113a10, 0x1e240842, 0xbd400262, "ldr s2, [x19]" },
+    { 0x113a14, 0xbd000262, 0x1e240842, "fmul s2, s2, s4" },
+    { 0x113a18, 0x14000003, 0xbd000262, "str s2, [x19]; the b is gone, falls into scvtf s0/s1" },
+    // SPR_DrawGeneric (HUD sprites)
+    { 0x115618, 0x1e2b1002, 0x1e2b5002, "x offset" },
+    { 0x11561c, 0x1e2a1004, 0x1e291004, "scale" },
+    { 0x115628, 0x1e220802, 0x1e2bd002, "+ fmov s2, #0.46875 (y offset)" },
+    { 0x11562c, 0x1e24094a, 0x1e220802, "fmul s2, s0, s2" },
+    { 0x115630, 0x1f040def, 0x1e24094a, "fmul s10, s10, s4" },
+    { 0x115634, 0x1f040908, 0x1f040def, "fmadd s15, s15, s4, s3" },
+    { 0x115638, 0x14000002, 0x1f040908, "fmadd s8, s8, s4, s2; falls into scvtf s0" },
+    // CL_FillRGBA
+    { 0x117b74, 0x1e2b1002, 0x1e2b5002, "x offset" },
+    { 0x117b78, 0x1e2a1004, 0x1e291004, "scale" },
+    { 0x117b84, 0x1e220802, 0x1e2bd002, "+ fmov s2, #0.46875 (y offset)" },
+    { 0x117b88, 0x1e24094a, 0x1e220802, "fmul s2, s0, s2" },
+    { 0x117b8c, 0x1f040d29, 0x1e24094a, "fmul s10, s10, s4" },
+    { 0x117b90, 0x1f04096b, 0x1f040d29, "fmadd s9, s9, s4, s3" },
+    { 0x117b94, 0x14000002, 0x1f04096b, "fmadd s11, s11, s4, s2; falls into scvtf s0" },
+    // CL_FillRGBABlend
+    { 0x119cf4, 0x1e2b1002, 0x1e2b5002, "x offset" },
+    { 0x119cf8, 0x1e2a1004, 0x1e291004, "scale" },
+    { 0x119d04, 0x1e220802, 0x1e2bd002, "+ fmov s2, #0.46875 (y offset)" },
+    { 0x119d08, 0x1e24094a, 0x1e220802, "fmul s2, s0, s2" },
+    { 0x119d0c, 0x1f040d29, 0x1e24094a, "fmul s10, s10, s4" },
+    { 0x119d10, 0x1f04096b, 0x1f040d29, "fmadd s9, s9, s4, s3" },
+    { 0x119d14, 0x14000002, 0x1f04096b, "fmadd s11, s11, s4, s2; falls into scvtf s0" },
+};
+
 static const kl_gp_patch k_patches[] = {
+    { "csvr-hud-smaller-lower", "libxash.so",
+      "the VR HUD is drawn at 3/4 of its size and 1/16 of the image lower",
+      k_csvr_hud_place, sizeof k_csvr_hud_place / sizeof *k_csvr_hud_place },
     { "alyx-player-by-userid", "libclient.so",
       "an event's userid resolves to the single player even when the ids disagree",
       k_alyx_player_by_userid, sizeof k_alyx_player_by_userid / sizeof *k_alyx_player_by_userid },

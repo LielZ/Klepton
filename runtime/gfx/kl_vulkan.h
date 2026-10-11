@@ -165,6 +165,13 @@ void kl_vulkan_capture_layers(void);
 // path (where the wait is on the GPU instead). See the implementation for why
 // this one is a CPU stall and what would remove it.
 void kl_vulkan_frame_done(int stage);
+// The same in three steps, so the wait can happen off the guest's thread (see
+// kl_vulkan.c, KL_VK_FRAME_ASYNC): mark the guest's queue (guest thread; 1 on
+// success), wait for the GPU to reach the mark (any thread; 1 when it has),
+// then advance the serial a compositor reads.
+int  kl_vulkan_frame_mark(void);
+int  kl_vulkan_frame_wait(unsigned ms);
+void kl_vulkan_frame_publish(void);
 unsigned long long kl_vulkan_frame_serial(void);
 
 // How many frames have been presented, and how many were written out. The

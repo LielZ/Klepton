@@ -12,6 +12,8 @@
 #include <sys/ioctl.h>
 #include "kl_va.h"
 #include "klepton.h"
+#include <errno.h>
+#include "../guest/kl_obbmap.h"
 
 // Darwin arm64's va_list is a bare char*, so a marshalled buffer *is* a va_list.
 #define KL_MARSHAL(fmt, va, mode)                                        \
@@ -242,7 +244,19 @@ int klh_open(const char *path, int flags, kl_va *va) {
             }
         }
     }
-    int fd = open(kl_guest_path(path, kp, sizeof kp), kl_open_flags(flags), (int)kl_va_gp(va));
+    const char *gp = kl_guest_path(path, kp, sizeof kp);
+    int fd = open(gp, kl_open_flags(flags), (int)kl_va_gp(va));
+    // The OBB read-through (paks, the synthetic .uproject) was reachable only
+    // through __open_2 / openat — the doors FORTIFY-built UE4 uses. Older UE4
+    // (gnustl era, e.g. Tales from the Galaxy's Edge) calls plain open(), so
+    // stat() said Taco.uproject and the paks existed while open() said ENOENT
+    // and the engine stopped at "Failed to open descriptor file". Consulted
+    // only when the real file is absent, so every open that worked before is
+    // unchanged; kl_obbmap_open is a no-op for paths it does not index.
+    if (fd < 0 && errno == ENOENT) {
+        int vfd = kl_obbmap_open(gp, kl_open_flags(flags));
+        if (vfd >= 0) fd = vfd; else errno = ENOENT;
+    }
     kl_fs_trace_open(path, flags, fd);
     return fd;
 }

@@ -561,6 +561,12 @@ static int recon_run(int view_pump) {
     // Without KL_LIFECYCLE it keeps the boot-only gate it always had.
     if (TARGET->kind == KL_GUEST_GLES3JNI && getenv("KL_LIFECYCLE"))
         return native_door_run(view_pump);
+    // ...and so does an SDL2 guest (Counter-Strike VR): nativeRunMain is its
+    // whole engine on a thread of its own, and the Unity frame loop below ends
+    // at once for a guest with no nativeRender — the process then reported and
+    // left while the engine was still opening its files.
+    if (TARGET->kind == KL_GUEST_SDL2 && getenv("KL_LIFECYCLE"))
+        return native_door_run(view_pump);
 
     if (kl_driver_boot(stdout) != 0) return fail(kl_driver_error());
 

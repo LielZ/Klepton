@@ -115,6 +115,25 @@ static void kl_driver_env_defaults(const kl_target *t) {
         setenv("KL_XASH_CVARS",
                "vr_smoothturn 1; vr_turn_angle 5; vr_height_adjust -1.5", 0);
     }
+    else if (!strcmp(t->name, "cs1")) {
+        // Counter-Strike VR (CSVR) with PlayStation VR2 Sense controllers: the
+        // game puts duck on A and jump on B, which on a Sense pair is cross for
+        // duck and circle for jump — the wrong way round for anyone used to a
+        // PlayStation pad, and what its first player here asked to have swapped.
+        // Written to userconfig.cfg at each start (see hl1 above), so the two
+        // buttons cannot be remapped in the game's own controls page while this
+        // is in force; KL_XASH_CVARS="" in the environment switches it off.
+        //
+        // vr_motion_activation 0: "use" follows the weapon. The game's default (3) makes the
+        // moment "use" is held – or the left arm is stretched – a hand pointer: the direction
+        // sent to the server is no longer the gun's but the line from the head through the
+        // left hand, and letting the arm come back sends "-use" even with the trigger held.
+        // Defusing needs "use" to keep hitting the bomb for seconds; reported from the
+        // headset as starting and breaking off at once, which is the first half second
+        // (still the gun's direction) followed by a hand that points elsewhere. With 0 the
+        // player aims the gun at the bomb, the door or the hostage and holds the trigger.
+        setenv("KL_XASH_CVARS", "vr_button_a \"+jump\"; vr_button_b \"+duck\"; vr_motion_activation 0", 0);
+    }
     else if (!strcmp(t->name, "alyx")) {
         // Half-Life: Alyx. The eye texture the display is offered at decides how
         // large the engine's render targets are ALLOCATED — it rounds the offer
@@ -162,6 +181,28 @@ static void kl_driver_env_defaults(const kl_target *t) {
         // device, the stalls a player meets on entering a new place. Compiled
         // behind the frame instead (kl_vulkan.c, KL_VK_ASYNC_PIPES).
         setenv("KL_VK_ASYNC_PIPES", "1", 0);
+        // The frame is published when the GPU has finished it rather than the
+        // guest waiting for that at xrEndFrame (kl_openxr.c, klxr_defer_*): the
+        // engine builds its next frame while this one is drawn.
+        setenv("KL_VK_FRAME_ASYNC", "1", 0);
+        // Better than behind the frame: compiled before the game starts. The
+        // system's Metal cache keeps what it has compiled, so every pipeline in
+        // a list that came with the game (Documents/klfz/*.foz, built on the
+        // Mac from the player's own shader files — tools/alyx_pipelines.py) is
+        // compiled while the start window is still up (kl_fossilize.cpp, and
+        // prepare_graphics in the app), and the game then finds it there in a
+        // few milliseconds. What the game asks for beyond the list is recorded
+        // beside it and is in the next start's. Only where the app has named
+        // the folder: a run on the host has no such place.
+        if (getenv("KL_VK_FOZ_DIR")) {
+            setenv("KL_VK_FOZ_REPLAY", "auto", 0);
+            setenv("KL_VK_FOZ_REPLAY_BLOCK", "1", 0);
+            setenv("KL_VK_FOZ_THREADS", "6", 0);
+            setenv("KL_VK_FOZ_RECORD", "auto", 0);
+            setenv("KL_VK_DEVICE_INFO", "auto", 0);
+            // The game's device, not the one xrizer opens its session with.
+            setenv("KL_VK_FOZ_APP", "Source2", 0);
+        }
     }
     else if (!strcmp(t->name, "wrath2")) {
         // wrath2's world never appears because the GAME thread grinds through FMOD

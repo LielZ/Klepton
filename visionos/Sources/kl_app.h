@@ -109,6 +109,12 @@ void kl_app_guest_stop(void);
 // yet), 1 = running frames, -1 = _begin failed or the loop has ended; in the
 // last case kl_app_status() says why.
 int  kl_app_guest_state(void);
+// Before the app ends itself on being backgrounded: ask a guest that has a quit
+// of its own to take it. 1 means a request went out and the guest should be
+// given a moment — it ends the process itself when it is done.
+int  kl_app_guest_request_quit(void);
+// ...and whether it has: its main has returned.
+int  kl_app_guest_quit_done(void);
 
 // Which guest this app was built for, and whether it is the Steam Link one.
 //
@@ -173,5 +179,10 @@ const char *kl_app_log_path(void);
 
 // Human-readable status of the last call, for the UI. Never NULL.
 const char *kl_app_status(void);
+
+// While kl_app_boot is compiling a pipeline list ahead of the game ("preparing
+// graphics"): returns 1 and how many pipelines are done of how many. 0 at any
+// other time.
+int kl_app_prepare_progress(unsigned *done, unsigned *total);
 
 #endif

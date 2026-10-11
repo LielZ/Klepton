@@ -71,7 +71,9 @@ TARGETS = {
         # libunity -> the Android lifecycle; "steamlink" is kl_slink's doors.
         "kind":    "unity",
         "product": "Klepton",
-        "display": "Beat Saber",
+        # The version is in the name of the OLD builds: 1.40 is the one players
+        # install, and on the Home Screen it is simply the game.
+        "display": "Beat Saber 1.6",
         # See beatsaber128.
         "hand_matting": False,
     },
@@ -92,7 +94,7 @@ TARGETS = {
         "entry":   "libmain",
         "kind":    "unity",
         "product": "Klepton",
-        "display": "Beat Saber 1.40",
+        "display": "Beat Saber",
         # See beatsaber128.
         "hand_matting": False,
         # The in-app data panel (KleptonGameData.swift): the OBB's file name,

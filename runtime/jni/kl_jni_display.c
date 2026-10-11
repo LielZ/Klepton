@@ -309,6 +309,12 @@ const klj_binding klj_bind_display[] = {
     {"com/unity3d/player/UnityPermissions", "requestUserPermissions",
      "(Lcom.unity3d.player.UnityPlayerActivity;[Ljava/lang/String;Lcom.unity3d.player.IPermissionRequestCallbacks;)V",
                                                  klj_UnityPermissions_requestUserPermissions},
+    // ...and the spelling Unity's reflection asks with when the callback is a
+    // ReflectionHelper proxy: its class is only known as Object (HARD BULLET's
+    // LCK plugin requesting RECORD_AUDIO from the main menu).
+    {"com/unity3d/player/UnityPermissions", "requestUserPermissions",
+     "(Lcom.unity3d.player.UnityPlayerActivity;[Ljava/lang/String;Ljava/lang/Object;)V",
+                                                 klj_UnityPermissions_requestUserPermissions},
 
     // ---- display, window and orientation ----
     {"android/hardware/display/DisplayManager", "getDisplay",

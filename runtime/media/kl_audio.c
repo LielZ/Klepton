@@ -26,6 +26,8 @@
 
 #include "klepton.h"
 #include "kl_audio.h"
+#include "kl_env.h"
+#include "guest/kl_driver.h"
 
 #define KL_AUDIO_MAX_CH 2
 
@@ -771,6 +773,24 @@ size_t kl_audio_write(const void *pcm, size_t bytes) {
 
 int kl_audio_peak(void) { return g_peak; }
 
+// Whether a MIXING writer lets go of g_wlock while it waits for room. Holding
+// it across the 2 ms naps serialises the sources: each one's wait for ITS
+// cursor blocks every other source's write for a whole buffer period. Pistol
+// Whip runs Unity's own OpenSL player (near-silent) beside Wwise's AAudio
+// stream (all of the game's sound): Wwise got in only between Unity's writes,
+// fell behind the reader, was resynced over and over, and delivered ~25% of
+// real time — garbled, stuttering audio. Every ring write still happens under
+// the lock; only the nap is outside it. Per target until the other two-source
+// titles have been re-measured; KL_AUDIO_MIX_UNLOCK=1/0 forces it.
+static int mix_unlock(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_AUDIO_MIX_UNLOCK", t && strcmp(t, "x2104963472963790") == 0);
+    }
+    return v;
+}
+
 size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
     if (!g_open || !pcm || !bytes) return 0;
     unsigned in_frame = g_in_ch * 2;              // 16-bit, checked at open
@@ -814,6 +834,20 @@ size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
     // which is paced by this call — stalled. The equivalence was argued rather
     // than constructed; this constructs it.
     int mixing = g_src_n > 1;
+    // conv points into the SHARED convert() scratch; a writer that releases the
+    // lock while it waits must not let another source's convert() overwrite it.
+    const int unlocked_wait = mixing && mix_unlock();
+    if (unlocked_wait) {
+        static __thread float *t_conv;
+        static __thread size_t t_conv_frames;
+        if (frames > t_conv_frames) {
+            float *p = realloc(t_conv, frames * g_out_ch * sizeof(float));
+            if (!p) { pthread_mutex_unlock(&g_wlock); return 0; }
+            t_conv = p; t_conv_frames = frames;
+        }
+        memcpy(t_conv, conv, frames * g_out_ch * sizeof(float));
+        conv = t_conv;
+    }
     uint64_t r0 = atomic_load_explicit(&g_r, memory_order_acquire);
     uint64_t pos;
     if (!mixing) {
@@ -880,8 +914,17 @@ size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
         if (!g_playing || g_interrupted) break;
         watchdog();
         if (now_ns() > deadline) { g_short_writes++; break; }
-        nap_ms(2);
+        if (unlocked_wait) {
+            pthread_mutex_unlock(&g_wlock);
+            nap_ms(2);
+            pthread_mutex_lock(&g_wlock);
+        } else {
+            nap_ms(2);
+        }
     }
+    // Slots shift when a source is released, which can happen during an
+    // unlocked wait: find ours again by key.
+    if (unlocked_wait) slot = src_slot(src);
     g_src_pos[slot] = pos + written < r0 ? r0 : pos + written;
     // A source that appears LATE must not inherit a cursor from the
     // single-source era: the moment a second one registers, both are resynced

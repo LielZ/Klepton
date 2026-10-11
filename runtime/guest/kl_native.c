@@ -18,6 +18,7 @@
 #include "kl_egl.h"
 #include "kl_openxr.h"
 #include "kl_opensl.h"
+#include "kl_xashservers.h"
 
 static char      g_libdir[1200];
 static char      g_engine_lib[256];   // e.g. "libmiamivr.so"
@@ -370,6 +371,10 @@ void kl_engine_setenv(const char *libdir, const char *entry_lib, FILE *out) {
         setenv("XASH3D_GAMEDIR",    gamedir, 1);
         setenv("XASH3D_ENGLIBDIR",  libdir, 1);
         setenv("XASH3D_GAMELIBDIR", libdir, 1);
+        // The player's own servers (favourites, admin access, the menus that use it) – before the
+        // userconfig is written, because the admin access adds a setting to it. See kl_xashservers.c.
+        extern const char *kl_jni_assets_dir(void);
+        kl_xash_servers_prepare(base, gamedir, kl_jni_assets_dir(), out);
         // Env-tunable cvars → userconfig.cfg, so knobs like vr_height_adjust can be
         // retuned between launches with no restage (see kl_xash_write_userconfig).
         kl_xash_write_userconfig(base, out);

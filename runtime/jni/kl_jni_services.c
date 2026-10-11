@@ -219,9 +219,12 @@ static klj_val klj_UnityPlayer_getNetworkConnectivity(void *env, void *self,
 // ClassNotFoundException and the C# catches it, which is how "close Sentry if
 // the Android SDK is present" is written.
 //
-// We cannot reproduce that, and the reason is a settled design decision rather
-// than an oversight: FindClass here never fails (it interns any name) and the
-// exception state is always clear, so a guest cannot discover that a class is
+// We do not reproduce that in general, and the reason is a design decision
+// rather than an oversight: FindClass here interns any name. (It can fail
+// since 2026-10-11 — there is a pending exception per thread, and
+// klj_class_absent in kl_jni.c names the classes an APK is known not to ship,
+// one title so far — but nothing here knows an APK's class list.) So a guest
+// usually cannot discover that a class is
 // absent. That is right for the Android framework, every class of which we
 // implement — and it is exactly wrong for an application's OPTIONAL dependency,
 // where the absence IS the answer. The failure it produces is an abort on a
@@ -232,7 +235,7 @@ static klj_val klj_UnityPlayer_getNetworkConnectivity(void *env, void *self,
 // and Sentry is crash TELEMETRY — "closed, sending nothing" is the state we
 // want to be in and the one we are actually in.
 //
-// Deliberately only close(). If this guest ever calls Sentry.init or
+// Deliberately only close() (and isEnabled(), below). If this guest ever calls Sentry.init or
 // captureException it should stop by name and be decided on then, because
 // those are a translated guest phoning home about a machine it is not running
 // on, which is not ours to answer for.
@@ -243,6 +246,21 @@ static klj_val klj_Sentry_close(void *env, void *self, const klj_val *a, int n) 
         KLJ_LOG("io/sentry/Sentry.close() — this APK ships no Sentry SDK, so "
                 "there is nothing initialised to close");
     return (klj_val){0};
+}
+
+// isEnabled() is the one query a guest can make of that state, and it has a
+// true answer: the Java SDK is never initialised here (SentryBridgeJava.init
+// is a no-op, see kl_jni_ue4.c), so it is not enabled — the same answer a
+// device gives before init. Skydance's BEHEMOTH (x5767635983306831, UE5) ships
+// the SDK, never calls io.sentry.Sentry.init itself (its Unreal bridge's init
+// is the no-op named above), and asks this right after its first composited
+// frame; it aborted here (fix 21, sent in by a user, 2026-10-11).
+static klj_val klj_Sentry_isEnabled(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("io/sentry/Sentry.isEnabled() -> false (never initialised here)");
+    return (klj_val){.j = 0};
 }
 
 // ---- Virtuix Omni: a treadmill bridge with no treadmill app to bind ----
@@ -1224,6 +1242,79 @@ static klj_val klj_File_getParent(void *env, void *self, const klj_val *a, int n
     parent[len] = '\0';
     return (klj_val){.l = kl_jni_new_string(parent)};
 }
+// new File(parent, child) / File(path) / File(parentPath, child). Java creates
+// nothing on disk here, so neither does this — unlike klj_new_file, which is for
+// the directories the platform hands out and makes them exist. A null or empty
+// parent leaves the child as given, as Java's does.
+static void *klj_File_make(const char *parent, const char *child) {
+    char path[1024];
+    if (parent && *parent && child)
+        snprintf(path, sizeof path, "%s%s%s", parent,
+                 parent[strlen(parent) - 1] == '/' ? "" : "/", child);
+    else
+        snprintf(path, sizeof path, "%s", child ? child : (parent ? parent : ""));
+    void *obj = kl_jni_new_object("java/io/File");
+    klj_as_object(obj)->data = strdup(path);
+    return klj_own(obj, free);       // a guest makes these as it goes; the path goes with the object
+}
+static klj_val klj_File_init_file_str(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    klj_object *p = n > 0 ? klj_as_object(a[0].l) : NULL;
+    return (klj_val){.l = klj_File_make(p ? p->data : NULL, n > 1 ? klj_str(a[1].l) : NULL)};
+}
+static klj_val klj_File_init_str(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    return (klj_val){.l = klj_File_make(NULL, n > 0 ? klj_str(a[0].l) : NULL)};
+}
+static klj_val klj_File_init_str_str(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    return (klj_val){.l = klj_File_make(n > 0 ? klj_str(a[0].l) : NULL,
+                                        n > 1 ? klj_str(a[1].l) : NULL)};
+}
+// The java.io.File predicates, answered from the real filesystem through the
+// same guest-path mapping every libc call uses (the payload may be the short
+// /sdcard spelling). Meta's Avatar SDK (BRINK Traveler) probes canRead during
+// its init. A File with no path answers false, as Java's does for "".
+static int klj_File_access(void *self, int mode, int want_dir) {
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data || !*(const char *)o->data) return 0;
+    char kp[1024];
+    const char *p = kl_guest_path(o->data, kp, sizeof kp);
+    if (want_dir) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }
+    return access(p, mode) == 0;
+}
+static klj_val klj_File_exists(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n; return (klj_val){.j = klj_File_access(self, F_OK, 0)};
+}
+static klj_val klj_File_canRead(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n; return (klj_val){.j = klj_File_access(self, R_OK, 0)};
+}
+static klj_val klj_File_canWrite(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n; return (klj_val){.j = klj_File_access(self, W_OK, 0)};
+}
+static klj_val klj_File_isDirectory(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n; return (klj_val){.j = klj_File_access(self, 0, 1)};
+}
+// mkdirs()/mkdir(): Java's contract is "true only if this call created it" —
+// false for a directory that was already there.
+static klj_val klj_File_mkdirs(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data || !*(const char *)o->data) return (klj_val){.j = 0};
+    char kp[1024];
+    const char *p = kl_guest_path(o->data, kp, sizeof kp);
+    struct stat st;
+    if (stat(p, &st) == 0) return (klj_val){.j = 0};
+    klj_mkdir_p(p);
+    return (klj_val){.j = stat(p, &st) == 0 && S_ISDIR(st.st_mode)};
+}
+static klj_val klj_File_mkdir(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data || !*(const char *)o->data) return (klj_val){.j = 0};
+    char kp[1024];
+    return (klj_val){.j = mkdir(kl_guest_path(o->data, kp, sizeof kp), 0755) == 0};
+}
 
 // getExternalFilesDir(type): type selects a subdirectory ("music", "pictures"),
 // and null means the root — which is what Unity passes.
@@ -1379,8 +1470,8 @@ static klj_val klj_Environment_getExternalStorageDirectory(void *env, void *self
 // without this call is for AskForManageStoragePermission() to THROW, which is
 // how the guest recognises a device with no all-files-access settings screen
 // (`m_FolderPermissionOverride = true`). Serving that arm means an
-// ActivityNotFoundException we cannot raise — our JNI has no exception state
-// (klj_ExceptionCheck is 0 forever) — plus Uri.fromParts, an
+// ActivityNotFoundException — which could be raised since klj_raise exists
+// (kl_jni.c), and was not when this was written — plus Uri.fromParts, an
 // Intent(String, Uri) constructor, addCategory and startActivity, i.e. four
 // fabricated answers about a Settings activity that does not exist here.
 // Answering the question we CAN answer truthfully forces none of them.
@@ -1890,6 +1981,7 @@ const klj_binding klj_bind_services[] = {
     {"com/unity3d/player/UnityPlayer", "getNetworkConnectivity", "()I",
      klj_UnityPlayer_getNetworkConnectivity},
     {"io/sentry/Sentry", "close", "()V", klj_Sentry_close},
+    {"io/sentry/Sentry", "isEnabled", "()Z", klj_Sentry_isEnabled},
     {"com/virtuix/omniconnectshared/OmniConnectSharedAndroid", "start",
      "(Lcom/unity3d/player/UnityPlayerActivity;)V", klj_Omni_start},
     {"com/unity3d/player/JavaBroadcastReceiver", "setReceiver",
@@ -1996,6 +2088,10 @@ const klj_binding klj_bind_services[] = {
      klj_ActivityThread_current},
     {"android/app/ActivityThread", "getApplication", "()Landroid/app/Application;",
      klj_ActivityThread_getApplication},
+    // The static shortcut to the same Application — Meta's Avatar SDK
+    // (libovravatar2, BRINK Traveler) asks this way right after its JNI_OnLoad.
+    {"android/app/ActivityThread", "currentApplication", "()Landroid/app/Application;",
+     klj_ActivityThread_getApplication},
     {"android/app/ActivityThread", "getTopResumedActivity", "()Landroid/app/Activity;",
      klj_ActivityThread_getTopResumedActivity},
     // AC Nexus's UbiServices SDK, offline. Accept the Activity injection, then
@@ -2024,8 +2120,18 @@ const klj_binding klj_bind_services[] = {
     {"android/os/Environment", "isExternalStorageManager", "()Z", klj_Environment_isExternalStorageManager},
     {"java/io/File", "getAbsolutePath", "()Ljava/lang/String;", klj_File_getPath},
     {"java/io/File", "getPath",         "()Ljava/lang/String;", klj_File_getPath},
+    {"java/io/File", "toString",        "()Ljava/lang/String;", klj_File_getPath},   // Java: == getPath()
     {"java/io/File", "getCanonicalPath","()Ljava/lang/String;", klj_File_getPath},
     {"java/io/File", "getParent",       "()Ljava/lang/String;", klj_File_getParent},
+    {"java/io/File", "<init>", "(Ljava/io/File;Ljava/lang/String;)V",   klj_File_init_file_str},
+    {"java/io/File", "<init>", "(Ljava/lang/String;)V",                 klj_File_init_str},
+    {"java/io/File", "<init>", "(Ljava/lang/String;Ljava/lang/String;)V", klj_File_init_str_str},
+    {"java/io/File", "exists",          "()Z",                  klj_File_exists},
+    {"java/io/File", "canRead",         "()Z",                  klj_File_canRead},
+    {"java/io/File", "canWrite",        "()Z",                  klj_File_canWrite},
+    {"java/io/File", "isDirectory",     "()Z",                  klj_File_isDirectory},
+    {"java/io/File", "mkdirs",          "()Z",                  klj_File_mkdirs},
+    {"java/io/File", "mkdir",           "()Z",                  klj_File_mkdir},
     {"android/content/res/AssetManager", "open", "(Ljava/lang/String;)Ljava/io/InputStream;", klj_AssetManager_open},
     {"com/unity3d/player/UnityPlayer", "initializeGoogleAr", "()Z", klj_UnityPlayer_initializeGoogleAr},
     {"com/unity/oculus/OculusUnity", "getIsOnOculusHardware", "()Z",

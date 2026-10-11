@@ -88,6 +88,7 @@ int getentropy(void *buffer, size_t size);
 #include "kl_aaudio.h"
 #include "kl_vulkan.h"
 #include "kl_ovrp.h"
+#include "kl_target.h"   // kl_guest_kind, for the ovrp_ tier of kl_shim_lookup
 #include "kl_ovrplat.h"
 #include "kl_jni.h"
 
@@ -486,6 +487,15 @@ static int kl_getaddrinfo(const char *node, const char *serv,
     if (kl_net_trace())
         fprintf(stderr, "  [net] getaddrinfo(\"%s\",\"%s\") -> %d\n",
                 node ? node : "(null)", serv ? serv : "", r);
+    // A Xash3D guest whose master servers no longer exist never asks for servers at all; with a stand-in
+    // address it does, and the player's own servers answer (runtime/guest/kl_xashservers.c).
+    extern const char *kl_xash_servers_master_standin(const char *);
+    const char *standin = r != 0 ? kl_xash_servers_master_standin(node) : NULL;
+    if (standin) {
+        r = getaddrinfo(standin, serv, hints, &hres);
+        if (kl_net_trace())
+            fprintf(stderr, "  [net] getaddrinfo(\"%s\") stands in for it -> %d\n", standin, r);
+    }
     // bionic and Darwin share the addrinfo layout (canonname before addr —
     // proven by the Ping callsite, which reads ai_addr at +0x20); only the
     // sockaddr inside differs (Darwin's sa_len). Convert each in place and
@@ -1276,7 +1286,16 @@ static ssize_t kl_sendto(int fd, const void *buf, size_t n, int flags,
     }
     int nosig = 0, dflags = kl_msg_flags(flags, &nosig);
     if (nosig) kl_no_sigpipe(fd);
-    ssize_t r = sendto(fd, buf, n, dflags, sa, len);
+    // A Xash3D guest's rcon request to one of the player's own servers leaves with that server's admin
+    // password in place of the guest's placeholder (runtime/guest/kl_xashservers.c). Nothing else is touched.
+    extern size_t kl_xash_rcon_rewrite(const void *, size_t, const struct sockaddr *, char *, size_t);
+    char rcon[1400];
+    size_t rn = sa ? kl_xash_rcon_rewrite(buf, n, sa, rcon, sizeof rcon) : 0;
+    ssize_t r = sendto(fd, rn ? (const void *)rcon : buf, rn ? rn : n, dflags, sa, len);
+    if (rn && r == (ssize_t)rn) r = (ssize_t)n;      // the guest sent its n bytes
+    // ...and its query for servers also asks the player's own (same file).
+    extern void kl_xash_servers_on_query(int, const void *, size_t, const struct sockaddr *, socklen_t);
+    if (sa && !rn) { int e = errno; kl_xash_servers_on_query(fd, buf, n, sa, len); errno = e; }
     if (r < 0 && errno == EISCONN && sa)
         r = kl_sendto_connected(fd, buf, n, dflags, sa);
     // ...and again, one host at a time, where the platform may have dropped it.
@@ -1921,7 +1940,7 @@ X(klb___read_chk) X(klb___vsprintf_chk)
 X(klv___sprintf_chk) X(klv___snprintf_chk) X(klv_swprintf) X(kl_vswprintf_g)
 X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk) X(klb_pread64) X(klb_pwrite64)
 X(klb___strncat_chk) X(klb_ftruncate64) X(klb___fwrite_chk)
-X(klb_fopen64) X(klb_fseeko64) X(klb_ftello64) X(klb_exit) X(klb__exit) X(klb_chdir) X(klb_getcwd) X(klb_realpath)
+X(klb_fopen64) X(klb_fseeko64) X(klb_ftello64) X(klb_exit) X(klb__exit) X(klb_creat) X(klb_chdir) X(klb_getcwd) X(klb_realpath)
 X(klb_sincosf) X(klb_sincos) X(klb_putchar) X(klb_getchar) X(klb_fdatasync)
 X(klb___cmsg_nxthdr) X(klb___cxa_thread_atexit_impl)
 X(klb_fileno) X(klb_fgetc) X(klb_ungetc) X(klb_getwc) X(klb_fgetwc)
@@ -2273,6 +2292,10 @@ static const kl_entry g_shim[] = {
     // called, because a guest that exits during startup leaves a log with
     // nothing in it and a driver that can only report "no signal".
     E("exit", klb_exit), E("_exit", klb__exit),
+    // CSVR 1.0.5 (Counter-Strike VR): what its SDL2 and its server library import
+    // beyond the above. Wide strings are 32-bit on both sides, so they forward.
+    E("_Exit", klb__exit), E("creat", klb_creat),
+    E("wcslcat", wcslcat), E("wcslcpy", wcslcpy), E("wcsncasecmp", wcsncasecmp), E("wcsstr", wcsstr),
     // ...and the fifth path door, which decides where an id Tech 3 guest
     // thinks its whole installation is.
     E("chdir", klb_chdir),
@@ -2576,8 +2599,25 @@ void *kl_shim_lookup(const char *name) {
     //
     // `ovrp_` is OVRPlugin's prefix and a different library (kl_ovrp), so the
     // fourth character is checked: `ovr_` and `ovrID` are the platform's, and
-    // `ovrp_` must not be claimed here.
+    // `ovrp_` is not claimed by this tier.
     if (!strncmp(name, "ovr_", 4) || !strncmp(name, "ovrID", 5))
         return kl_ovrplat_sym(name);
+
+    // Tier 12: OVRPlugin as an ELF import. Newer Unreal dlopens libOVRPlugin.so
+    // and dlsyms it (kl_dl.c -> kl_ovrp_sym), but older Unreal (the gnustl era:
+    // Tales from the Galaxy's Edge, fix 16, 2026-10-11) has libOVRPlugin in
+    // libUE4's DT_NEEDED and binds its ovrp_* calls at RELOCATION time, so
+    // without this tier they were all unresolved and the first one
+    // (ovrp_PreInitialize3) aborted. Same answers dlsym gives.
+    //
+    // For Unreal guests only. kl_ovrp_sym answers a name it does not know with
+    // a stub that stops the run when CALLED, and this lookup also serves weak
+    // imports and dlsym(RTLD_DEFAULT): a guest that probes for an ovrp_ entry
+    // and would have taken "not there" for an answer gets that stub instead.
+    // Unity guests reach OVRPlugin by dlsym and were brought up without this.
+    if (!strncmp(name, "ovrp_", 5)) {
+        extern kl_guest_kind kl_driver_kind(void);
+        if (kl_driver_kind() == KL_GUEST_UE4) return kl_ovrp_sym(name);
+    }
     return NULL;
 }

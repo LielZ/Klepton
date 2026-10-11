@@ -140,6 +140,25 @@ enum Lifecycle {
         // a guest whose threads are still live, and one of those blocking would
         // turn a clean exit into a watchdog kill with a truncated log.
         fflush(nil)
+        // A guest with a quit of its own gets to take it first: its shutdown is
+        // where an engine saves the player's settings, and it ends the process
+        // itself when it is through. Bounded — a guest that does not finish in
+        // time is ended as before.
+        if kl_app_guest_request_quit() != 0 {
+            NSLog("[app] asked the guest to quit; giving it up to 2.5 s to save and leave")
+            fflush(nil)
+            // Its main returning is the end of its shutdown (Xash returns from
+            // SDL_main rather than calling exit), so that is the cue to go.
+            var waited = 0.0
+            while waited < 2.5 && kl_app_guest_quit_done() == 0 {
+                Thread.sleep(forTimeInterval: 0.05)
+                waited += 0.05
+            }
+            NSLog(kl_app_guest_quit_done() != 0
+                  ? "[app] the guest finished its shutdown after \(Int(waited * 1000)) ms — exiting"
+                  : "[app] the guest did not finish in time — exiting")
+            fflush(nil)
+        }
         exit(0)
     }
 }
@@ -265,6 +284,11 @@ final class KbState: ObservableObject {
 // (kl_mono_commit_text for characters, KEYCODE_DEL for backspace, KEYCODE_ENTER on
 // submit). Dismissing it puts the keyboard away.
 struct KeyboardEntryView: View {
+    private static func backspace(_ n: Int) {
+        for _ in 0..<n {
+            let c = kl_mono_keycode_for_char(8); kl_mono_key(1, c); kl_mono_key(0, c)
+        }
+    }
     @State private var text = ""
     @FocusState private var focused: Bool
     @Environment(\.dismissWindow) private var dismissWindow
@@ -273,7 +297,8 @@ struct KeyboardEntryView: View {
     var body: some View {
         VStack(spacing: 14) {
             Text("Game text entry").font(.headline)
-            Text("Type here — it goes straight to the game. Tap Done when finished.")
+            Text(klT("Type here — it goes straight to the game. “Send” presses Enter for you; a name box in a menu only needs “Close”.",
+                     "Hier tippen – es geht direkt ans Spiel. „Abschicken“ drückt die Eingabetaste für dich; ein Namensfeld in einem Menü braucht nur „Schließen“."))
                 .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
             TextField("", text: $text)
                 .focused($focused)
@@ -291,7 +316,27 @@ struct KeyboardEntryView: View {
                 .onSubmit {
                     let c = kl_mono_keycode_for_char(10); kl_mono_key(1, c); kl_mono_key(0, c)  // Enter
                 }
-            Button("Done") { dismissWindow(id: "kbentry") }
+            // What is already in the game's field was not typed here, so this
+            // field starts empty and its delete key has nothing to remove: a name
+            // box that opens with "Player" in it could only be added to. These two
+            // send the game's own backspace, whatever this field holds.
+            HStack(spacing: 12) {
+                // With text in this field its own change handler sends the backspace.
+                Button(klT("Delete one", "Ein Zeichen löschen")) {
+                    if text.isEmpty { Self.backspace(1) } else { text.removeLast() }
+                }
+                Button(klT("Clear the game's field", "Feld im Spiel leeren")) { Self.backspace(64); text = "" }
+            }
+            // A game that reads a line – a chat message, a value for a setting – acts on it only when the Enter
+            // key arrives; closing this window is not that. The field's own Return key sends it too, but with a
+            // virtual keyboard that key is easy to miss, so here it is as a button that also closes the window.
+            HStack(spacing: 12) {
+                Button(klT("Send (Enter)", "Abschicken (Eingabetaste)")) {
+                    let c = kl_mono_keycode_for_char(10); kl_mono_key(1, c); kl_mono_key(0, c)
+                    dismissWindow(id: "kbentry")
+                }
+                Button(klT("Close", "Schließen")) { dismissWindow(id: "kbentry") }
+            }
         }
         .padding(28)
         .frame(minWidth: 480)
@@ -310,6 +355,10 @@ struct PlayerSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
+            // Alyx has its own page for the picture (AlyxPanel), with one choice
+            // where this has two dials; both at once were two places to set the
+            // same thing. These two stay reachable under Advanced.
+            if !klIsAlyx() {
             GroupBox(klT("Picture", "Bild")) {
                 VStack(alignment: .leading, spacing: 10) {
                     Toggle(klT("Foveated rendering", "Foveated Rendering"), isOn: $rendering.foveation)
@@ -327,6 +376,7 @@ struct PlayerSettingsView: View {
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+            }
             }
             // Alyx hides the player's arms whatever this says (see
             // KleptonChroma.upperLimbVisibility), so the switch would be a lie there.
@@ -382,6 +432,12 @@ struct BootView: View {
     @State private var finished = false
     @State private var succeeded = false
     @State private var openedSpace = false
+    /// "Preparing graphics" (kl_app_prepare_progress): pipelines compiled of
+    /// pipelines to compile, while a start is doing that; a total of 0 otherwise.
+    @State private var prepDone = 0
+    @State private var prepTotal = 0
+    @State private var prepTimer: Timer?
+    @ObservedObject private var steamCloud = KLSteamCloud.shared
     /// The guest's data is not in the container yet: show the data panel
     /// instead of booting into Unity's "not enough storage" three layers up.
     @State private var needsData = false
@@ -602,6 +658,22 @@ struct BootView: View {
                     .controlSize(.extraLarge)
                     if running { ProgressView() }
                 }
+                KLSteamCloudStatus()
+                if running, steamCloud.syncing {
+                    Text(klT("Bringing your saves in step with Steam Cloud …",
+                             "Spielstände werden mit der Steam Cloud abgeglichen …"))
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                if running, prepTotal > 0 {
+                    VStack(spacing: 6) {
+                        ProgressView(value: Double(min(prepDone, prepTotal)), total: Double(prepTotal))
+                            .frame(maxWidth: 420)
+                        Text(klT("Preparing graphics: \(prepDone) of \(prepTotal). This takes a few minutes the first time and a few seconds after that; the game then starts by itself.",
+                                 "Grafik wird vorbereitet: \(prepDone) von \(prepTotal). Das dauert beim ersten Mal einige Minuten, danach nur Sekunden; das Spiel startet anschließend von selbst."))
+                            .font(.callout).foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                }
                 if run.up {
                     Button(klT("Close this window", "Dieses Fenster schließen")) { dismissWindow() }
                         .font(.callout)
@@ -618,8 +690,8 @@ struct BootView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     if isLauncher { LauncherPanel() }
-                    PlayerSettingsView()
                     if klIsAlyx() { AlyxPanel(started: running || finished || run.started) }
+                    PlayerSettingsView()
                     // Everything a player does not need to understand to play: the
                     // dials of the port itself, and the report of this run.
                     DisclosureGroup(klT("Advanced", "Erweitert")) {
@@ -831,12 +903,25 @@ struct BootView: View {
         // Before configure, which is where the runtime starts reading its
         // environment.
         klAlyxApply()
+        // On the main run loop: the thread below is inside kl_app_boot for as
+        // long as there is anything to show, and a timer of its own would not
+        // fire until it came back.
+        prepTimer?.invalidate()
+        prepTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            var d: UInt32 = 0, t: UInt32 = 0
+            let on = kl_app_prepare_progress(&d, &t) != 0
+            prepDone = Int(d)
+            prepTotal = on ? Int(t) : 0
+        }
 
         // Off the main thread: the guest blocks — Unity's Baselib waits on
         // futexes, IL2CPP's GC suspends the world — and a blocked main thread
         // is a watchdog kill on this platform, which would present as a crash
         // with no report rather than as the hang it is.
         Thread.detachNewThread {
+            // Before anything of the game's is opened: its saves here and in
+            // the player's Steam Cloud are brought in step (KleptonSteamCloud.swift).
+            KLSteamCloud.syncBeforeStart()
             let rc = kl_app_configure(Paths.resources, Paths.container)
             if rc != 0 {
                 // To the SYSTEM log as well as the window, because this is the
@@ -949,6 +1034,7 @@ struct BootView: View {
 
             let text = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
             DispatchQueue.main.async {
+                prepTimer?.invalidate(); prepTimer = nil; prepTotal = 0
                 log = text
                 status = String(cString: kl_app_status())
                 succeeded = (result == 0)

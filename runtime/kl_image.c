@@ -87,6 +87,8 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define R_AARCH64_GLOB_DAT  1025
 #define R_AARCH64_JUMP_SLOT 1026
 #define R_AARCH64_RELATIVE  1027
+#define R_AARCH64_TLSDESC   1031
+#define PT_TLS 7
 #define STB_WEAK 2
 
 struct kl_image {
@@ -114,6 +116,7 @@ struct kl_image {
     unsigned    weak_n, weak_cap;
     void       *dl_handle;     // set when the image arrived as a translated
                                // Mach-O dylib; then dyld owns the mapping
+    int         tls_mod;       // index into g_tls_mod + 1; 0 = no PT_TLS
 };
 
 static void record_missing(kl_image *img, const char *nm) {
@@ -359,6 +362,118 @@ static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
     }
 }
 
+// ---------- ELF TLS: R_AARCH64_TLSDESC, dynamic model ----------
+// A guest library with its own `thread_local`/`__thread` data carries a PT_TLS
+// segment and reaches it through TLS descriptors: a 16-byte GOT pair {resolver,
+// argument}, called as `blr` with x0 = &pair, returning the variable's offset
+// from the thread pointer, which the caller adds to its own `mrs tpidr_el0`
+// (tpidrro_el0 after rewrite_tls / klepton-ld). Darwin's thread pointer is its
+// TSD block, so there is no static TLS area to place a module at; instead each
+// thread gets the module's block lazily on first touch, and the resolver
+// answers `block + offset - tp`. bionic's dynamic-TLS path does the same.
+//
+// Only module-local descriptors (symbol 0, or a symbol this image defines) —
+// every guest seen so far: Meta's libovravatar2 / libovrbody /
+// libovrplugintracking / libovrgpuskinning (BRINK Traveler) carry nothing else,
+// and before this each was refused as "unhandled relocation type 1031". A
+// descriptor against an IMPORTED TLS symbol still refuses by name.
+//
+// The blocks are not freed at thread exit: guest thread_local destructors may
+// run after a key destructor would, and a block is a few KB.
+#define KL_TLS_MAX 64
+typedef struct { const uint8_t *init; size_t filesz, memsz, align; } kl_tls_mod;
+typedef struct { unsigned mod; uint64_t off; } kl_tlsdesc_arg;
+static kl_tls_mod      g_tls_mod[KL_TLS_MAX];
+static unsigned        g_tls_nmod;
+static pthread_mutex_t g_tls_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_key_t   g_tls_key;
+static pthread_once_t  g_tls_once = PTHREAD_ONCE_INIT;
+static void tls_key_make(void) { pthread_key_create(&g_tls_key, NULL); }
+
+// Register an image's PT_TLS; returns tls_mod (index + 1), or 0 if none/full.
+static int tls_register(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t lo) {
+    for (int i = 0; i < phnum; i++) {
+        if (ph[i].p_type != PT_TLS) continue;
+        pthread_mutex_lock(&g_tls_mu);
+        int idx = g_tls_nmod < KL_TLS_MAX ? (int)g_tls_nmod++ : -1;
+        if (idx >= 0)
+            g_tls_mod[idx] = (kl_tls_mod){ img->base + ph[i].p_vaddr - lo,
+                                           ph[i].p_filesz, ph[i].p_memsz,
+                                           ph[i].p_align ? ph[i].p_align : 1 };
+        pthread_mutex_unlock(&g_tls_mu);
+        if (idx < 0) { err("%s: more than %d TLS modules", img->path, KL_TLS_MAX); return 0; }
+        return idx + 1;
+    }
+    return 0;
+}
+
+// The calling thread's copy of the variable. Called only from the resolver
+// below, on the guest thread that asked.
+void *kl_tls_addr(const kl_tlsdesc_arg *a) __asm__("_kl_tls_addr");
+void *kl_tls_addr(const kl_tlsdesc_arg *a) {
+    pthread_once(&g_tls_once, tls_key_make);
+    void **v = pthread_getspecific(g_tls_key);
+    if (!v) {
+        v = calloc(KL_TLS_MAX, sizeof *v);
+        if (!v) abort();
+        pthread_setspecific(g_tls_key, v);
+    }
+    if (!v[a->mod]) {
+        const kl_tls_mod *m = &g_tls_mod[a->mod];
+        size_t al = m->align < 16 ? 16 : m->align;
+        void *b = NULL;
+        if (posix_memalign(&b, al, m->memsz ? m->memsz : 1) != 0) abort();
+        memset(b, 0, m->memsz);
+        memcpy(b, m->init, m->filesz);           // .tdata, already relocated
+        v[a->mod] = b;
+    }
+    return (uint8_t *)v[a->mod] + a->off;
+}
+
+// The descriptor's resolver. The TLSDESC ABI lets it clobber x0 and nothing
+// else, so it keeps every general register the C call may touch (x1-x18) and
+// all of q0-q31 (AAPCS64 preserves only the low halves of v8-v15).
+void kl_tlsdesc_resolve(void) __asm__("_kl_tlsdesc_resolve");
+__asm__(
+    ".text\n.p2align 2\n"
+    "_kl_tlsdesc_resolve:\n"
+    "  stp x29, x30, [sp, #-16]!\n"
+    "  mov x29, sp\n"
+    "  sub sp, sp, #656\n"
+    "  stp x1, x2, [sp, #0]\n   stp x3, x4, [sp, #16]\n"
+    "  stp x5, x6, [sp, #32]\n  stp x7, x8, [sp, #48]\n"
+    "  stp x9, x10, [sp, #64]\n stp x11, x12, [sp, #80]\n"
+    "  stp x13, x14, [sp, #96]\n stp x15, x16, [sp, #112]\n"
+    "  stp x17, x18, [sp, #128]\n"
+    "  stp q0, q1, [sp, #144]\n  stp q2, q3, [sp, #176]\n"
+    "  stp q4, q5, [sp, #208]\n  stp q6, q7, [sp, #240]\n"
+    "  stp q8, q9, [sp, #272]\n  stp q10, q11, [sp, #304]\n"
+    "  stp q12, q13, [sp, #336]\n stp q14, q15, [sp, #368]\n"
+    "  stp q16, q17, [sp, #400]\n stp q18, q19, [sp, #432]\n"
+    "  stp q20, q21, [sp, #464]\n stp q22, q23, [sp, #496]\n"
+    "  stp q24, q25, [sp, #528]\n stp q26, q27, [sp, #560]\n"
+    "  stp q28, q29, [sp, #592]\n stp q30, q31, [sp, #624]\n"
+    "  ldr x0, [x0, #8]\n"
+    "  bl _kl_tls_addr\n"
+    "  mrs x1, tpidrro_el0\n"
+    "  sub x0, x0, x1\n"
+    "  ldp q0, q1, [sp, #144]\n  ldp q2, q3, [sp, #176]\n"
+    "  ldp q4, q5, [sp, #208]\n  ldp q6, q7, [sp, #240]\n"
+    "  ldp q8, q9, [sp, #272]\n  ldp q10, q11, [sp, #304]\n"
+    "  ldp q12, q13, [sp, #336]\n ldp q14, q15, [sp, #368]\n"
+    "  ldp q16, q17, [sp, #400]\n ldp q18, q19, [sp, #432]\n"
+    "  ldp q20, q21, [sp, #464]\n ldp q22, q23, [sp, #496]\n"
+    "  ldp q24, q25, [sp, #528]\n ldp q26, q27, [sp, #560]\n"
+    "  ldp q28, q29, [sp, #592]\n ldp q30, q31, [sp, #624]\n"
+    "  ldp x1, x2, [sp, #0]\n   ldp x3, x4, [sp, #16]\n"
+    "  ldp x5, x6, [sp, #32]\n  ldp x7, x8, [sp, #48]\n"
+    "  ldp x9, x10, [sp, #64]\n ldp x11, x12, [sp, #80]\n"
+    "  ldp x13, x14, [sp, #96]\n ldp x15, x16, [sp, #112]\n"
+    "  ldp x17, x18, [sp, #128]\n"
+    "  add sp, sp, #656\n"
+    "  ldp x29, x30, [sp], #16\n"
+    "  ret\n");
+
 // ---------- symbol lookup ----------
 // Registered interposers, consulted for defined and undefined symbols alike.
 // Small and fixed: this is an instrument, and a table that has to grow is a sign
@@ -440,6 +555,47 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
             if (type == R_AARCH64_ABS64) img->stats.abs64++;
             else if (type == R_AARCH64_GLOB_DAT) img->stats.glob_dat++;
             else img->stats.jump_slot++;
+            break;
+        }
+        case R_AARCH64_TLSDESC: {
+            // See the ELF TLS block above: module-local descriptors only.
+            //
+            // Not for every guest yet (KL_ELF_TLSDESC, default on for the title
+            // this was sent in for: BRINK Traveler, fix 9, 2026-10-11). Until
+            // now an image with such a relocation did not load, and where a
+            // guest loads it by dlopen that is a NULL it carries on from: a
+            // title that works today may ship an optional library it has been
+            // running WITHOUT, and would start running it. That wants a look at
+            // the libraries of the titles that work (tools/audit_elf.py counts
+            // these relocations) before this becomes what the loader does.
+            {
+                static int on = -1;
+                if (on < 0) {
+                    extern const char *kl_driver_target_name(void);
+                    const char *t = kl_driver_target_name();
+                    on = kl_env_on("KL_ELF_TLSDESC", t && strcmp(t, "x3635172946605196") == 0);
+                }
+                if (!on) {
+                    err("unhandled relocation type %u at %#llx (ELF TLS; KL_ELF_TLSDESC=1 serves it)",
+                        type, (unsigned long long)r->r_offset);
+                    return -1;
+                }
+            }
+            if (!img->tls_mod) {
+                err("TLSDESC at %#llx in an image with no PT_TLS", (unsigned long long)r->r_offset);
+                return -1;
+            }
+            if (sidx && img->symtab[sidx].st_shndx == 0) {
+                err("TLSDESC at %#llx against imported TLS symbol %s — not supported",
+                    (unsigned long long)r->r_offset, img->strtab + img->symtab[sidx].st_name);
+                return -1;
+            }
+            kl_tlsdesc_arg *a = malloc(sizeof *a);
+            if (!a) { err("TLSDESC at %#llx: out of memory", (unsigned long long)r->r_offset); return -1; }
+            a->mod = (unsigned)(img->tls_mod - 1);
+            a->off = (sidx ? img->symtab[sidx].st_value : 0) + (uint64_t)r->r_addend;
+            slot[0] = (uint64_t)(uintptr_t)kl_tlsdesc_resolve;
+            slot[1] = (uint64_t)(uintptr_t)a;
             break;
         }
         default:
@@ -563,6 +719,7 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
         }
     }
     if (!img->symtab || !img->strtab) { err("missing DT_SYMTAB/DT_STRTAB"); return -1; }
+    img->tls_mod = tls_register(img, ph, phnum, lo);
 
     // Order is independent — RELA, RELR and APS2 relocate disjoint slots — but
     // every relative table must run before kl_run_init: the .init_array pointers

@@ -112,20 +112,18 @@ enum AlyxQuality: Int, CaseIterable, Identifiable {
         }
     }
 
-    var detail: String {
+    /// What the settings window calls it.
+    var name: String {
         switch self {
-        case .smooth:
-            return "The smallest picture and the highest frame rate (about 50 a second)."
-        case .balanced:
-            return "A larger picture at a lower frame rate."
-        case .sharp:
-            return "Close to the display's own size. Hands and objects move visibly "
-                 + "less smoothly; looking around stays smooth."
-        case .maximum:
-            return "The largest picture the game draws, at the lowest frame rate. "
-                 + "Distant textures are coarser to make room for it, and the system "
-                 + "may still close the app in big scenes."
+        case .smooth:   return klT("Small", "Klein")
+        case .balanced: return klT("Medium", "Mittel")
+        case .sharp:    return klT("Large", "Groß")
+        case .maximum:  return klT("Maximum", "Maximal")
         }
+    }
+    static var note: String {
+        klT("How many pixels the game draws. Larger is sharper and slower; “Maximum” can run out of memory in big scenes.",
+            "Wie viele Bildpunkte das Spiel zeichnet. Größer ist schärfer und langsamer; „Maximal“ kann in großen Szenen den Speicher sprengen.")
     }
 
     /// The render target scale for this choice, as the table spells it: the
@@ -183,19 +181,18 @@ enum AlyxEdges: Int, CaseIterable, Identifiable {
     case two = 2, four = 4
 
     static let storageKey = "alyx.msaa"
+    /// Four, as the game ships and as the pipeline list that is compiled
+    /// before the game starts was recorded: of its 3,030 graphics pipelines
+    /// 1,585 are for four samples and 552 for two.
+    static let standard = AlyxEdges.four
     var id: Int { rawValue }
 
     var title: String { self == .two ? "2x" : "4x" }
 
-    var detail: String {
-        switch self {
-        case .two:
-            return "Edges are smoothed with two samples a pixel: faster, and what "
-                 + "the larger pictures need to stay playable."
-        case .four:
-            return "Edges are smoothed with four samples a pixel, as the game "
-                 + "ships: the cleanest edges at the highest cost."
-        }
+    var name: String { self == .two ? "2×" : "4×" }
+    static var note: String {
+        klT("How slanted edges are smoothed. 4× is cleaner, 2× is faster.",
+            "Wie schräge Kanten geglättet werden. 4× ist sauberer, 2× ist schneller.")
     }
 
     static var stored: AlyxEdges {
@@ -203,7 +200,7 @@ enum AlyxEdges: Int, CaseIterable, Identifiable {
         // measured against each other without touching the window.
         if let e = getenv("KL_ALYX_MSAA"), let v = AlyxEdges(rawValue: Int(atoi(e))) { return v }
         guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
-              let v = AlyxEdges(rawValue: n) else { return .two }
+              let v = AlyxEdges(rawValue: n) else { return standard }
         return v
     }
 }
@@ -212,23 +209,22 @@ enum AlyxView: Int, CaseIterable, Identifiable {
     case full, trimmed
 
     static let storageKey = "alyx.view"
+    static let standard = AlyxView.trimmed
+    /// As the settings window lists them: the lightest first, the costliest last.
+    static let ordered: [AlyxView] = [.trimmed, .full]
     var id: Int { rawValue }
 
     var title: String { self == .full ? "Full" : "Trimmed" }
 
-    var detail: String {
-        switch self {
-        case .full:
-            return "Each eye is drawn as wide as the display reaches."
-        case .trimmed:
-            return "The outermost edge of view is left dark and not drawn — a "
-                 + "sixth fewer pixels a frame at the same sharpness."
-        }
+    var name: String { self == .full ? klT("Full", "Voll") : klT("Trimmed", "Beschnitten") }
+    static var note: String {
+        klT("“Trimmed” leaves the outermost edge of view dark and saves about a sixth of the work.",
+            "„Beschnitten“ lässt den äußersten Rand des Sichtfelds dunkel und spart etwa ein Sechstel der Arbeit.")
     }
 
     static var stored: AlyxView {
         guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
-              let v = AlyxView(rawValue: n) else { return .full }
+              let v = AlyxView(rawValue: n) else { return standard }
         return v
     }
 }
@@ -237,9 +233,11 @@ enum AlyxFoveation: Int, CaseIterable, Identifiable {
     case off, on, strong
 
     static let storageKey = "alyx.foveation"
-    /// What a fresh install runs with: the level that was not visible in play
-    /// and saves about a third of the shading.
-    static let standard = AlyxFoveation.on
+    /// What a fresh install runs with: the Balanced preset's (AlyxPreset),
+    /// about half the pixels shaded.
+    static let standard = AlyxFoveation.strong
+    /// As the settings window lists them: the lightest first, the costliest last.
+    static let ordered: [AlyxFoveation] = [.strong, .on, .off]
     var id: Int { rawValue }
 
     var title: String {
@@ -250,17 +248,16 @@ enum AlyxFoveation: Int, CaseIterable, Identifiable {
         }
     }
 
-    var detail: String {
+    var name: String {
         switch self {
-        case .off:
-            return "The whole picture is drawn at one density."
-        case .on:
-            return "Full density straight ahead, coarser toward the edge of view "
-                 + "(about a third fewer pixels shaded). Not visible in a first test."
-        case .strong:
-            return "The same with a smaller sharp centre and a coarser edge (about "
-                 + "half the pixels shaded). The edge is softer when looked at."
+        case .off:    return klT("Off", "Aus")
+        case .on:     return klT("Mild", "Leicht")
+        case .strong: return klT("Strong", "Stark")
         }
+    }
+    static var note: String {
+        klT("Keeps the middle of the picture sharp and draws its edge more coarsely. “Strong” saves the most; the edge then looks softer when you look at it.",
+            "Hält die Bildmitte scharf und zeichnet den Rand gröber. „Stark“ spart am meisten; der Rand wirkt dann weicher, wenn man hinsieht.")
     }
 
     /// KL_VK_FOVEATE and KL_VK_FOVEATE_INNER: the rate at the widest edge of
@@ -276,6 +273,92 @@ enum AlyxFoveation: Int, CaseIterable, Identifiable {
     static var stored: AlyxFoveation {
         guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
               let v = AlyxFoveation(rawValue: n) else { return .standard }
+        return v
+    }
+}
+
+/// How finely the compositor draws the game's picture onto the display
+/// (KL_CP_QUALITY, Compositor Services' render quality). The game's picture is
+/// about 2,500 pixels wide an eye; at full quality the compositor draws it into
+/// a much finer target than that, and its pass was measured at 5-6 ms of GPU
+/// time per display frame beside a game that needs 20-30 ms for its own
+/// (Vision Pro M5, 2026-10-11). Glovebox runs at 0.40; the device's own
+/// default is 0.52.
+enum AlyxOutput: Int, CaseIterable, Identifiable {
+    case full, standard, light
+
+    static let storageKey = "alyx.output"
+    /// What a fresh install runs with (`standard` is one of the cases here).
+    static let initial = AlyxOutput.light
+    /// As the settings window lists them: the lightest first, the costliest last.
+    static let ordered: [AlyxOutput] = [.light, .standard, .full]
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .full:     return "Full"
+        case .standard: return "Standard"
+        case .light:    return "Light"
+        }
+    }
+
+    var name: String {
+        switch self {
+        case .full:     return klT("Full", "Voll")
+        case .standard: return "Standard"
+        case .light:    return klT("Light", "Leicht")
+        }
+    }
+    static var note: String {
+        klT("How finely the finished picture is put on the display. Lower leaves the graphics chip more time for the game; fine text may look softer.",
+            "Wie fein das fertige Bild aufs Display kommt. Niedriger lässt dem Grafikchip mehr Zeit fürs Spiel; feine Schrift kann weicher wirken.")
+    }
+
+    var quality: String {
+        switch self {
+        case .full:     return "1.0"
+        case .standard: return "0.52"
+        case .light:    return "0.40"
+        }
+    }
+
+    static var stored: AlyxOutput {
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let v = AlyxOutput(rawValue: n) else { return initial }
+        return v
+    }
+}
+
+/// How fast the player moves with the stick ("continuous" movement): the
+/// game's two speeds, walking and in a fight, both set to one value
+/// (+hlvr_continuous_normal_speed, +hlvr_continuous_combat_speed) — what
+/// players of the game on a PC put into its launch options when the stick
+/// feels like wading (katwalk.fandom.com, "Half Life Alyx Workaround: Walking
+/// Speed": 175, or 150 or 200 to taste). "Game" passes neither and leaves the
+/// game its own two speeds. Teleport and shift movement are not affected.
+enum AlyxPace: Int, CaseIterable, Identifiable {
+    case game = 0, brisk = 150, fast = 175, faster = 200
+
+    static let storageKey = "alyx.pace"
+    var id: Int { rawValue }
+
+    var name: String {
+        switch self {
+        case .game:   return klT("Game's own", "Wie im Spiel")
+        case .brisk:  return "150"
+        case .fast:   return "175"
+        case .faster: return "200"
+        }
+    }
+
+    /// The arguments for the game's command line; empty for the game's own.
+    var arguments: String {
+        self == .game ? "" : " +hlvr_continuous_normal_speed \(rawValue) +hlvr_continuous_combat_speed \(rawValue)"
+    }
+
+    static var stored: AlyxPace {
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let v = AlyxPace(rawValue: n) else { return .game }
         return v
     }
 }
@@ -394,11 +477,30 @@ private func klAlyxWriteLadder(scale: String, samples: Int) -> Bool {
     else { return false }
     let dir = docs.appendingPathComponent("lx/game/hlvr")
     guard FileManager.default.fileExists(atPath: dir.path) else { return false }
-    var t = "hlvr,default,vr_msaa,vr_render_target_scale,min_gpu_memory,min_width,min_height,\n"
+    // The columns after the seventh are Glovebox's (github.com/glovebox-vr/
+    // glovebox, packages/alyx/defaults/vr_fidelity_fixed_1.0.csv): ambient
+    // occlusion and bloom on, the plain shadow filter and one sun cascade.
+    // Which shaders a frame needs follows from these, and the pipeline list
+    // that is compiled before the game starts (kl_fossilize.cpp) was recorded
+    // with them.
+    //
+    // One of Glovebox's is left out: sc_disable_spotlight_shadows 1. With it
+    // the flashlight was switched on and lit nothing (Vision Pro, 2026-10-11) —
+    // it is a spotlight that casts shadows, and the engine seems to drop such a
+    // light rather than draw it unshadowed. The pipelines its shadows need are
+    // not in the list; the game compiles them at their first use and they are
+    // recorded for the next start. KL_ALYX_SPOT_SHADOWS=0 puts the column back.
+    var spot = true
+    if let e = getenv("KL_ALYX_SPOT_SHADOWS"), atoi(e) == 0 { spot = false }
+    var t = "hlvr,default,vr_msaa,vr_render_target_scale,min_gpu_memory,min_width,min_height,"
+          + "r_ssao,r_post_bloom,r_high_quality_shadows,"
+          + "vr_single_light_fast_path_sun_cascade_0_texels_per_world,"
+          + "vr_single_light_fast_path_sun_cascade_1_texels_per_world,"
+          + (spot ? "" : "sc_disable_spotlight_shadows,") + "\n"
     for level in 0...8 {
-        t += "\(level),\(level == 5 ? "1" : ""),\(samples),\(scale),,,,\n"
+        t += "\(level),\(level == 5 ? "1" : ""),\(samples),\(scale),,,,1,1,0,3,0,\(spot ? "" : "1,")\n"
     }
-    t += "end,,,,,,,\n"
+    t += "end,,,,,,,,,,,,\(spot ? "" : ",")\n"
     do {
         try t.write(to: dir.appendingPathComponent("vr_fidelity_levels_override.csv"),
                     atomically: true, encoding: .utf8)
@@ -407,6 +509,142 @@ private func klAlyxWriteLadder(scale: String, samples: Int) -> Bool {
         NSLog("[app] Alyx: could not write the fidelity table: \(error)")
         return false
     }
+}
+
+/// The game's detail settings, once: what the game's own "video settings" file
+/// (hlvr/cfg/deckard/video2.txt) says about particles, cached lights,
+/// characters, eye occlusion, volumetric fog and texture filtering.
+///
+/// Left to itself the game measures the device at its first start and writes
+/// the lowest of everything. The values here are Glovebox's (github.com/
+/// glovebox-vr/glovebox, packages/alyx/defaults/video2-visionpro-demo.txt), and
+/// they are here for the same reason as the last columns of the table above:
+/// they decide which shaders a frame needs, and the pipeline list was recorded
+/// with them. The picture's size, the sample count and the texture budget are
+/// not among them and stay this app's.
+///
+/// Once, because the file is the game's and so are the player's later changes
+/// in its Options: the values go into an existing file line by line and a
+/// mark is left that it was done. Where the game has not written the file yet
+/// it is written whole, without the mark — the game may replace it at that
+/// first start, and the next one then finds a file to put the values into.
+/// KL_ALYX_DETAIL=0 leaves the file alone.
+private let klAlyxDetailKey = "alyx.detailSettings"
+private let klAlyxDetail: [(String, String)] = [
+    ("r_particle_max_detail_level", "1"), ("r_particle_max_draw_distance", "10000"),
+    ("cl_particle_fallback_base", "1"), ("vr_enable_cached_lights", "1"),
+    ("vr_character_level_placeholder", "2"), ("cl_enable_eye_occlusion", "1"),
+    ("volume_fog_width", "128"), ("volume_fog_height", "128"), ("volume_fog_depth", "64"),
+    ("g_ragdoll_maxcount", "5"), ("r_texturefilteringquality", "4"),
+]
+private let klAlyxVideoFile = """
+"video.cfg"
+{
+\t"Version"\t\t"18"
+\t"VendorID"\t\t"4203"
+\t"DeviceID"\t\t"453115914"
+\t"setting.cpu_level"\t\t"0"
+\t"setting.mem_level"\t\t"1"
+\t"setting.gpu_mem_level"\t\t"1"
+\t"setting.knowndevice"\t\t"0"
+\t"setting.defaultres"\t\t"16"
+\t"setting.defaultresheight"\t\t"16"
+\t"setting.refreshrate_numerator"\t\t"0"
+\t"setting.refreshrate_denominator"\t\t"0"
+\t"setting.fullscreen"\t\t"0"
+\t"setting.coop_fullscreen"\t\t"0"
+\t"setting.nowindowborder"\t\t"1"
+\t"setting.mat_vsync"\t\t"0"
+\t"setting.fullscreen_min_on_focus_loss"\t\t"1"
+\t"setting.high_dpi"\t\t"0"
+\t"setting.r_particle_max_detail_level"\t\t"1"
+\t"setting.r_particle_max_draw_distance"\t\t"10000"
+\t"setting.cl_particle_fallback_base"\t\t"1"
+\t"setting.cl_particle_fallback_multiplier"\t\t"2"
+\t"setting.r_high_quality_shadows"\t\t"0"
+\t"setting.vr_single_light_fast_path_sun_cascade_0_texels_per_world"\t\t"3.000000"
+\t"setting.vr_single_light_fast_path_sun_cascade_1_texels_per_world"\t\t"0.000000"
+\t"setting.vr_shadow_level_placeholder"\t\t"0"
+\t"setting.vr_enable_cached_lights"\t\t"1"
+\t"setting.vr_aoproxy_enable"\t\t"0"
+\t"setting.vr_character_level_placeholder"\t\t"2"
+\t"setting.cl_enable_eye_occlusion"\t\t"1"
+\t"setting.volume_fog_width"\t\t"128"
+\t"setting.volume_fog_height"\t\t"128"
+\t"setting.volume_fog_depth"\t\t"64"
+\t"setting.r_light_flickering_enabled"\t\t"1"
+\t"setting.vr_fast_hologram"\t\t"1"
+\t"setting.cloth_rigid_update"\t\t"1"
+\t"setting.g_ragdoll_maxcount"\t\t"5"
+\t"setting.snd_steamaudio_reverb_order"\t\t"0"
+\t"setting.snd_steamaudio_hybrid_reverb_transition_time"\t\t"0.300000"
+\t"setting.snd_steamaudio_reverb_update_rate"\t\t"5"
+\t"setting.snd_opvar_set_point_update_interval"\t\t"0.400000"
+\t"setting.snd_steamaudio_dynamicpathing_max_samples"\t\t"1"
+\t"setting.vr_depth_prepass"\t\t"0"
+\t"setting.vr_stencil_hidden_pixels"\t\t"1"
+\t"setting.vr_hidden_pixels_use_depth"\t\t"1"
+\t"setting.r_texturefilteringquality"\t\t"4"
+\t"setting.r_texture_stream_max_resolution"\t\t"2048"
+\t"setting.r_texture_stream_resolution_bias_min"\t\t"0.8"
+\t"setting.vr_perf_mode_override2"\t\t"2"
+}
+
+"""
+private func klAlyxApplyDetail() -> String {
+    if let e = getenv("KL_ALYX_DETAIL"), atoi(e) == 0 { return "left alone (KL_ALYX_DETAIL=0)" }
+    if UserDefaults.standard.bool(forKey: klAlyxDetailKey) { return "the game's own (set once before)" }
+    guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+    else { return "not set (no Documents)" }
+    let game = docs.appendingPathComponent("lx/game/hlvr")
+    guard FileManager.default.fileExists(atPath: game.path) else { return "not set (no game yet)" }
+    let file = game.appendingPathComponent("cfg/deckard/video2.txt")
+    guard let data = try? Data(contentsOf: file), let text = String(data: data, encoding: .utf8) else {
+        do {
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try klAlyxVideoFile.write(to: file, atomically: true, encoding: .utf8)
+            return "written whole (the game had no file yet)"
+        } catch { return "NOT written: \(error.localizedDescription)" }
+    }
+    var lines = text.components(separatedBy: "\n")
+    var set = 0, missing: [String] = []
+    for (key, value) in klAlyxDetail {
+        guard let at = lines.firstIndex(where: { $0.contains("\"setting.\(key)\"") }) else { missing.append(key); continue }
+        let cr = lines[at].hasSuffix("\r") ? "\r" : ""
+        let new = "\t\"setting.\(key)\"\t\t\"\(value)\"" + cr
+        if lines[at] != new { lines[at] = new; set += 1 }
+    }
+    // A setting the game's file does not name goes in before the closing brace.
+    if !missing.isEmpty, let close = lines.lastIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "}" }) {
+        let cr = lines[close].hasSuffix("\r") ? "\r" : ""
+        for key in missing.reversed() {
+            let value = klAlyxDetail.first { $0.0 == key }!.1
+            lines.insert("\t\"setting.\(key)\"\t\t\"\(value)\"" + cr, at: close)
+            set += 1
+        }
+    }
+    do {
+        if set > 0 { try lines.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8) }
+        UserDefaults.standard.set(true, forKey: klAlyxDetailKey)
+        return "\(set) of \(klAlyxDetail.count) value(s) put into the game's file"
+    } catch { return "NOT written: \(error.localizedDescription)" }
+}
+
+/// The pipeline recorder's folder was Documents/klfz for two test builds (235,
+/// 236) and is Documents/lx/klfz, where the installer puts the list. What a
+/// device recorded in the old place goes along, and the old place goes away.
+private func klAlyxMovePipelineFolder() {
+    let fm = FileManager.default
+    guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+    let old = docs.appendingPathComponent("klfz"), new = docs.appendingPathComponent("lx/klfz")
+    guard fm.fileExists(atPath: old.path), fm.fileExists(atPath: docs.appendingPathComponent("lx").path) else { return }
+    try? fm.createDirectory(at: new, withIntermediateDirectories: true)
+    for name in ["recorded.foz", "device-info.json"] {
+        let to = new.appendingPathComponent(name)
+        if !fm.fileExists(atPath: to.path) { try? fm.moveItem(at: old.appendingPathComponent(name), to: to) }
+    }
+    try? fm.removeItem(at: old)
+    NSLog("[app] Alyx: the pipeline folder moved to lx/klfz")
 }
 
 /// Say what the system thinks of the device's temperature, now and whenever it
@@ -462,6 +700,10 @@ func klAlyxApply() {
     setenv("KL_LX_ARGS_EXTRA",
            "+vr_fidelity_level_auto 0 +vr_fidelity_level \(q.fidelityLevel) "
            + "+r_texture_pool_size \(q.texturePoolMB)"
+           // Textures come in at twice the engine's pace, as in Glovebox's
+           // settings: fewer moments in which a surface is still coarse.
+           + " +r_texture_stream_throttle_count 6 +r_texture_stream_throttle_amount 20"
+           + AlyxPace.stored.arguments
            + (loading ? "" : " +hlvr_auto_dismiss_loading 1")
            + (language == .english ? "" : " -language \(language.engineName)"), 0)
     // The ceiling on the eye texture the game is offered. With the level fixed
@@ -475,88 +717,196 @@ func klAlyxApply() {
         setenv("KL_VK_FOVEATE", k.edge, 0)
         setenv("KL_VK_FOVEATE_INNER", k.inner, 0)
     }
+    let output = AlyxOutput.stored
+    setenv("KL_CP_QUALITY", output.quality, 0)
+    // The game's picture keeps its size: that is the Picture setting's.
+    setenv("KL_CP_EYE_AT_FULL", "1", 0)
+    NSLog("[app] Alyx output: \(output.title) (compositor quality \(output.quality))")
     let edges = AlyxEdges.stored
     let wrote = klAlyxWriteLadder(scale: q.scale, samples: edges.rawValue)
+    NSLog("[app] Alyx detail settings: \(klAlyxApplyDetail())")
+    klAlyxMovePipelineFolder()
     NSLog("[app] Alyx picture: \(q.title), edges \(edges.title), view \(view.title), foveation \(fov.title)\(wrote ? "" : " (table NOT written)"), language \(language.title) with \(voices ? "staged" : "the game's own") voices\(voicePath ? "" : " (gameinfo.gi NOT written)") — KL_LX_ARGS_EXTRA=\(String(cString: getenv("KL_LX_ARGS_EXTRA")))")
+}
+
+/// The three ways to play that most people choose between, each a set of the
+/// five dials below. A set of dials that is none of them is "Custom".
+enum AlyxPreset: Int, CaseIterable, Identifiable {
+    case smooth, balanced, sharp
+    var id: Int { rawValue }
+
+    var name: String {
+        switch self {
+        case .smooth:   return klT("Smooth", "Flüssig")
+        case .balanced: return klT("Balanced", "Ausgewogen")
+        case .sharp:    return klT("Sharp", "Scharf")
+        }
+    }
+
+    var note: String {
+        switch self {
+        case .smooth:
+            return klT("The highest frame rate: the smallest picture and simpler edge smoothing.",
+                       "Die höchste Bildrate: das kleinste Bild und einfachere Kantenglättung.")
+        case .balanced:
+            return klT("A sharp centre at a steady frame rate. What a new installation starts with.",
+                       "Scharfe Bildmitte bei ruhiger Bildrate. Damit startet eine neue Installation.")
+        case .sharp:
+            return klT("A large picture, sharp to its edge and across the whole field of view. Hands and objects move less smoothly; looking around stays smooth.",
+                       "Ein großes Bild, scharf bis zum Rand und über das ganze Sichtfeld. Hände und Gegenstände bewegen sich weniger flüssig; das Umsehen bleibt flüssig.")
+        }
+    }
+
+    var dials: (quality: AlyxQuality, edges: AlyxEdges, view: AlyxView, foveation: AlyxFoveation, output: AlyxOutput) {
+        switch self {
+        // Balanced is what its first player settled on after trying the rest
+        // (Vision Pro M5, 2026-10-11: the game held the compositor's 16.7 ms
+        // a frame with it), and what every dial's own default is.
+        case .smooth:   return (.smooth, .two, .trimmed, .strong, .light)
+        case .balanced: return (.balanced, .four, .trimmed, .strong, .light)
+        case .sharp:    return (.sharp, .four, .full, .on, .full)
+        }
+    }
 }
 
 struct AlyxPanel: View {
     @AppStorage(AlyxQuality.storageKey) private var quality = AlyxQuality.balanced.rawValue
-    @AppStorage(AlyxEdges.storageKey) private var edges = AlyxEdges.two.rawValue
-    @AppStorage(AlyxView.storageKey) private var view = AlyxView.full.rawValue
+    @AppStorage(AlyxEdges.storageKey) private var edges = AlyxEdges.standard.rawValue
+    @AppStorage(AlyxView.storageKey) private var view = AlyxView.standard.rawValue
     @AppStorage(AlyxFoveation.storageKey) private var foveation = AlyxFoveation.standard.rawValue
+    @AppStorage(AlyxOutput.storageKey) private var output = AlyxOutput.initial.rawValue
+    /// "Custom" was chosen: the dials are shown even while they happen to be a preset's.
+    @AppStorage("alyx.custom") private var customChosen = false
     @AppStorage(klAlyxLoadingKey) private var loadingScreens = true
+    @AppStorage(AlyxPace.storageKey) private var pace = AlyxPace.game.rawValue
     @AppStorage(AlyxLanguage.storageKey) private var language = AlyxLanguage.standard.rawValue
     @AppStorage(AlyxLanguage.voicesKey) private var voices = true
     /// True once a run has started: the values were read at its start, so the
-    /// control then describes the NEXT launch and says so.
+    /// controls then describe the NEXT launch and say so.
     let started: Bool
 
+    private static let customTag = -1
+
+    /// The preset the dials are set to, if they are one's.
+    private var matching: AlyxPreset? {
+        AlyxPreset.allCases.first {
+            let d = $0.dials
+            return d.quality.rawValue == quality && d.edges.rawValue == edges && d.view.rawValue == view
+                && d.foveation.rawValue == foveation && d.output.rawValue == output
+        }
+    }
+
+    private var preset: Binding<Int> {
+        Binding(
+            get: { customChosen ? Self.customTag : (matching?.rawValue ?? Self.customTag) },
+            set: { tag in
+                guard let p = AlyxPreset(rawValue: tag) else { customChosen = true; return }
+                let d = p.dials
+                quality = d.quality.rawValue; edges = d.edges.rawValue; view = d.view.rawValue
+                foveation = d.foveation.rawValue; output = d.output.rawValue
+                customChosen = false
+            })
+    }
+
+    /// One dial of "Custom": its name, its choices, and a sentence on what it does.
+    private func dial<T: Identifiable>(_ title: String, _ selection: Binding<Int>, _ cases: [T],
+                                       name: @escaping (T) -> String, tag: @escaping (T) -> Int,
+                                       note: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.headline)
+            Picker(title, selection: selection) {
+                ForEach(cases) { c in Text(name(c)).tag(tag(c)) }
+            }
+            .pickerStyle(.segmented)
+            Text(note).font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Picker("Picture", selection: $quality) {
-                ForEach(AlyxQuality.allCases) { q in
-                    Text(q.title).tag(q.rawValue)
+        VStack(alignment: .leading, spacing: 18) {
+            KLSteamCloudPanel()
+            GroupBox(klT("Walking speed", "Laufgeschwindigkeit")) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker(klT("Walking speed", "Laufgeschwindigkeit"), selection: $pace) {
+                        ForEach(AlyxPace.allCases) { p in Text(p.name).tag(p.rawValue) }
+                    }
+                    .pickerStyle(.segmented)
+                    Text(klT("How fast you move with the stick, walking and in a fight. Higher is faster; “Game's own” leaves the game its two speeds. Teleporting is not affected.",
+                             "Wie schnell du dich mit dem Stick bewegst, beim Gehen und im Kampf. Höher ist schneller; „Wie im Spiel“ lässt dem Spiel seine beiden Geschwindigkeiten. Teleportieren ist davon nicht betroffen."))
+                        .font(.callout).foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .pickerStyle(.segmented)
-            Text((AlyxQuality(rawValue: quality) ?? .balanced).detail)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Picker("Edges", selection: $edges) {
-                ForEach(AlyxEdges.allCases) { e in
-                    Text(e.title).tag(e.rawValue)
+            GroupBox(klT("Graphics", "Grafik")) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker(klT("Graphics", "Grafik"), selection: preset) {
+                        ForEach(AlyxPreset.allCases) { p in Text(p.name).tag(p.rawValue) }
+                        Text(klT("Custom", "Eigene")).tag(Self.customTag)
+                    }
+                    .pickerStyle(.segmented)
+                    if preset.wrappedValue == Self.customTag {
+                        Text(klT("Your own combination. In every row the choice on the left is the lightest and the one on the right the most demanding.",
+                                 "Deine eigene Kombination. In jeder Zeile ist die Wahl links die leichteste und die rechts die aufwendigste."))
+                            .font(.callout).foregroundStyle(.secondary)
+                        dial(klT("Picture size", "Bildgröße"), $quality, AlyxQuality.allCases,
+                             name: { $0.name }, tag: { $0.rawValue }, note: AlyxQuality.note)
+                        dial(klT("Edge smoothing", "Kantenglättung"), $edges, AlyxEdges.allCases,
+                             name: { $0.name }, tag: { $0.rawValue }, note: AlyxEdges.note)
+                        dial(klT("Field of view", "Sichtfeld"), $view, AlyxView.ordered,
+                             name: { $0.name }, tag: { $0.rawValue }, note: AlyxView.note)
+                        dial("Foveated Rendering", $foveation, AlyxFoveation.ordered,
+                             name: { $0.name }, tag: { $0.rawValue }, note: AlyxFoveation.note)
+                        dial(klT("Display output", "Ausgabe aufs Display"), $output, AlyxOutput.ordered,
+                             name: { $0.name }, tag: { $0.rawValue }, note: AlyxOutput.note)
+                    } else if let p = matching {
+                        Text(p.note).font(.callout).foregroundStyle(.secondary)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .pickerStyle(.segmented)
-            Text((AlyxEdges(rawValue: edges) ?? .two).detail)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Picker("View", selection: $view) {
-                ForEach(AlyxView.allCases) { v in
-                    Text(v.title).tag(v.rawValue)
+            GroupBox(klT("Language", "Sprache")) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker(klT("Language", "Sprache"), selection: $language) {
+                        ForEach(AlyxLanguage.allCases) { l in Text(l.title).tag(l.rawValue) }
+                    }
+                    .pickerStyle(.segmented)
+                    let chosen = AlyxLanguage(rawValue: language) ?? .english
+                    let staged = chosen.voiceArchive != nil
+                    if staged {
+                        Toggle(klT("\(chosen.title) voices", "Stimmen auf \(chosen.title)"), isOn: $voices)
+                    }
+                    Text(chosen == .english
+                         ? klT("Menus, subtitles and voices are English, as the game was recorded.",
+                               "Menüs, Untertitel und Stimmen sind englisch, wie das Spiel aufgenommen wurde.")
+                         : staged
+                           ? (voices ? klT("Menus and subtitles are the game's own \(chosen.title); the voices are the fan-made voice-over that was installed with the game.",
+                                           "Menüs und Untertitel bringt das Spiel selbst mit; die Stimmen sind die Fan-Vertonung, die mit dem Spiel installiert wurde.")
+                                     : klT("Menus and subtitles are the game's own \(chosen.title); the voices stay English.",
+                                           "Menüs und Untertitel bringt das Spiel selbst mit; die Stimmen bleiben englisch."))
+                           : klT("Menus and subtitles are the game's own \(chosen.title); the voices stay English. A fan-made voice-over can be added when the game is installed from the Mac.",
+                                 "Menüs und Untertitel bringt das Spiel selbst mit; die Stimmen bleiben englisch. Eine Fan-Vertonung lässt sich bei der Installation vom Mac aus hinzufügen."))
+                        .font(.callout).foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .pickerStyle(.segmented)
-            Text((AlyxView(rawValue: view) ?? .full).detail)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Picker("Foveation", selection: $foveation) {
-                ForEach(AlyxFoveation.allCases) { f in
-                    Text(f.title).tag(f.rawValue)
+            GroupBox(klT("After loading", "Nach dem Laden")) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(klT("Wait for the trigger", "Auf den Trigger warten"), isOn: $loadingScreens)
+                    Text(loadingScreens
+                         ? klT("When a level is ready the game shows a card and starts when you pull the trigger.",
+                               "Ist ein Level fertig geladen, zeigt das Spiel eine Karte und beginnt, wenn du den Trigger ziehst.")
+                         : klT("The game continues by itself as soon as a level is ready.",
+                               "Das Spiel geht von selbst weiter, sobald ein Level fertig geladen ist."))
+                        .font(.callout).foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .pickerStyle(.segmented)
-            Text((AlyxFoveation(rawValue: foveation) ?? .standard).detail)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Picker("Language", selection: $language) {
-                ForEach(AlyxLanguage.allCases) { l in
-                    Text(l.title).tag(l.rawValue)
-                }
+            if started {
+                Label(klT("The game is running: these apply the next time it is started.",
+                          "Das Spiel läuft: Das gilt ab dem nächsten Start."),
+                      systemImage: "info.circle")
+                    .font(.callout).foregroundStyle(.secondary)
             }
-            .pickerStyle(.segmented)
-            let chosen = AlyxLanguage(rawValue: language) ?? .english
-            let staged = chosen.voiceArchive != nil
-            if staged {
-                Toggle("\(chosen.title) voices", isOn: $voices)
-            }
-            Text(chosen == .english
-                 ? "Menus, subtitles and voices are English, as the game was recorded."
-                 : staged
-                   ? (voices ? "Menus and subtitles are the game's own \(chosen.title); the voices are the fan-made voice-over that was installed with the game."
-                             : "Menus and subtitles are the game's own \(chosen.title); the voices stay English.")
-                   : "Menus and subtitles are the game's own \(chosen.title); the voices stay English. "
-                     + "A fan-made voice-over can be added when the game is installed from the Mac.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Toggle("Loading screens", isOn: $loadingScreens)
-            Text((loadingScreens
-                  ? "The game shows its loading card and waits for a trigger pull when a level is ready."
-                  : "The game continues by itself as soon as a level is ready.")
-                 + (started ? "  All of these take effect the next time the game is started." : ""))
-                .font(.footnote)
-                .foregroundStyle(.secondary)
         }
     }
 }

@@ -74,6 +74,12 @@ static const char *ue4_meta_str(const char *key);   // defined below; used by co
 // is skipped with a note; only the entry library failing is fatal.
 static const char *const UE4_CHAIN[] = {
     "libc++_shared.so",
+    // Older UE4 (pre-4.20 NDK toolchains) links GNU STL instead of libc++:
+    // libUE4 NEEDS libgnustl_shared.so and its static initializers call
+    // std::ios_base::Init (_ZNSt8ios_base4InitC1Ev, no __1 namespace), which
+    // only gnustl exports. Absent from the chain, Tales from the Galaxy's Edge
+    // (x3484270071659289) died on that unresolved import before JNI_OnLoad.
+    "libgnustl_shared.so",
     // FMOD, dependencies first (libfmodstudio is built on the libfmod core).
     // libUE4 has these as DT_NEEDED and binds FMOD_* / FMOD::* against them, but
     // the translated libUE4 carries no LC_LOAD_DYLIB, so a symbol only resolves
@@ -734,11 +740,29 @@ static void kl_ue4_java_create(FILE *out) {
     // Matter 2, Vampire) is 4.26+, and UE5 (Wanderer, libUnreal) inherited the
     // int-inserted form too. Resident Evil 4 VR (2021, built on 4.25) is the
     // only known five-string guest; it and any future 4.25 title are named here.
-    // The engine version is not cheaply readable from the stripped binary, so
-    // this is a name list rather than a probe — a wrong guess does not corrupt,
-    // it faults loudly in klj_str exactly as TWD2 did, which names the fix.
+    //
+    // Which form a guest takes is its engine's version, and the manifest says
+    // it: com.epicgames.ue4.GameActivity.EngineVersion ("4.27.2" for Wrath 2).
+    // 4.25 and older is the five-string form. Where the manifest does not say,
+    // the names decide as before — "re4", and the same game under its
+    // store-built target, which is how it was sent in as failing: the int 32
+    // read as a jstring, a fault at 0x20 before the first frame (fix 18,
+    // 2026-10-11). A wrong guess does not corrupt, it faults loudly in klj_str
+    // exactly as TWD2 did, which names the fix.
     const char *ue4_tgt = kl_driver_target_name();
-    int is_425 = ue4_tgt && strcmp(ue4_tgt, "re4") == 0;
+    // Tales from the Galaxy's Edge (x3484270071659289, fix 16) is the third:
+    // an engine old enough to link GNU STL.
+    int is_425 = ue4_tgt && (strcmp(ue4_tgt, "re4") == 0 || strcmp(ue4_tgt, "x2637179839719680") == 0 ||
+                             strcmp(ue4_tgt, "x3484270071659289") == 0);
+    {
+        const char *ev = ue4_meta_str("com.epicgames.ue4.GameActivity.EngineVersion");
+        int major = 0, minor = 0;
+        if (sscanf(ev, "%d.%d", &major, &minor) == 2 && major >= 4) {
+            is_425 = major == 4 && minor <= 25;
+            fprintf(out, "  engine %s per the manifest: nativeSetAndroidVersionInformation in the %s form\n",
+              ev, is_425 ? "five-string (4.25)" : "4.26+");
+        }
+    }
     if (is_425) {
         UE4_CALL(out, "nativeSetAndroidVersionInformation", ue4_fn_sssss,
                  jrel, jmake, jmodel, jbuild, jloc);
