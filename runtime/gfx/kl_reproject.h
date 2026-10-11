@@ -152,7 +152,16 @@ typedef struct {
     // having a hard jagged edge.
     float         chroma_min, chroma_max;
     float         chroma_key[3];
+    // The guest's colour scale and offset for the eye picture (kl_ovrp.c,
+    // ovrp_SetColorScaleAndOffset): colour * (1 - fade) + offset. Kept as what
+    // is TAKEN AWAY rather than as the scale itself, so that uniforms nobody
+    // filled in — all zeroes — are the picture as it is and not a black one.
+    float         color_fade[4];
+    float         color_offset[4];
 } kl_reproject_uniforms;
+// The values every kl_reproject_build puts there from now on. Scale 1, offset
+// 0 is the picture unchanged.
+void kl_reproject_set_eye_color(const float scale[4], const float offset[4]);
 
 // The blit's uniforms — buffer(0) of its FRAGMENT stage. It carried a bare
 // `uint slice` until the flip existed; a second scalar could have gone in
@@ -208,7 +217,21 @@ typedef struct {
     // already happening and is at least honest.
     uint32_t      visible;
     uint32_t      opaque;    // KL_OVERLAY_OPAQUE: force sampled alpha to 1
+    // A CYLINDER, when cyl_segments is not 0: the strip is then
+    // (cyl_segments + 1) * 2 vertices along the arc instead of the quad's
+    // four, on a surface of this radius around the pose, from -cyl_half_angle
+    // to +cyl_half_angle about the direction the pose faces (-Z). half_size.y
+    // is half its height; half_size.x is not used. kl_overlay_strip_vertices
+    // says how many vertices to draw.
+    uint32_t      cyl_segments;
+    float         cyl_radius;      // metres
+    float         cyl_half_angle;  // radians
 } kl_overlay_uniforms;
+
+// How many vertices the overlay strip has for these uniforms: 4 for a quad.
+static inline int kl_overlay_strip_vertices(const kl_overlay_uniforms *u) {
+    return (u && u->cyl_segments) ? (int)(u->cyl_segments + 1u) * 2 : 4;
+}
 
 // The overlay shader — `kl_ov_v` / `kl_ov_f`, a 4-vertex triangle strip with no
 // vertex buffer, buffer(0) an array indexed by [[amplification_id]] exactly as

@@ -947,10 +947,14 @@ size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
     // of buffers means the guest's mixer is running but producing silence (banks
     // not loaded, no events) — a different bug from an output that never opened.
     if ((g_writes % 1000) == 1) {
+        size_t fill = atomic_load(&g_w) - atomic_load(&g_r);
         fprintf(stderr, "  [au] guest PCM so far: peak %d/32767, %lu of %lu "
-                        "buffers all-zero — %s\n",
+                        "buffers all-zero — %s; fill %.1f ms, %u underruns, "
+                        "%lu short writes, %lu restarts\n",
                 g_peak, g_silent_buffers, g_writes,
-                g_peak ? "producing audio" : "ONLY SILENCE so far");
+                g_peak ? "producing audio" : "ONLY SILENCE so far",
+                g_out_rate > 0 ? 1000.0 * (double)fill / g_out_rate : 0.0,
+                atomic_load(&g_underruns), g_short_writes, g_restarts);
     }
     pthread_mutex_unlock(&g_wlock);
     return written == frames ? bytes : written * in_frame;

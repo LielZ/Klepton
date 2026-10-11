@@ -338,6 +338,12 @@ typedef struct {
     int   viewport[2][4];// per-eye {x, y, w, h} within that texture
     float pose[7];       // orientation xyzw then position xyz, tracking space
     float size[2];       // Quad: width and height in METRES
+    // Cylinder: the arc's LENGTH along the surface, the height and the radius,
+    // all in metres — ovrpLayerSubmitCylinder's ArcWidth, Height, Radius. The
+    // pose is the cylinder's centre (a point on its axis); the picture is on
+    // the part of the surface that faces -Z from there. All zero for any
+    // other shape, and for a cylinder whose submit could not be read.
+    float cyl[3];
     int   flags;         // ovrpLayerSubmitFlags, as submitted
     int   head_locked;   // the flag above, decoded — see kl_ovrp.c
     // Which eyes see this layer: 0 both, 1 left only, 2 right only. OpenXR's
@@ -548,6 +554,9 @@ void kl_ovrp_proj_layers_external(const kl_ovrp_proj_layer *v, int n);
 // every OpenXR guest that submits a projection layer every frame) is unchanged.
 void kl_ovrp_eye_layer_external(int submitted);
 int  kl_ovrp_eye_layer_live(void);
+// Black behind the quads of a frame that has no eye picture (kl_ovrp.c).
+void kl_ovrp_set_eyeless_black(int on);
+int  kl_ovrp_eyeless_black(void);
 
 // How many swapchain stages we tell the guest it has (KL_OVRP_STAGES). The
 // answer to ovrp_GetEyeTextureStageCount, so it bounds every (eye, stage) key

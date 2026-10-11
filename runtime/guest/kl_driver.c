@@ -215,6 +215,35 @@ static void kl_driver_env_defaults(const kl_target *t) {
         setenv("KL_USLEEP_CAP", "250", 0);   // microseconds; the FMOD poll slept 5-33 ms/call
         setenv("KL_GUEST_QOS",  "1",   0);   // USER_INITIATED instead of default
     }
+    else if (!strcmp(t->name, "walkabout")) {
+        // "It lags every few seconds" (a Vision Pro, 2026-10-11): the display
+        // keeps its 100 Hz, and the GAME's frames arrive 100-300 ms late now
+        // and then. Say what each such moment was — the stall watch names the
+        // threads that were busy.
+        //
+        // What the watch found in two sessions: the long ones (0.3-0.6 s) are
+        // MoltenVK compiling a shader the first time a pipeline needs it (this
+        // is a Vulkan guest). A frame that arrives one refresh late about once
+        // a second is there as well, and was there still with the managed
+        // probe gated (kl_mprobe.c) — not explained yet.
+        setenv("KL_STALL_MS", "100", 0);
+        // ...and how long its frames take against the display's period, every
+        // ten seconds (the app's frame loop), while this is being looked into.
+        setenv("KL_GUEST_FRAME_STATS", "10", 0);
+        // So its pipelines are compiled before the game starts, as Alyx's are:
+        // what a session compiled is recorded in the app's klfz folder, and
+        // the next start compiles that list while the start window is still
+        // up (kl_fossilize.cpp, prepare_graphics in the app). The first start
+        // after installing has no list and is as before. Only where the app
+        // has named the folder.
+        if (getenv("KL_VK_FOZ_DIR")) {
+            setenv("KL_VK_FOZ_REPLAY", "auto", 0);
+            setenv("KL_VK_FOZ_REPLAY_BLOCK", "1", 0);
+            setenv("KL_VK_FOZ_THREADS", "6", 0);
+            setenv("KL_VK_FOZ_RECORD", "auto", 0);
+            setenv("KL_VK_DEVICE_INFO", "auto", 0);
+        }
+    }
     else if (!strcmp(t->name, "x5269080709783454")) {
         // Max Mustard (Unity 2022.3 + FMOD Studio over OpenSL). FMOD produced
         // sound in only a small fraction of its buffers — heard as near-silence

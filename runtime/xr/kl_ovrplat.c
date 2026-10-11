@@ -224,11 +224,25 @@ static int plat_is_checkout(const char *name) {
 // files that are really in that directory (klplat_scan_obb_langpacks) — again
 // a fact about the disk; delivery, delete and purchase calls are untouched.
 // KL_PLAT_LANGPACK_LIST=0 restores the empty list.
+//
+// Asgard's Wrath 2 is the third, with the same files (`de.lang`, `fr.lang`, …:
+// free voice packs, one per language, that the store hands every owner) and
+// one question more. Its engine mounts every .lang beside its OBBs by itself
+// (FAndroidPlatformFile::FMountOBBVisitor); what it asks the platform is which
+// packs are installed (ovr_AssetFile_GetList, as above) and which one is the
+// CURRENT one (ovr_LanguagePack_GetCurrent), and its language menu changes
+// that with ovr_LanguagePack_SetCurrent(tag). On a headset both went
+// unanswered and the German pack a user had fetched could not be chosen
+// (2026-10-11). The current pack is a choice between files that are on the
+// disk, remembered in a file of ours beside them (klplat_langpack_current);
+// choosing one that is not there is an error, as before — nothing is fetched
+// from here, and nothing in this family is for sale.
 static int plat_is_obb_langpack_target(void) {
     static int v = -1;
     if (v < 0) {
         const char *t = kl_driver_target_name();
-        v = kl_env_on("KL_PLAT_LANGPACK_LIST", t && strcmp(t, "x5812519008825194") == 0);
+        v = kl_env_on("KL_PLAT_LANGPACK_LIST", t && (strcmp(t, "x5812519008825194") == 0 ||
+                                                     strcmp(t, "wrath2") == 0));
     }
     return v;
 }
@@ -250,6 +264,16 @@ static int plat_is_langpack_status(const char *name) {
         if (strcmp(name, ok[i]) == 0) return 1;
     return 0;
 }
+// The completion of ovr_LanguagePack_SetCurrent is an AssetFileDownloadResult
+// by name, and for a pack that is already on the disk it is read for one thing:
+// that it names an asset. Only where the .lang files are listed at all; every
+// other title's "DownloadResult" is a delivery and stays refused.
+static int plat_is_langpack_select(const char *name) {
+    if (!plat_is_obb_langpack_target()) return 0;
+    return strcmp(name, "ovr_Message_GetAssetFileDownloadResult") == 0 ||
+           strcmp(name, "ovr_AssetFileDownloadResult_GetAssetId") == 0 ||
+           strcmp(name, "ovr_AssetFileDownloadResult_GetFilepath") == 0;
+}
 
 static int plat_is_drm(const char *name) {
     if (plat_is_absent_ok(name)) return 0;
@@ -258,6 +282,7 @@ static int plat_is_drm(const char *name) {
     if (plat_is_checkout(name)) return 0;
     if (plat_is_course_record(name)) return 0;
     if (plat_is_langpack_status(name)) return 0;
+    if (plat_is_langpack_select(name)) return 0;
     for (size_t i = 0; i < sizeof g_drm_markers / sizeof g_drm_markers[0]; i++)
         if (strstr(name, g_drm_markers[i])) return 1;
     return 0;
@@ -354,6 +379,7 @@ static uint64_t klplat_called(const char *name) {
 #define KLPLAT_MSG_ACHIEVEMENT_DEFS 0x03D3458Du  // .Achievements_GetAllDefinitions (empty array)
 #define KLPLAT_MSG_ACHIEVEMENT_PROG 0x4F9FDE1Du  // .Achievements_GetAllProgress (empty array)
 #define KLPLAT_MSG_LOGGED_IN_USER  0x436F345Du  // .User_GetLoggedInUser (Message<User>)
+#define KLPLAT_MSG_USER_GET        0x6BCF9E47u  // .User_Get (Message<User>; KL_PROBE_ENUM, Wooorld 2.4.0)
 #define KLPLAT_MSG_USER_PROOF      0x22810483u  // .User_GetUserProof (BRINK Traveler's
                                                 //   global-metadata, beside GetLoggedInUser's)
 #define KLPLAT_MSG_IAP_CHECKOUT    0x3F9B0D0Du  // .IAP_LaunchCheckoutFlow (KL_PROBE_ENUM, 1.28)
@@ -396,6 +422,7 @@ enum {
     KLPLAT_KIND_ASSET,
     KLPLAT_KIND_PURCHASES,
     KLPLAT_KIND_PRODUCTS,
+    KLPLAT_KIND_LANGPACK_SET,   // obj is the pack ovr_LanguagePack_SetCurrent chose
 };
 typedef struct {
     uint32_t type; uint64_t request; int32_t payload; const char *str; int err;
@@ -568,7 +595,10 @@ static int langpack_in_manifest(const char *dir, const char *name,
 
 // The `<tag>.lang` files in AC Nexus's OBB directory (plat_is_obb_langpack_target).
 // Rescanned on every question, so the answer is what is on disk now.
-#define KLPLAT_OBB_LANG_PKG "com.Ubisoft.ACNexusVR"
+static const char *klplat_obb_lang_pkg(void) {
+    const char *t = kl_driver_target_name();
+    return t && strcmp(t, "wrath2") == 0 ? "com.Sanzaru.Wrath2" : "com.Ubisoft.ACNexusVR";
+}
 static klplat_asset g_lang[8];
 static int          g_nlang;
 static int klplat_scan_obb_langpacks(void) {
@@ -576,7 +606,7 @@ static int klplat_scan_obb_langpacks(void) {
     const char *root = kl_jni_files_dir();
     char dir[PATH_MAX];
     if (!root || !root[0] ||
-        snprintf(dir, sizeof dir, "%s/Android/obb/" KLPLAT_OBB_LANG_PKG, root) >= (int)sizeof dir)
+        snprintf(dir, sizeof dir, "%s/Android/obb/%s", root, klplat_obb_lang_pkg()) >= (int)sizeof dir)
         return 0;
     DIR *d = opendir(dir);
     if (!d) return 0;
@@ -626,6 +656,89 @@ static uint64_t klplat_obb_langpack_status(const char *what, uint32_t type,
         if (g_msgq[i % KLPLAT_MSGQ].request == req) g_msgq[i % KLPLAT_MSGQ].obj = a;
     pthread_mutex_unlock(&g_msg_mu);
     return req;
+}
+
+// ---- the CURRENT language pack (Asgard's Wrath 2; plat_is_obb_langpack_target) ----
+// The SDK's own numbers for the two completions (OVR_MessageType.h). Unreal's
+// Oculus subsystem hands a completion to whoever made the request, by request
+// id, so nothing here depends on them being right.
+#define KLPLAT_MSG_LANGPACK_GET_CURRENT 0x1F90F0D5u
+#define KLPLAT_MSG_LANGPACK_SET_CURRENT 0x5B4FBBE0u
+static int klplat_langpack_choice_path(char *out, size_t cap) {
+    const char *root = kl_jni_files_dir();
+    return root && root[0] && snprintf(out, cap, "%s/klepton-language-pack.txt", root) < (int)cap;
+}
+// Which of the packs on the disk is the current one: the one that was chosen
+// (a tag in klepton-language-pack.txt, written by SetCurrent below — and a
+// chosen tag with no pack, "en", means none); with nothing chosen yet, the
+// pack of the language the game is told the device speaks, when it is there.
+static klplat_asset *klplat_langpack_current(void) {
+    if (klplat_scan_obb_langpacks() == 0) return NULL;
+    char tag[32] = "", path[PATH_MAX];
+    int chosen = 0;
+    if (klplat_langpack_choice_path(path, sizeof path)) {
+        FILE *f = fopen(path, "r");
+        if (f) { chosen = fscanf(f, "%31s", tag) == 1; fclose(f); }
+    }
+    if (!chosen) {
+        char country[16];
+        kl_jni_locale_parts(tag, sizeof tag, country, sizeof country);
+    }
+    for (int i = 0; i < g_nlang; i++)
+        if (strcasecmp(g_lang[i].tag, tag) == 0) return &g_lang[i];
+    return NULL;
+}
+static uint64_t klplat_LanguagePack_GetCurrent(void) {
+    plat_hit("ovr_LanguagePack_GetCurrent");
+    if (!plat_is_obb_langpack_target())
+        return klplat_request_err("ovr_LanguagePack_GetCurrent", KLPLAT_MSG_LANGPACK_GET_CURRENT);
+    klplat_asset *a = klplat_langpack_current();
+    fprintf(stderr, "  [plat] current language pack: %s\n", a ? a->tag : "none");
+    // With none, the completion still succeeds and its language tag reads "".
+    uint64_t req = klplat_request("ovr_LanguagePack_GetCurrent", KLPLAT_MSG_LANGPACK_GET_CURRENT, 0);
+    pthread_mutex_lock(&g_msg_mu);
+    for (unsigned i = g_msg_head; i != g_msg_tail; i++)
+        if (g_msgq[i % KLPLAT_MSGQ].request == req) g_msgq[i % KLPLAT_MSGQ].obj = a;
+    pthread_mutex_unlock(&g_msg_mu);
+    return req;
+}
+static uint64_t klplat_LanguagePack_SetCurrent(const char *tag) {
+    plat_hit("ovr_LanguagePack_SetCurrent");
+    if (!plat_is_obb_langpack_target() || !tag || !tag[0] || strlen(tag) > 31 || strpbrk(tag, "/ \t\r\n"))
+        return klplat_request_err("ovr_LanguagePack_SetCurrent", KLPLAT_MSG_LANGPACK_SET_CURRENT);
+    klplat_scan_obb_langpacks();
+    klplat_asset *a = NULL;
+    for (int i = 0; i < g_nlang && !a; i++)
+        if (strcasecmp(g_lang[i].tag, tag) == 0) a = &g_lang[i];
+    // Remembered either way: a language with no pack ("en") is how a player
+    // goes back to the voices the game ships with.
+    char path[PATH_MAX];
+    if (klplat_langpack_choice_path(path, sizeof path)) {
+        FILE *f = fopen(path, "w");
+        if (f) { fprintf(f, "%s\n", tag); fclose(f); }
+    }
+    fprintf(stderr, "  [plat] language pack '%s' chosen: %s\n", tag,
+            a ? "on the device -> current" : "not on the device (it cannot be fetched from here) -> no pack is current");
+    if (!a) return klplat_request_err("ovr_LanguagePack_SetCurrent", KLPLAT_MSG_LANGPACK_SET_CURRENT);
+    uint64_t req = klplat_request_kind("ovr_LanguagePack_SetCurrent", KLPLAT_MSG_LANGPACK_SET_CURRENT,
+                                       0, KLPLAT_KIND_LANGPACK_SET);
+    pthread_mutex_lock(&g_msg_mu);
+    for (unsigned i = g_msg_head; i != g_msg_tail; i++)
+        if (g_msgq[i % KLPLAT_MSGQ].request == req) g_msgq[i % KLPLAT_MSGQ].obj = a;
+    pthread_mutex_unlock(&g_msg_mu);
+    return req;
+}
+static uint64_t klplat_Message_GetAssetFileDownloadResult(const klplat_msg *m) {
+    plat_hit("ovr_Message_GetAssetFileDownloadResult");
+    return m && m->kind == KLPLAT_KIND_LANGPACK_SET ? (uint64_t)(uintptr_t)m->obj : 0;
+}
+static uint64_t klplat_AssetFileDownloadResult_GetAssetId(const klplat_asset *a) {
+    plat_hit("ovr_AssetFileDownloadResult_GetAssetId");
+    return a ? a->id : 0;
+}
+static const char *klplat_AssetFileDownloadResult_GetFilepath(const klplat_asset *a) {
+    plat_hit("ovr_AssetFileDownloadResult_GetFilepath");
+    return a ? a->path : "";
 }
 
 static uint64_t klplat_langpack_StatusByName(const char *name) {
@@ -1784,7 +1897,15 @@ static int klplat_user_default(void) {
                                 // Sniper Elite VR: with no user its Init scene
                                 // activates, the loading screen fades out, and it
                                 // stops submitting frames for good.
-                                "x2544573735586536" };
+                                "x2544573735586536",
+                                // Wooorld: the AC Nexus chain again. Its boot
+                                // logs "OVR Initialized: Success", the
+                                // entitlement request goes out, GetLoggedInUser
+                                // fails with "An unknown error occurred. Request
+                                // failed." and the game stays in its boot scene:
+                                // sound, and two draws a frame of black (on
+                                // device, 2026-10-11).
+                                "x4360608937312293" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
@@ -1800,6 +1921,52 @@ static uint64_t klplat_User_GetLoggedInUser(void) {
         return 0;
     }
     return klplat_request("ovr_User_GetLoggedInUser", KLPLAT_MSG_LOGGED_IN_USER, 0);
+}
+
+// ovr_User_Get(userID) — one user's profile, by id. Its completion is
+// Message<User>, read through the same accessors as GetLoggedInUser's. Wooorld
+// asks it for the id GetLoggedInUser just gave it — the SDK's own advice, since
+// the logged-in-user message need not carry the display name — and there was
+// no entry point: "unimplemented Oculus Platform entry point 'ovr_User_Get'",
+// one frame after the offline user was handed out (on a Mac host, 2026-10-11).
+// Asked for the offline user itself, the answer is that same user; nothing is
+// added to what GetLoggedInUser already said. Asked for anyone else — or with
+// no user handed out at all — there is no service to look them up in, and that
+// is an ERROR completion rather than a 0, so the caller's callback still runs
+// (see the user-proof note above).
+static uint64_t klplat_User_Get(uint64_t user_id) {
+    plat_hit("ovr_User_Get");
+    if (user_id == 1000000000000042ull &&          // == klplat_User_GetID's synthetic ovrID
+        kl_env_on("KL_PLAT_USER", klplat_user_default()))
+        return klplat_request("ovr_User_Get", KLPLAT_MSG_USER_GET, 0);
+    return klplat_request_err("ovr_User_Get", KLPLAT_MSG_USER_GET);
+}
+
+// ovr_User_GetOrgScopedID(userID) — the id a developer's own backend knows the
+// user by. Nothing here can issue one, and a made-up id sent to somebody's
+// server would be a lie about who is playing, so the request fails for every
+// guest. What differs is the SHAPE of the failure, as with the user proof
+// above. The default stays 0 through klplat_init_fails further down, "the
+// request could not be made" (Asgard's Wrath 2 walks past that). Wooorld
+// (x4360608937312293) does not walk past it: its sign-in is GetLoggedInUser ->
+// User_Get -> GetOrgScopedID -> a nonce -> its own cloud, the SDK meets a 0
+// with "Request failed" and never calls the callback, and the game waits on
+// that callback in a black boot scene. An ERROR completion runs the game's own
+// handler instead ("Error getting OrgScopedId: ..." in its log; it asks again
+// some time later). It does NOT sign the game in: Wooorld's cloud wants an id
+// and a proof only Meta can issue.
+#define KLPLAT_MSG_ORG_SCOPED_ID   0x18F0B01Bu  // .User_GetOrgScopedID (KL_PROBE_ENUM, Wooorld 2.4.0)
+static uint64_t klplat_init_fails(const char *name);
+static uint64_t klplat_User_GetOrgScopedID(uint64_t user_id) {
+    (void)user_id;
+    static int err = -1;
+    if (err < 0) {
+        const char *t = kl_driver_target_name();
+        err = t && strcmp(t, "x4360608937312293") == 0;
+    }
+    if (!err) return klplat_init_fails("ovr_User_GetOrgScopedID");
+    plat_hit("ovr_User_GetOrgScopedID");
+    return klplat_request_err("ovr_User_GetOrgScopedID", KLPLAT_MSG_ORG_SCOPED_ID);
 }
 
 // The User that completion carries. The message handle IS the user handle (one
@@ -2396,6 +2563,8 @@ static const char *klplat_MessageType_ToString(uint32_t type) {
     case KLPLAT_MSG_ACCESS_TOKEN:           return "ovrMessage_User_GetAccessToken";
     case KLPLAT_MSG_ACHIEVEMENT_DEFS:       return "ovrMessage_Achievements_GetAllDefinitions";
     case KLPLAT_MSG_LOGGED_IN_USER:         return "ovrMessage_User_GetLoggedInUser";
+    case KLPLAT_MSG_USER_GET:               return "ovrMessage_User_Get";
+    case KLPLAT_MSG_ORG_SCOPED_ID:          return "ovrMessage_User_GetOrgScopedID";
     case KLPLAT_MSG_LEADERBOARD_GET_ENTRIES: return "ovrMessage_Leaderboard_GetEntries";
     case KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY: return "ovrMessage_Leaderboard_WriteEntry";
     case KLPLAT_MSG_IAP_PURCHASES:          return "ovrMessage_IAP_GetViewerPurchases";
@@ -2504,6 +2673,10 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     // user was handed out. The exact-match binding overrides ovr_User_GetLoggedInUser's
     // entry in g_plat_request.
     {"ovr_User_GetLoggedInUser",               (void *)klplat_User_GetLoggedInUser},
+    {"ovr_User_Get",                           (void *)klplat_User_Get},
+    // The exact-match binding overrides the name's entry in g_plat_request,
+    // which is still what every guest but one gets (see the handler).
+    {"ovr_User_GetOrgScopedID",                (void *)klplat_User_GetOrgScopedID},
     {"ovr_Message_GetUser",                    (void *)klplat_Message_GetPayload},
     {"ovr_User_GetID",                         (void *)klplat_User_GetID},
     {"ovr_User_GetOculusID",                   (void *)klplat_User_GetOculusID},
@@ -2535,6 +2708,13 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_LanguagePackInfo_GetEnglishName", (void *)klplat_LanguagePackInfo_tag},
     {"ovr_LanguagePackInfo_GetNativeName",  (void *)klplat_LanguagePackInfo_tag},
     {"ovr_LanguagePackInfo_GetTag",         (void *)klplat_LanguagePackInfo_tag},
+    // The current pack (Asgard's Wrath 2). The two DownloadResult readers are
+    // reached only where plat_is_langpack_select lets them past the refusal.
+    {"ovr_LanguagePack_GetCurrent",             (void *)klplat_LanguagePack_GetCurrent},
+    {"ovr_LanguagePack_SetCurrent",             (void *)klplat_LanguagePack_SetCurrent},
+    {"ovr_Message_GetAssetFileDownloadResult",  (void *)klplat_Message_GetAssetFileDownloadResult},
+    {"ovr_AssetFileDownloadResult_GetAssetId",  (void *)klplat_AssetFileDownloadResult_GetAssetId},
+    {"ovr_AssetFileDownloadResult_GetFilepath", (void *)klplat_AssetFileDownloadResult_GetFilepath},
     {"ovr_Message_GetRequestID",  (void *)klplat_Message_GetRequestID},
     {"ovr_Message_GetPlatformInitialize",      (void *)klplat_Message_GetPayload},
     {"ovr_PlatformInitialize_GetResult",       (void *)klplat_payload_int},

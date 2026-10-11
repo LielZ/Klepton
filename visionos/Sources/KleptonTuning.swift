@@ -274,3 +274,74 @@ struct RenderingView: View {
         }
     }
 }
+
+// The language the game is told the device speaks.
+//
+// A Quest game reads the device's language and many decide everything from it:
+// Asgard's Wrath 2 has no language menu at all, text and voices follow the
+// device. Here nothing sets a language for the guest, so every game was told
+// en_US — and a player with a German headset and the German voice pack on it
+// heard English. The device's own language is passed along (KleptonApp.init,
+// KL_DEVICE_LANG) and this says whether the guest hears about it
+// (KL_LOCALE_DEVICE, read in kl_jni_services.c).
+//
+// The default is the target's: the device's language where a game is known to
+// depend on it (wrath2), English — what every game got so far — elsewhere, so
+// that nothing changes language unasked. Read once, at boot.
+final class KleptonLanguage: ObservableObject {
+    static let shared = KleptonLanguage()
+    private static let key = "klepton.gameLanguage"      // "device" | "en"
+
+    static let targetDefault: String =
+        String(cString: kl_app_target_name_or_default()) == "wrath2" ? "device" : "en"
+
+    /// The device's first language in its own words ("Deutsch"), for the picker.
+    static let deviceLanguageName: String = {
+        guard let first = Locale.preferredLanguages.first else { return "English" }
+        let loc = Locale(identifier: first)
+        let code = loc.language.languageCode?.identifier ?? "en"
+        return (loc.localizedString(forLanguageCode: code) ?? code).capitalized(with: loc)
+    }()
+    static let deviceIsEnglish: Bool =
+        Locale.preferredLanguages.first?.lowercased().hasPrefix("en") ?? true
+
+    @Published var choice: String {
+        didSet { UserDefaults.standard.set(choice, forKey: Self.key) }
+    }
+
+    private init() {
+        let stored = UserDefaults.standard.string(forKey: Self.key)
+        choice = (stored == "device" || stored == "en") ? stored! : Self.targetDefault
+    }
+
+    /// Before kl_app_boot. An explicit KL_LOCALE_DEVICE on a launch line wins.
+    func apply() {
+        setenv("KL_LOCALE_DEVICE", choice == "device" ? "1" : "0", 0)
+        NSLog("[app] game language: \(choice == "device" ? "the device's (\(Self.deviceLanguageName))" : "English")"
+              + " (target default \(Self.targetDefault))")
+    }
+}
+
+struct GameLanguageView: View {
+    @ObservedObject private var language = KleptonLanguage.shared
+
+    var body: some View {
+        // A device set to English has nothing to choose between.
+        if !KleptonLanguage.deviceIsEnglish {
+            VStack(alignment: .leading, spacing: 8) {
+                Picker(klT("Game language", "Sprache des Spiels"), selection: $language.choice) {
+                    Text(KleptonLanguage.deviceLanguageName).tag("device")
+                    Text("English").tag("en")
+                }
+                .pickerStyle(.segmented)
+                Text(klT("What the game is told this headset is set to. Games that offer the "
+                         + "language use it for text and, where their voice pack is installed, "
+                         + "for voices. Takes effect the next time the app starts.",
+                         "Was dem Spiel als Sprache dieser Brille gemeldet wird. Spiele, die die "
+                         + "Sprache anbieten, nutzen sie für Texte und – wenn ihr Sprachpaket "
+                         + "installiert ist – für die Stimmen. Gilt ab dem nächsten Start der App."))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+}

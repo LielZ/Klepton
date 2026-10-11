@@ -223,6 +223,7 @@ __google_potentially_blocking_region_begin __google_potentially_blocking_region_
 getrandom isnan
 mmap madvise sysinfo
 warnx fopen64 fseeko64 ftello64 __fwrite_chk exit _exit chdir
+putenv
 """.split())
 
 # Excluded from the table but NOT hand-written anywhere: names we deliberately

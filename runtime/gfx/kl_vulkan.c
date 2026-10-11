@@ -1033,8 +1033,10 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
 // freed MoltenVK object handed back to MoltenVK.
 void klvk_ap_drain_all(void);
 static void klvk_frame_mark_forget(klvk_device *d);
+static void klvk_pcache_wait(VkDevice dev);
 static void klvk_DestroyDevice(VkDevice dev, const VkAllocationCallbacks *alloc) {
     PFN_vkDestroyDevice real = real_gdpa ? (PFN_vkDestroyDevice)real_gdpa(dev, "vkDestroyDevice") : NULL;
+    klvk_pcache_wait(dev);
     klvk_ap_drain_all();
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_ndev; i++)
@@ -4811,6 +4813,147 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
     }
     return r;
 }
+// vkCreatePipelineCache with the cache a guest saved in an earlier session.
+//
+// MoltenVK's pipeline cache is the MSL source of every shader the session
+// used, and reading it back COMPILES each of them, in this call, before it
+// returns. Asgard's Wrath 2 hands over 30 MB at every start. While the
+// system's own Metal cache still holds the results that is 0.2 s; when it does
+// not — after the app was installed again, after an update of the system, or
+// when the system cleared the app's caches to make room — it was 95 s on a
+// Mac, and on a headset a black picture with no sign of life for as long
+// ("it does not start any more", given up after 18 s, 2026-10-11).
+//
+// So the read gets a moment (KL_VK_CACHE_WAIT_MS, default 1500), on a thread
+// of its own. Done in time: the guest gets that cache, as before. Not done:
+// the guest gets an EMPTY cache and goes on at once — which is the start of a
+// freshly installed game, and the game's own "compiling shaders" screen where
+// it has one, instead of nothing at all. The read is left to finish behind it;
+// what it compiles lands in Metal's cache, so the pipelines the game then asks
+// for are quick, and so is the whole saved cache at the next start. It runs at
+// background priority once the guest has gone on, so the two do not fight over
+// the compiler ("you are doing it twice now", the same day). Its result
+// is thrown away rather than merged into the guest's cache while the guest is
+// using it (the guest writes its cache out again as it goes).
+//
+// A card of our own over the wait was tried first (c823cf0) and was the worse
+// answer: the game has a screen for exactly this, and behind the card it then
+// came as well — Wrath 2 walks its own list of 7,150 pipelines at every start
+// (a second on a warm headset), so the saved cache was the same work once
+// more, in front of it and in the dark.
+typedef struct {
+    VkDevice dev;
+    PFN_vkCreatePipelineCache create;
+    void *blob; size_t size;
+    VkPipelineCacheCreateFlags flags;
+    VkPipelineCache cache;
+    VkResult res;
+    int done, abandoned;
+    double t0;
+} klvk_pcache_job;
+static pthread_mutex_t g_pcache_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_pcache_cv = PTHREAD_COND_INITIALIZER;
+static klvk_pcache_job *g_pcache_behind;     // the one read still running behind the guest
+
+static void *klvk_pcache_thread(void *arg) {
+    klvk_pcache_job *j = arg;
+    pthread_setname_np("kl-vk-saved-cache");
+    VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .flags = j->flags,
+                                     .initialDataSize = j->size, .pInitialData = j->blob };
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    VkResult r = j->create(j->dev, &ci, NULL, &cache);
+    pthread_mutex_lock(&g_pcache_mu);
+    j->cache = cache; j->res = r; j->done = 1;
+    int abandoned = j->abandoned;
+    pthread_cond_broadcast(&g_pcache_cv);
+    pthread_mutex_unlock(&g_pcache_mu);
+    if (!abandoned) return NULL;            // the caller is waiting and owns the job
+
+    fprintf(stderr, "  [vk] saved pipeline cache: read behind the guest in %.1f s (result %d) — "
+                    "its shaders are in Metal's cache for the next start\n", (kl_pipe_ms() - j->t0) / 1000.0, (int)r);
+    if (r == VK_SUCCESS && cache && real_gdpa) {
+        PFN_vkDestroyPipelineCache destroy = (PFN_vkDestroyPipelineCache)real_gdpa(j->dev, "vkDestroyPipelineCache");
+        if (destroy) destroy(j->dev, cache, NULL);
+    }
+    pthread_mutex_lock(&g_pcache_mu);
+    if (g_pcache_behind == j) g_pcache_behind = NULL;
+    pthread_cond_broadcast(&g_pcache_cv);
+    pthread_mutex_unlock(&g_pcache_mu);
+    free(j->blob); free(j);
+    return NULL;
+}
+
+// A device is about to go: a read still running on it has to end first.
+static void klvk_pcache_wait(VkDevice dev) {
+    pthread_mutex_lock(&g_pcache_mu);
+    while (g_pcache_behind && g_pcache_behind->dev == dev) pthread_cond_wait(&g_pcache_cv, &g_pcache_mu);
+    pthread_mutex_unlock(&g_pcache_mu);
+}
+
+static VkResult VKAPI_CALL klvk_CreatePipelineCache(VkDevice dev, const VkPipelineCacheCreateInfo *ci,
+        const VkAllocationCallbacks *alloc, VkPipelineCache *out) {
+    static PFN_vkCreatePipelineCache real;
+    if (!real && real_gdpa)
+        real = (PFN_vkCreatePipelineCache)real_gdpa(dev, "vkCreatePipelineCache");
+    if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    size_t saved = ci && ci->pInitialData ? ci->initialDataSize : 0;
+    unsigned wait_ms = kl_env_uint("KL_VK_CACHE_WAIT_MS", 1500);
+    klvk_pcache_job *j = NULL;
+    pthread_mutex_lock(&g_pcache_mu);
+    int busy = g_pcache_behind != NULL;
+    pthread_mutex_unlock(&g_pcache_mu);
+    // Small caches are read in place, as is everything with the switch at 0;
+    // so is a second large one while a first is still being read.
+    if (saved < (1u << 20) || !wait_ms || busy || !(j = calloc(1, sizeof *j)) || !(j->blob = malloc(saved))) {
+        free(j);
+        double t0 = kl_pipe_ms();
+        VkResult r = real(dev, ci, alloc, out);
+        if (saved >= (1u << 20))
+            fprintf(stderr, "  [vk] vkCreatePipelineCache: %.1f MB of saved cache read in place, result %d after %.1f s\n",
+                    (double)saved / 1048576.0, (int)r, (kl_pipe_ms() - t0) / 1000.0);
+        return r;
+    }
+    memcpy(j->blob, ci->pInitialData, saved);
+    j->dev = dev; j->create = real; j->size = saved; j->flags = ci->flags; j->t0 = kl_pipe_ms();
+    // The thread is a background one that is lifted to the caller's urgency
+    // for as long as the caller waits for it: once the guest has gone on with
+    // an empty cache, the read must not compete with the compiling the guest
+    // then does in front of the player — that would be the same wait twice.
+    pthread_t th;
+    pthread_attr_t at; pthread_attr_init(&at); pthread_attr_set_qos_class_np(&at, QOS_CLASS_UTILITY, 0);
+    int started = pthread_create(&th, &at, klvk_pcache_thread, j) == 0;
+    pthread_attr_destroy(&at);
+    if (!started) { free(j->blob); free(j); return real(dev, ci, alloc, out); }
+    pthread_override_t lift = pthread_override_qos_class_start_np(th, QOS_CLASS_USER_INITIATED, 0);
+
+    struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += wait_ms / 1000; until.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
+    if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&g_pcache_mu);
+    while (!j->done && pthread_cond_timedwait(&g_pcache_cv, &g_pcache_mu, &until) == 0) { }
+    int done = j->done;
+    if (!done) { j->abandoned = 1; g_pcache_behind = j; }
+    pthread_mutex_unlock(&g_pcache_mu);
+    if (lift) pthread_override_qos_class_end_np(lift);
+
+    if (done) {
+        pthread_join(th, NULL);
+        VkResult r = j->res;
+        if (r == VK_SUCCESS) *out = j->cache;
+        fprintf(stderr, "  [vk] vkCreatePipelineCache: %.1f MB of saved cache, result %d after %.1f s\n",
+                (double)saved / 1048576.0, (int)r, (kl_pipe_ms() - j->t0) / 1000.0);
+        free(j->blob); free(j);
+        return r;
+    }
+    fprintf(stderr, "  [vk] vkCreatePipelineCache: %.1f MB of saved cache not read within %u ms — Metal's cache is cold. "
+                    "The guest starts with an empty cache, as after a fresh install; the read goes on behind it\n",
+            (double)saved / 1048576.0, wait_ms);
+    pthread_detach(th);
+    VkPipelineCacheCreateInfo empty = *ci;
+    empty.initialDataSize = 0; empty.pInitialData = NULL;
+    return real(dev, &empty, alloc, out);
+}
+
 static VkResult VKAPI_CALL klvk_CreateComputePipelines(VkDevice dev,
         VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkPipeline *out) {
@@ -9012,7 +9155,7 @@ static const entry g_ours[] = {
     E(CmdCopyBuffer), E(CmdUpdateBuffer),
     E(CmdBlitImage), E(CmdResolveImage), E(CmdClearColorImage),
     E(CmdCopyBufferToImage), E(CmdCopyImageToBuffer), E(CmdPipelineBarrier),
-    R(CreateGraphicsPipelines), R(CreateComputePipelines),
+    R(CreateGraphicsPipelines), R(CreateComputePipelines), E(CreatePipelineCache),
     E(DestroyPipeline), E(DestroyShaderModule), E(DestroyPipelineLayout),
     E(SetDebugUtilsObjectNameEXT), E(SetDebugUtilsObjectTagEXT),
     E(DebugMarkerSetObjectNameEXT), E(DebugMarkerSetObjectTagEXT),

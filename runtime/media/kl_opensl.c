@@ -1215,14 +1215,17 @@ static void take_device(kl_sl_player *p) {
 int kl_opensl_audio_users(void) { return g_audio_users; }
 void kl_opensl_yield_device(unsigned rate) {
     if (!g_audio_users || !rate) return;
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    int aaudio_owns_pistol_whip = t && !strcmp(t, "x2104963472963790");
     g_device_rate = rate;
     for (unsigned i = 0; i < sizeof g_players / sizeof g_players[0]; i++) {
         kl_sl_player *p = &g_players[i];
-        if (!p->started || !p->mixes || p->rate == rate) continue;
+        if (!p->started || !p->mixes || (!aaudio_owns_pistol_whip && p->rate == rate)) continue;
         p->mixes = 0;
         kl_audio_src_release(p);
         fprintf(stderr, "  [sl] player #%u at %u Hz yields the device to an AAudio "
-                        "stream at %u Hz — pacing silently from here\n",
-                i, p->rate, rate);
+                        "stream at %u Hz%s — pacing silently from here\n",
+                i, p->rate, rate, aaudio_owns_pistol_whip ? " (exclusive for Pistol Whip)" : "");
     }
 }

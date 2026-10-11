@@ -389,7 +389,14 @@ void kl_obbmap_init(const char *obbdir, const char *ue4game_base) {
     unsigned files = 0;
     while ((e = readdir(d)) != NULL) {
         size_t L = strlen(e->d_name);
-        if (L < 4 || strcmp(e->d_name + L - 4, ".obb") != 0) continue;
+        // ...and the store's language packs, `<tag>.lang`: the same ZIP as an
+        // OBB under another name (Asgard's Wrath 2's de.lang is 73 stored FMOD
+        // banks, Wrath2/Content/FMOD/Desktop/VO_*_DE.bank). Unreal's own OBB
+        // visitor mounts them beside the .obb files; left out here, the banks
+        // of a pack that was on the device were not there for the sound engine.
+        int is_obb  = L >= 4 && strcmp(e->d_name + L - 4, ".obb") == 0;
+        int is_lang = L >= 5 && strcmp(e->d_name + L - 5, ".lang") == 0;
+        if (!is_obb && !is_lang) continue;
         char p[1024];
         snprintf(p, sizeof p, "%s/%s", obbdir, e->d_name);
         index_one(p);

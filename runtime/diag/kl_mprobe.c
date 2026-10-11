@@ -753,6 +753,15 @@ void kl_mprobe_tick(unsigned frame) {
 
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_PROBE_INPUT", 0);
+    // The gate this file's header and its caller both describe, and which was
+    // not here: `on` was read and never looked at, so every IL2CPP guest was
+    // probed every 120 frames from frame 1200 on — on a headset, in every run.
+    // Each probe calls into the game's own managed code on the frame thread
+    // (OVRInput, the event system, FindObjectsOfType for the menu objects)
+    // and prints four lines; Walkabout's log shows it every 1.2 s for a whole
+    // session, beside a frame that arrives a refresh late about as often
+    // (2026-10-11). Off unless asked for, as documented.
+    if (!on) return;
     static unsigned every, from;
     if (!every) {
         every = kl_env_uint("KL_PROBE_EVERY", 120);

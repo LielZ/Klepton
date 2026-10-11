@@ -165,11 +165,12 @@ static int klaa_burst_frames(void) {
         // Dead: Saints & Sinners and Tales from the Galaxy's Edge (fixes 15
         // and 16, 2026-10-11) — three titles, so it is the sound engine's
         // block size and not a game's; there is no telling from here which
-        // guest carries that Wwise, so they are named.
+        // guest carries that Wwise, so they are named. Pistol Whip is the
+        // fourth (fix 26, 2026-10-11).
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
         static const char *const wwise[] = { "x5812519008825194", "x2897337400373711",
-                                             "x3484270071659289" };
+                                             "x3484270071659289", "x2104963472963790" };
         for (unsigned i = 0; t && i < sizeof wwise / sizeof *wwise; i++)
             if (strcmp(t, wwise[i]) == 0) n = 1024;
     }

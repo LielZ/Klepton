@@ -148,6 +148,14 @@ int kl_reproject_srgb_decode(void) {
 // contract, and having them in one file is how they stay one.
 //
 // Drawn as a 4-vertex triangle strip with no vertex buffer.
+// The guest's colour scale and offset for the eye picture — written by the
+// guest's frame thread, read by the compositor's. Component by component, which
+// can show one frame of a fade with a mixed step and nothing worse.
+static volatile float s_eye_scale[4] = { 1, 1, 1, 1 }, s_eye_offset[4];
+void kl_reproject_set_eye_color(const float scale[4], const float offset[4]) {
+    for (int i = 0; i < 4; i++) { s_eye_scale[i] = scale[i]; s_eye_offset[i] = offset[i]; }
+}
+
 static const char kl_msl_reproject[] =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
@@ -166,6 +174,8 @@ static const char kl_msl_reproject[] =
 "    float    chromaMin;\n"
 "    float    chromaMax;\n"
 "    packed_float3 chromaKey;  // packed: matches the C side's three floats\n"
+"    packed_float4 colorFade;  // 1 - the guest's colour scale; kl_reproject.h\n"
+"    packed_float4 colorOffset;\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -204,6 +214,7 @@ static const char kl_msl_reproject[] =
 // the same texture is bound twice and this reduces to exactly what it was.
 "struct VOut { float4 pos [[position]]; float2 uv; uint slice [[flat]];\n"
 "              uint srgb [[flat]]; uint src [[flat]];\n"
+"              float3 colorFade [[flat]]; float3 colorOffset [[flat]];\n"
 // The chroma parameters travel as flat varyings for the same reason `slice` and
 // `srgbDecode` do: with both eyes drawn in one amplified pass the fragment stage
 // has no amplification_id, so it cannot index the per-view uniform array it
@@ -337,6 +348,8 @@ static const char kl_msl_reproject[] =
 "    o.chromaOn = u.chromaOn;\n"
 "    o.chromaKey = float3(u.chromaKey);\n"
 "    o.chromaRange = float2(u.chromaMin, u.chromaMax);\n"
+"    o.colorFade = float4(u.colorFade).rgb;\n"
+"    o.colorOffset = float4(u.colorOffset).rgb;\n"
 "    // The amplification index IS the texture slot: the caller binds the views'\n"
 "    // textures in the order it amplified them. A single-view pass amplifies\n"
 "    // once, lands on 0, and binds one texture.\n"
@@ -377,6 +390,9 @@ static const char kl_msl_reproject[] =
 "                               sampler samp [[sampler(0)]])\n"
 "{\n"
 "    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+// The guest's own fade (ovrp_SetColorScaleAndOffset), before the matte: a
+// picture faded to black is black, not whatever the key colour makes of it.
+"    c.rgb = c.rgb * (float3(1.0) - in.colorFade) + in.colorOffset;\n"
 // The matte is applied HERE and in no probe below. A rung of the probe ladder
 // exists to answer "is the picture arriving", and one that could also be
 // keyed out would answer that question with the matte's opinion — which is the
@@ -417,6 +433,8 @@ static const char kl_msl_reproject[] =
 "    o.chromaOn = ua[amp].chromaOn;\n"
 "    o.chromaKey = float3(ua[amp].chromaKey);\n"
 "    o.chromaRange = float2(ua[amp].chromaMin, ua[amp].chromaMax);\n"
+"    o.colorFade = float3(0.0);\n"
+"    o.colorOffset = float3(0.0);\n"
 "    o.src = uint(amp);\n"
 "    o.pos = ua[amp].visible == 0u ? kl_offscreen\n"
 "                                  : float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
@@ -496,6 +514,9 @@ static const char kl_msl_overlay[] =
 "    uint     srgb_decode;\n"
 "    uint     visible;\n"
 "    uint     opaque;\n"
+"    uint     cyl_segments;\n"
+"    float    cyl_radius;\n"
+"    float    cyl_half_angle;\n"
 "};\n"
 "vertex VOut kl_ov_v(uint vid [[vertex_id]],\n"
 "                    constant KLOv *us [[buffer(0)]],\n"
@@ -507,6 +528,16 @@ static const char kl_msl_overlay[] =
 // ovrpLayerSubmit's Pose states its orientation in.
 "    float2 c = float2((vid & 1) ? 1.0 : -1.0, (vid & 2) ? -1.0 : 1.0);\n"
 "    float4 p = float4(c * u.half_size, 0.0, 1.0);\n"
+// A cylinder: the same strip bent round the pose — pairs of vertices (top,
+// bottom) stepping along the arc, on the inside of a surface `cyl_radius` away
+// in the direction the pose faces. c keeps its meaning (-1..1 across, +1 top)
+// so the texture coordinates below are the quad's.
+"    if (u.cyl_segments != 0u) {\n"
+"        float fx = float(vid >> 1) / float(u.cyl_segments);\n"
+"        c = float2(fx * 2.0 - 1.0, (vid & 1u) ? -1.0 : 1.0);\n"
+"        float th = c.x * u.cyl_half_angle;\n"
+"        p = float4(u.cyl_radius * sin(th), c.y * u.half_size.y, -u.cyl_radius * cos(th), 1.0);\n"
+"    }\n"
 "    o.pos = u.projection * (u.model_view * p);\n"
 // Bottom-left origin as the base, and `flip_y` meaning "the picture's origin is
 // the TOP left" — the same convention as the reprojection pass above and as
@@ -787,6 +818,10 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     // exactly this call and no other.
     u.chroma_on = (uint32_t)kl_reproject_chroma(u.chroma_key, &u.chroma_min,
                                                 &u.chroma_max);
+    for (int i = 0; i < 4; i++) {
+        u.color_fade[i]   = 1.0f - s_eye_scale[i];
+        u.color_offset[i] = s_eye_offset[i];
+    }
 
     if (rendered && rendered->serial) {
         const float *t = rendered->tangents[(unsigned)eye > 1 ? 0 : eye];
@@ -947,13 +982,16 @@ kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
     u.visible    = 0;
     if (!ov) return u;
 
-    // Only the Quad is implemented, and an unimplemented shape is REFUSED
-    // rather than drawn as a quad: a cylinder or an equirect placed as a flat
+    // The Quad and the Cylinder are implemented, and any other shape is
+    // REFUSED rather than drawn as a quad: an equirect placed as a flat
     // rectangle is a wrong picture with no error surface, where an absent one
     // is the failure that is already happening and is at least honest. The
     // caller names it (see kl_reproject.h).
-    if (ov->shape != 0) return u;
-    if (!(ov->size[0] > 0.0f) || !(ov->size[1] > 0.0f)) return u;
+    int cylinder = ov->shape == 1;
+    if (ov->shape != 0 && !cylinder) return u;
+    if (cylinder) {
+        if (!(ov->cyl[0] > 0.0f) || !(ov->cyl[1] > 0.0f) || !(ov->cyl[2] > 0.0f)) return u;
+    } else if (!(ov->size[0] > 0.0f) || !(ov->size[1] > 0.0f)) return u;
 
     // Which eyes were named. LEFT(1) and RIGHT(2) are how a guest shows
     // different pixels to each eye — two quads, one per eye — so drawing one of
@@ -962,6 +1000,19 @@ kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
     if (ov->eye_visibility == 2 && eye != 1) return u;
 
     u.half_size = simd_make_float2(ov->size[0] * 0.5f, ov->size[1] * 0.5f);
+    if (cylinder) {
+        // ArcWidth is a length along the surface, so the angle it spans is
+        // that over the radius — capped at the whole turn. A segment every
+        // four degrees or so: at the two metres such a menu sits at, the
+        // chord's sag is well under a millimetre.
+        float angle = ov->cyl[0] / ov->cyl[2];
+        if (angle > 6.2831853f) angle = 6.2831853f;
+        u.half_size      = simd_make_float2(0.0f, ov->cyl[1] * 0.5f);
+        u.cyl_radius     = ov->cyl[2];
+        u.cyl_half_angle = angle * 0.5f;
+        u.cyl_segments   = (uint32_t)(angle / 0.07f) + 2u;
+        if (u.cyl_segments > 96u) u.cyl_segments = 96u;
+    }
 
     // Which part of the layer texture this eye reads. The guest states it in
     // PIXELS of its own texture, so it is carried as a fraction for the reason

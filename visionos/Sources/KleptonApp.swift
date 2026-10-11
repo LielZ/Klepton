@@ -171,6 +171,20 @@ struct KleptonApp: App {
     /// singleton the panel edits, not a second copy.
     @ObservedObject private var chroma = KleptonChroma.shared
 
+    // Before anything here has asked Metal for a shader (kl_app.c).
+    init() {
+        kl_app_shader_cache_test()
+        // The device's language, for a guest that takes its own from the
+        // device (kl_jni_services.c reads it where that is switched on).
+        if let first = Locale.preferredLanguages.first {
+            let loc = Locale(identifier: first)
+            if let lang = loc.language.languageCode?.identifier {
+                let region = loc.region?.identifier ?? Locale.current.region?.identifier
+                setenv("KL_DEVICE_LANG", region.map { "\(lang)_\($0)" } ?? lang, 0)
+            }
+        }
+    }
+
     var body: some Scene {
         WindowGroup { BootView() }
             .defaultSize(width: 1280, height: 800)
@@ -692,6 +706,7 @@ struct BootView: View {
                     if isLauncher { LauncherPanel() }
                     if klIsAlyx() { AlyxPanel(started: running || finished || run.started) }
                     PlayerSettingsView()
+                    GameLanguageView()
                     // Everything a player does not need to understand to play: the
                     // dials of the port itself, and the report of this run.
                     DisclosureGroup(klT("Advanced", "Erweitert")) {
@@ -796,6 +811,7 @@ struct BootView: View {
             // dial: off unless turned on, and read once at boot.
             DisclosureGroup("Rendering") { RenderingView() }
                 .font(.callout)
+            GameLanguageView()
 
             // ...and the microphone opt-in, same window, collapsed by default.
             // Off unless a person turns it on: it is the one dial that opens a
@@ -967,6 +983,7 @@ struct BootView: View {
             RunLoop.current.add(poll, forMode: .common)
 
             KleptonRendering.shared.apply()
+            KleptonLanguage.shared.apply()
             var result = kl_app_boot()
 
             // The audio session, and the placement is deliberate on both sides.

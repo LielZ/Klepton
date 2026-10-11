@@ -2170,6 +2170,22 @@ static int klb_sched_getparam(int pid, int *param) { (void)pid; if (param) *para
 // sched_getcpu: no Darwin equivalent; CPU 0 is a valid answer for "where am I".
 static int klb_sched_getcpu(void) { return 0; }
 
+// putenv: same contract on bionic and Darwin — the "NAME=value" string itself
+// becomes part of the environment, no copy — and the guest's `environ` is the
+// process's own (E("environ") below), so this is the forward the generated
+// table would hold beside getenv/setenv/unsetenv. It is here by hand because no
+// tree that table was generated from imports it. Wooorld's
+// libVuplexWebViewAndroid does, on the first frame after Unity loads its
+// plugins, and with no answer the game stopped there: "called unresolved
+// import 'putenv'" (2026-10-11). The first few are logged, because a guest
+// that sets TZ or a locale this way changes what the rest of the process reads.
+static int klb_putenv(char *s) {
+    static atomic_int said;
+    if (atomic_fetch_add(&said, 1) < 4)
+        fprintf(stderr, "  [klepton] guest putenv(\"%.80s\")\n", s ? s : "(null)");
+    return putenv(s);
+}
+
 static const kl_entry g_shim[] = {
 #include "kl_libc_table.h"
 
@@ -2454,6 +2470,7 @@ static const kl_entry g_shim[] = {
     // is 32-bit on both sides, so these forward unchanged.
     E("wcscasecmp", wcscasecmp), E("wctomb", wctomb),
     E("sched_getparam", klb_sched_getparam), E("sched_getcpu", klb_sched_getcpu),
+    E("putenv", klb_putenv),
     E("quick_exit", klb__exit),
 
     // Steam Link (SDL3) additions — plain forwards plus the small wrappers above

@@ -575,7 +575,49 @@ typedef struct {
     int        res_changed;
     unsigned long long tex_serial;   // the frame last put into the guest's texture
     unsigned   tex_uploads;
+    unsigned   tex_asks;             // getVideoLastFrame calls, new frame or not
+    uint32_t   tex_seen[64];         // the distinct textures it was asked to fill
+    unsigned   tex_nseen;
 } klj_media;
+
+// Where playback is, in milliseconds, as the guest is told it.
+//
+// A Vulkan guest (RE4) is told the time of the frame it was last handed.
+//
+// A GLES guest is told ZERO, and that is measured rather than chosen. UE4's
+// player has two GLES routes. The one every Android device takes hands frames
+// over as an external texture; this runtime has no external textures, so the
+// engine takes its fallback, which stamps a sample with this value on the
+// render thread and fetches it on the game thread against the engine's own
+// playback time. On that route the engine's time never moves: traced on Tales
+// from the Galaxy's Edge (KL_MP14_TRACE), the game thread asks isPlaying,
+// didComplete and didResolutionChange every tick and never the position. So a
+// sample stamped with any time but zero is "not due yet" for ever — none is
+// fetched, each keeps a texture of its own, and the title grew by one movie
+// frame per frame until a Vision Pro jettisoned it at 8 GB (2026-10-11).
+// Tried and all the same: the frame's own time, a running clock, a clock held
+// to less than a frame per reading, a constant 500, +1 per call, a time
+// running backwards. With zero the engine cycles through five textures and
+// the movie is on screen. Its end comes from didComplete, not from here.
+static long long klj_media_position(klj_media *m) {
+    if (!m || !m->dec) return 0;
+    return m->vulkan ? kl_avdec_position_ms(m->dec) : 0;
+}
+
+// KL_MP14_TRACE=1 — name every call the guest makes on a player, with the
+// thread it came from, for the first few hundred. The order of an engine's
+// calls on its player IS its playback logic, and it is not written anywhere
+// else that can be read from here.
+static void klj_media_trace(const char *what, long long value) {
+    static int on = -1;
+    static unsigned said;
+    if (on < 0) on = kl_env_on("KL_MP14_TRACE", 0);
+    if (!on || said >= 600) return;
+    said++;
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    fprintf(stderr, "[mp14] t%llu %s -> %lld\n", (unsigned long long)tid, what, value);
+}
 
 static klj_media *klj_media_of(void *self) {
     klj_object *o = klj_as_object(self);
@@ -693,12 +735,14 @@ static klj_val klj_MP14_start(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
     if (m) { m->started = 1; kl_avdec_play(m->dec, 1); }
+    klj_media_trace("start", (long long)(0));
     return (klj_val){.j = 0};
 }
 static klj_val klj_MP14_pause(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
     if (m) kl_avdec_play(m->dec, 0);
+    klj_media_trace("pause", (long long)(0));
     return (klj_val){.j = 0};
 }
 static klj_val klj_MP14_stop(void *env, void *self, const klj_val *a, int n) {
@@ -711,6 +755,7 @@ static klj_val klj_MP14_reset(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
     if (m && m->dec) { kl_avdec_close(m->dec); m->dec = NULL; m->started = 0; }
+    if (m) m->tex_serial = 0;
     return (klj_val){.j = 0};
 }
 static klj_val klj_MP14_release(void *env, void *self, const klj_val *a, int n) {
@@ -720,22 +765,26 @@ static klj_val klj_MP14_seekTo(void *env, void *self, const klj_val *a, int n) {
     (void)env;
     klj_media *m = klj_media_of(self);
     if (m) kl_avdec_seek(m->dec, n > 0 ? (int32_t)a[0].j : 0);
+    klj_media_trace("seekTo", (long long)(n > 0 ? (int32_t)a[0].j : 0));
     return (klj_val){.j = 0};
 }
 static klj_val klj_MP14_setLooping(void *env, void *self, const klj_val *a, int n) {
     (void)env;
     klj_media *m = klj_media_of(self);
     if (m) { m->looping = n > 0 && a[0].j != 0; kl_avdec_set_looping(m->dec, m->looping); }
+    klj_media_trace("setLooping", (long long)(n > 0 && a[0].j != 0));
     return (klj_val){.j = 0};
 }
 static klj_val klj_MP14_isLooping(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
+    klj_media_trace("isLooping", (long long)(m && m->looping));
     return (klj_val){.j = m && m->looping};
 }
 static klj_val klj_MP14_isPlaying(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
+    klj_media_trace("isPlaying", (long long)(m && kl_avdec_playing(m->dec)));
     return (klj_val){.j = m && kl_avdec_playing(m->dec)};
 }
 // "Prepared" is "a decoder is open on real media", which is the same condition
@@ -749,17 +798,21 @@ static klj_val klj_MP14_isPrepared(void *env, void *self, const klj_val *a, int 
 static klj_val klj_MP14_didComplete(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
+    klj_media_trace("didComplete", (long long)(m && kl_avdec_complete(m->dec)));
     return (klj_val){.j = m && kl_avdec_complete(m->dec)};
 }
 static klj_val klj_MP14_getDuration(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
+    klj_media_trace("getDuration", (long long)(m ? kl_avdec_duration_ms(m->dec) : 0));
     return (klj_val){.j = (uint64_t)(uint32_t)(m ? kl_avdec_duration_ms(m->dec) : 0)};
 }
 static klj_val klj_MP14_getCurrentPosition(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
-    return (klj_val){.j = (uint64_t)(uint32_t)(m ? kl_avdec_position_ms(m->dec) : 0)};
+    long long pos = klj_media_position(m);
+    klj_media_trace("getCurrentPosition", pos);
+    return (klj_val){.j = (uint64_t)(uint32_t)pos};
 }
 static klj_val klj_MP14_getVideoWidth(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
@@ -853,6 +906,24 @@ static klj_val klj_MP14_getVideoLastFrame(void *env, void *self, const klj_val *
         m->last_w = w; m->last_h = h;
     }
     uint32_t tex = n > 0 ? (uint32_t)a[0].j : 0;
+    klj_media_trace("getVideoLastFrame", (long long)tex);
+    // How the guest uses this, said every few hundred calls: how often it
+    // asks, how many of those were new frames, and into how many DIFFERENT
+    // textures — a guest that takes a fresh texture for every frame and keeps
+    // them is a gigabyte in seconds at these sizes.
+    if (!m->vulkan && tex) {
+        unsigned k = 0;
+        while (k < m->tex_nseen && m->tex_seen[k] != tex) k++;
+        if (k == m->tex_nseen && m->tex_nseen < 64) m->tex_seen[m->tex_nseen++] = tex;
+        if (++m->tex_asks % 900 == 0) {
+            extern int kl_glfb_is_texture(uint32_t);
+            unsigned alive = 0;
+            for (unsigned q = 0; q < m->tex_nseen; q++) alive += kl_glfb_is_texture(m->tex_seen[q]) ? 1u : 0u;
+            KLJ_LOG("MediaPlayer14: %u frame requests, %u new frames uploaded, %u distinct "
+                    "textures named%s, %u of them still exist", m->tex_asks, m->tex_uploads, m->tex_nseen,
+                    m->tex_nseen >= 64 ? " (or more)" : "", alive);
+        }
+    }
     if (!m->vulkan && tex && serial != m->tex_serial) {
         extern int kl_glfb_upload_picture(uint32_t, int, int, const void *, int);
         if (kl_glfb_upload_picture(tex, w, h, px, !m->swizzle)) {
@@ -873,6 +944,7 @@ static klj_val klj_MP14_didResolutionChange(void *env, void *self, const klj_val
     if (!m) return (klj_val){.j = 0};
     int c = m->res_changed;
     m->res_changed = 0;
+    klj_media_trace("didResolutionChange", (long long)(c));
     return (klj_val){.j = c != 0};
 }
 

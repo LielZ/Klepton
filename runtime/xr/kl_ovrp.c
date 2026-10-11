@@ -3124,6 +3124,7 @@ static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[
 // declared for the same reason as the line above: ovrpLayerSubmit's layout is
 // stated further down, next to the DWARF it was read out of.
 static int klovrp_submit_stage(const void *layer_submits, int count);
+static void klovrp_submit_eye_color(const void *layer_submits, int count);
 // ...and the census of the whole list, for the same forward-declaration reason.
 static void klovrp_census_submits(const void *layer_submits, int count);
 // ...and the overlay list a compositor draws on top of the eye picture.
@@ -3151,6 +3152,9 @@ static void klovrp_enq_age(void);
 // the guest is drawing into NEXT — a torn picture with every counter healthy.
 static uint64_t klovrp_end_frame_impl(int guest_frame_index, const int *viewports,
                                       const int *viewport_of, int named_stage) {
+    // The stall watch's stamp (kl_stall.c): an OVRPlugin guest's frame is this
+    // call, as an OpenXR guest's is xrEndFrame. Free unless KL_STALL_MS is set.
+    { extern void kl_stall_frame(void); kl_stall_frame(); }
 // Close the observation window opened at BeginFrame. `observed` is still
     // the sticky answer; `mask`/`binds` are what say whether it belongs to this
     // frame, and they are the difference between an association that is known
@@ -3408,6 +3412,7 @@ static uint64_t klovrp_EndFrame(int guest_frame_index) {
 // The guest's submitted-frame counter — see KL_OVRP_POKE and kl_vulkan_capture_eyes.
 static unsigned g_vk_frame;
 
+void kl_ovrp_set_eyeless_black(int on);            // defined with the eye-layer switch, below
 static volatile unsigned g_loadvid_frames_since;   // defined with the loading video, below
 // EndFrames since the guest last called ovrp_EnqueueSubmitLayer — see
 // klovrp_enq_owns_overlays.
@@ -3449,16 +3454,27 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
     // splash and level-loading screens submit quads alone, that was eye storage
     // nothing had drawn yet, a magenta flicker behind every loading screen
     // (2026-10-11, KL_OVRP_LAYERS: "submit 1/1: layer 2 (Quad)").
-    //   default 1 for x5767635983306831, else 0 (every other OVRPlugin guest is
-    //   left with the eye pass always on, as before)
+    // Asgard's Wrath 2 (UE4) is the same thing with older pictures: while a
+    // level loads its frames are the loading quads alone, and behind them the
+    // compositor went round the three eye stages by frame counter ("eye stage
+    // NOT observed") — three stale pictures in turn, not the same one for both
+    // eyes ("the pictures sent to the eye are broken and the left eye sees
+    // something else than the right", 2026-10-11; the log has `layers=1` with
+    // layer 2, a 350x175 m quad at 200 m, from the first frame on).
+    //   default 1 for x5767635983306831 and wrath2, else 0 (every other
+    //   OVRPlugin guest is left with the eye pass always on, as before)
     static int eyeless = -1;
     if (eyeless < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
-        eyeless = kl_env_on("KL_OVRP_EYELESS_FRAMES", t && !strcmp(t, "x5767635983306831"));
+        eyeless = kl_env_on("KL_OVRP_EYELESS_FRAMES",
+                            t && (!strcmp(t, "x5767635983306831") || !strcmp(t, "wrath2")));
     }
-    if (eyeless && layer_submits && layer_submit_count > 0)
+    if (eyeless && layer_submits && layer_submit_count > 0) {
         kl_ovrp_eye_layer_external(named >= 0);
+        kl_ovrp_set_eyeless_black(named < 0);
+    }
+    klovrp_submit_eye_color(layer_submits, layer_submit_count);
 
     // BONELAB / the Vulkan path: this call IS the guest's assertion that it has
     // SUBMITTED the eye textures' drawing, so it is where they can be read back
@@ -5757,6 +5773,45 @@ static void klovrp_quad_size(const ovrp_layer_submit *s, float out[2]) {
     const float *q = klovrp_quad_size_off == 0xb0 ? b0 : bc;
     out[0] = q[0]; out[1] = q[1];
 }
+// The Cylinder arm of the same union: ArcWidth, Height, Radius, three floats
+// where the Quad arm has its two — at +0xb0 in a guest built against the older
+// header (read out of RE4's ImportLayerSubmit, above) and at +0xbc in one with
+// the blend-factor triple (wrath2's UpdateLayer_RHIThread stores the cylinder
+// arm at +0xbc/+0xc0/+0xc4). The offset is the one a quad already latched; a
+// guest whose first overlay is a cylinder is decided here by the same test.
+// Tales from the Galaxy's Edge puts its main menu on one (2026-10-11).
+static void klovrp_cylinder(const ovrp_layer_submit *s, float out[3]) {
+    const unsigned char *base = (const unsigned char *)s;
+    float b0[3], bc[3];
+    unsigned int w0[3];
+    memcpy(b0, base + 0xb0, sizeof b0);
+    memcpy(bc, base + 0xbc, sizeof bc);
+    memcpy(w0, base + 0xb0, sizeof w0);
+    out[0] = out[1] = out[2] = 0.0f;
+    if (!klovrp_quad_size_off) {
+        int old_fits = klovrp_plausible_metres(b0[0]) && klovrp_plausible_metres(b0[1])
+                       && klovrp_plausible_metres(b0[2]);
+        int new_fits = klovrp_plausible_metres(bc[0]) && klovrp_plausible_metres(bc[1])
+                       && klovrp_plausible_metres(bc[2])
+                       && w0[0] <= 1 && w0[1] <= 32 && w0[2] <= 32;
+        if (old_fits == new_fits) return;                               // undecidable
+        klovrp_quad_size_off = old_fits ? 0xb0 : 0xbc;
+        fprintf(stderr, "  [ovrp] layer submit union starts at +0x%x (decided by a cylinder)\n",
+                klovrp_quad_size_off);
+    }
+    const float *c = klovrp_quad_size_off == 0xb0 ? b0 : bc;
+    if (!klovrp_plausible_metres(c[0]) || !klovrp_plausible_metres(c[1]) ||
+        !klovrp_plausible_metres(c[2])) return;
+    out[0] = c[0]; out[1] = c[1]; out[2] = c[2];
+    static int said;
+    if (said < 3) {
+        said++;
+        fprintf(stderr, "  [ovrp] cylinder layer %d: arc %.3f m, height %.3f m, radius %.3f m "
+                        "(%.1f degrees) at (%.2f, %.2f, %.2f)\n", s->layer_id, c[0], c[1], c[2],
+                c[0] / c[2] * 57.29578f, s->pose[4], s->pose[5], s->pose[6]);
+    }
+}
+
 static void klovrp_probe_submit_tail(const ovrp_layer_submit *s) {
     const float *q0 = (const float *)((const unsigned char *)s + 0xb0);
     const float *q1 = (const float *)((const unsigned char *)s + 0xbc);
@@ -5929,11 +5984,16 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
         // Print the first 0xd0 bytes of a NON-eye submit once per layer as words
         // + floats so the real pose(quat+xyz) and Quad size offsets are readable.
         {
-            static int dumped, on = -1;
+            // Twice per LAYER rather than six times in all: one layer that is
+            // submitted from the first frame (a splash quad) used to spend the
+            // whole quota before the layer in question existed.
+            static int on = -1;
+            static unsigned char per_layer[64];
             if (on < 0) on = kl_env_on("KL_OVRP_SUBMIT_DUMP", 1);
             struct klovrp_layer *dl = klovrp_layer(s->layer_id);
-            if (on && dumped < 6 && dl && !dl->is_eye) {
-                dumped++;
+            unsigned slot = (unsigned)s->layer_id % 64u;
+            if (on && per_layer[slot] < 2 && dl && !dl->is_eye) {
+                per_layer[slot]++;
                 const unsigned char *b = (const unsigned char *)s;
                 fprintf(stderr, "  [ovrp] SUBMIT DUMP layer %d (%d bytes shown):\n",
                         s->layer_id, 0xd0);
@@ -6008,6 +6068,8 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
         // against. klovrp_quad_size tells them apart and latches; see it.
         if (o->shape == 0)
             klovrp_quad_size(s, o->size);
+        else if (o->shape == 1)
+            klovrp_cylinder(s, o->cyl);
         // Back a GLES non-eye layer with something a compositor can sample.
         // The Vulkan half is already handled — o is read back through
         // kl_vulkan_layer_mtl_texture in encodeOverlays — but on GLES nothing
@@ -6164,6 +6226,19 @@ void kl_ovrp_eye_layer_external(int submitted) {
 }
 int kl_ovrp_eye_layer_live(void) { return g_eye_layer_live; }
 
+// ...and what is BEHIND the quads of such a frame. On a Quest it is black: the
+// eye buffer is simply absent. Here the space is a mixed one, and what the
+// system shows where the app wrote no depth is the room — so with the eye pass
+// off, Asgard's Wrath 2's loading screen was its picture in a ragged black
+// frame with the player's living room around it ("outside it is no longer
+// black but passthrough, that is wrong and looks broken", 2026-10-11). While
+// this is set the compositor puts black behind the frame's quads. Only the
+// OVRPlugin switch above sets it; an OpenXR guest's quad-only frames are left
+// as they were.
+static int g_eyeless_black;
+void kl_ovrp_set_eyeless_black(int on) { g_eyeless_black = !!on; }
+int  kl_ovrp_eyeless_black(void) { return g_eyeless_black && !g_eye_layer_live; }
+
 int kl_ovrp_overlay_count(void) {
     pthread_mutex_lock(&g_frames.mu);
     int n = g_overlays.n;
@@ -6181,6 +6256,80 @@ int kl_ovrp_overlay_get(int i, kl_ovrp_overlay *out) {
     // head-locked one is relative to the head and has no height to convert.
     if (ok && !out->head_locked) out->pose[5] += klovrp_origin_y();
     return ok;
+}
+
+// ---- the eye picture's colour scale and offset ----------------------------
+// What a Quest's compositor does to the eye picture after the game has drawn
+// it: colour * scale + offset. It is how a game fades to black without drawing
+// anything — OVRManager.SetColorScaleAndOffset, OVRScreenFade's compositor
+// path, Unity.XR.Oculus.Utils.SetColorScale — and it was accepted and dropped
+// here ("a fade shows its end state at once"). The end state of the fade a
+// game holds while it LOADS is black, and dropping that shows the level being
+// put together behind where the loading screen should be: Batman: Arkham
+// Shadow ("you see the level build up while it loads, that was not so on the
+// Quest", 2026-10-11).
+//
+// Handed to the reprojection (kl_reproject_set_eye_color), which is where both
+// compositors get it from. The eye picture only: panels keep their own colour,
+// so a loading icon stays lit over the black. KL_OVRP_COLOR_SCALE=0 drops the
+// values again, as before.
+typedef struct { float x, y, z, w; } klovrp_vec4;
+static float g_color_scale[4] = { 1, 1, 1, 1 }, g_color_offset[4];
+static int klovrp_color_sane(const float *v) {
+    for (int i = 0; i < 4; i++) if (!(v[i] > -16.0f && v[i] < 16.0f)) return 0;   // NaN fails
+    return 1;
+}
+static void klovrp_eye_color_apply(const float *scale, const float *offset, const char *from) {
+    extern void kl_reproject_set_eye_color(const float scale[4], const float offset[4]);
+    static float last_s[4] = { 1, 1, 1, 1 }, last_o[4];
+    static unsigned said;
+    if (!memcmp(last_s, scale, sizeof last_s) && !memcmp(last_o, offset, sizeof last_o)) return;
+    memcpy(last_s, scale, sizeof last_s); memcpy(last_o, offset, sizeof last_o);
+    kl_reproject_set_eye_color(scale, offset);
+    // A fade is a few dozen steps; its ends are what a log is read for.
+    int end = (scale[0] == 0 && scale[1] == 0 && scale[2] == 0) || (scale[0] == 1 && scale[1] == 1 && scale[2] == 1);
+    if (said < 24 || (end && said < 400)) {
+        said++;
+        fprintf(stderr, "  [ovrp] eye colour scale (%.2f %.2f %.2f %.2f) offset (%.2f %.2f %.2f %.2f) — %s\n",
+                scale[0], scale[1], scale[2], scale[3], offset[0], offset[1], offset[2], offset[3], from);
+    }
+}
+static uint64_t klovrp_SetColorScaleAndOffset(klovrp_vec4 scale, klovrp_vec4 offset, int all_layers) {
+    ovrp_hit("ovrp_SetColorScaleAndOffset");
+    (void)all_layers;        // the eye picture is what is faded here; panels keep their own colour
+    float s[4] = { scale.x, scale.y, scale.z, scale.w }, o[4] = { offset.x, offset.y, offset.z, offset.w };
+    if (!klovrp_color_sane(s) || !klovrp_color_sane(o)) return OVRP_SUCCESS;
+    memcpy(g_color_scale, s, sizeof s); memcpy(g_color_offset, o, sizeof o);
+    if (kl_env_on("KL_OVRP_COLOR_SCALE", 1)) klovrp_eye_color_apply(s, o, "ovrp_SetColorScaleAndOffset");
+    return OVRP_SUCCESS;
+}
+// The eye layer's submit has a ColorScale/ColorOffset of its own (+0x48, +0x58)
+// and a flag saying they override (+0xac). They are NOT applied: an older
+// plugin's submit ends before them and those bytes are something else there,
+// and no guest has been seen to need them. Said once, where a submit carries
+// values that are not the identity, so that the game that does need them names
+// itself in a log.
+static void klovrp_submit_eye_color(const void *layer_submits, int count) {
+    static int said;
+    const ovrp_layer_submit *const *list = layer_submits;
+    if (said || !list || count <= 0) return;
+    for (int i = 0; i < count; i++) {
+        const ovrp_layer_submit *s = list[i];
+        if (!s) continue;
+        struct klovrp_layer *l = klovrp_layer(s->layer_id);
+        if (!l || !l->is_eye) continue;
+        static const float one[4] = { 1, 1, 1, 1 }, zero[4];
+        if (s->override_per_layer_color == 1 && klovrp_color_sane(s->color_scale) &&
+            klovrp_color_sane(s->color_offset) &&
+            (memcmp(s->color_scale, one, sizeof one) || memcmp(s->color_offset, zero, sizeof zero))) {
+            said = 1;
+            fprintf(stderr, "  [ovrp] the eye layer's submit overrides the colour scale itself: (%.2f %.2f %.2f %.2f) "
+                            "offset (%.2f %.2f %.2f %.2f) — not applied (only ovrp_SetColorScaleAndOffset is)\n",
+                    s->color_scale[0], s->color_scale[1], s->color_scale[2], s->color_scale[3],
+                    s->color_offset[0], s->color_offset[1], s->color_offset[2], s->color_offset[3]);
+        }
+        return;
+    }
 }
 
 static int klovrp_submit_stage(const void *layer_submits, int count) {
@@ -8016,6 +8165,9 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetHandTrackingEnabled", (void *)klovrp_GetHandTrackingEnabled},
     {"ovrp_GetHandState",  (void *)klovrp_hand_unsupported},
     {"ovrp_GetHandState2", (void *)klovrp_hand_unsupported},
+    // Wooorld: asked once libovrplugintracking loads (the Avatar SDK's tracking
+    // bridge), which it does now that its TLS relocations are served.
+    {"ovrp_GetHandState3", (void *)klovrp_hand_unsupported},
     {"ovrp_GetMesh",  (void *)klovrp_hand_unsupported},
     {"ovrp_GetInstanceExtensionsVk", (void *)klovrp_GetInstanceExtensionsVk},
     {"ovrp_GetDeviceExtensionsVk",   (void *)klovrp_GetDeviceExtensionsVk},
@@ -8118,6 +8270,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_CalculateEyeLayerDesc3", (void *)klovrp_CalculateEyeLayerDesc3},
     {"ovrp_CalculateLayerDesc", (void *)klovrp_CalculateLayerDesc},
     {"ovrp_SetupLayer", (void *)klovrp_SetupLayer},
+    {"ovrp_SetColorScaleAndOffset", (void *)klovrp_SetColorScaleAndOffset},
     {"ovrp_EnqueueSetupLayer2", (void *)klovrp_EnqueueSetupLayer2},
     {"ovrp_EnqueueSubmitLayer2", (void *)klovrp_EnqueueSubmitLayer2},
     {"ovrp_SetOverlayQuad3", (void *)klovrp_SetOverlayQuad3},
@@ -8398,14 +8551,8 @@ static const char *const g_ovrp_result_ok[] = {
     "ovrp_SetupDistortionWindow", "ovrp_SetupDistortionWindow3",
     "ovrp_SetupDisplayObjects", "ovrp_SetupDisplayObjects2",
     "ovrp_DestroyDistortionWindow", "ovrp_DestroyDistortionWindow2",
-    // Per-layer colour scale/offset - the guest pushes it for fade-from-black on
-    // load (OVRManager / the game's own fader). ovrpResult, and record-and-
-    // succeed: the compositor here does not apply the transform, so the only
-    // visible effect of ignoring it is that a fade shows its end state at once
-    // (full brightness) rather than ramping - cosmetic, and never a failure the
-    // guest reads back. If a title turns out to REQUIRE the ramp, this graduates
-    // to a real body that hands the scale/offset to kl_glfb.
-    "ovrp_SetColorScaleAndOffset",
+    // (ovrp_SetColorScaleAndOffset was here, recorded and dropped; it has a real
+    // body now — klovrp_SetColorScaleAndOffset.)
     // The OVERLAY submit path. AC Nexus drives its main eye layer through
     // BeginFrame4/EndFrame4 (implemented, and where the eye texture is captured)
     // but submits its Equirect background OVROverlay through the older enqueue

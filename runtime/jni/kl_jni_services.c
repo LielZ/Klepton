@@ -24,6 +24,7 @@
 #include "kl_fault.h"
 #include "kl_target.h"
 #include "kl_env.h"
+#include "guest/kl_driver.h"   // the target name, for the device-language default
 #include "kl_ovrp.h"
 #include "kl_avdec.h"
 #include "kl_egl.h"
@@ -280,6 +281,54 @@ static klj_val klj_Omni_start(void *env, void *self, const klj_val *a, int n) {
         KLJ_LOG("OmniConnectSharedAndroid.start() — no Omni Connect service to "
                 "bind on this host; treadmill support stays off");
     return (klj_val){0};
+}
+
+// ---- Vuplex 3D WebView: settings for a browser engine that is not here ----
+//
+// Vuplex's Android plugin is a Java wrapper (com.vuplex.webview.WebView3D)
+// around the system WebView or GeckoView. Neither exists on this host, so a web
+// view cannot be created — but a game configures the plugin long before it
+// opens one. Wooorld (x4360608937312293) does it while booting:
+// setAlternativePointerInputSystemEnabled and setAutoplayEnabled from its
+// startup scripts, resumeAll from OnApplicationPause(false). All three are
+// static, return void and only set process-wide switches for web views that
+// may be created later (resumeAll resumes the ones that exist: none). With no
+// answer the first of them stopped the game before its first frame ("no host
+// implementation", 2026-10-11).
+//
+// Deliberately only these. WebView3D.<init> and everything that would hand the
+// game a page stays unimplemented, so a game that really opens a web view
+// stops by name there and is decided on then.
+static klj_val klj_Vuplex_setting(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("com/vuplex/webview/WebView3D: no Android WebView on this host — "
+                "the plugin's static settings are accepted and change nothing");
+    return (klj_val){0};
+}
+
+// ---- Meta Voice SDK: a telemetry service that is never bound ----
+//
+// The Voice SDK reports usage to the headset's Assistant service through a
+// fragment it attaches to the activity:
+// UnityPlatformLoggerServiceFragment.createAndAttach(activity, version), then
+// getService() for the service the fragment bound. There is no Assistant
+// service to bind here, and telemetry about this machine is not ours to send,
+// so getService() answers what a fragment whose bind never completed holds:
+// null. Wooorld (x4360608937312293) asks once during boot and carries on
+// without a logger — no further call on the fragment, nothing in Unity's log
+// (measured on the host, 2026-10-11). The fragment itself is an inert object
+// (klj_View_new in the table) rather than null, because createAndAttach
+// constructs one unconditionally and the caller uses it without a check.
+// Unanswered, createAndAttach aborted before the game's first scene.
+static klj_val klj_VoiceLogger_getService(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("UnityPlatformLoggerServiceFragment.getService() -> null (no "
+                "Assistant service to bind; Voice SDK telemetry stays off)");
+    return (klj_val){.l = NULL};
 }
 
 // ---- JavaBroadcastReceiver: a subscription to a bus with no publisher ----
@@ -575,6 +624,21 @@ static void klj_locale_parts(char *lang, size_t lang_sz, char *country, size_t c
     snprintf(lang, lang_sz, "en");
     snprintf(country, country_sz, "US");
     const char *env = getenv("LANG");
+    // On a headset nothing sets LANG, so every game was told en_US whatever the
+    // device is set to. The app passes the device's own language along as
+    // KL_DEVICE_LANG ("de_DE"), and it is used where a game is known to take
+    // its language from the device and nowhere else: Asgard's Wrath 2 has no
+    // language menu — FGenericPlatformMisc::GetDefaultLanguage decides text
+    // and voices — and stayed English with the German pack installed
+    // (2026-10-11). KL_LOCALE_DEVICE=1 turns it on for any game, =0 off.
+    if (!env || !*env) {
+        static int from_device = -1;
+        if (from_device < 0) {
+            const char *t = kl_driver_target_name();
+            from_device = kl_env_on("KL_LOCALE_DEVICE", t && strcmp(t, "wrath2") == 0);
+        }
+        if (from_device) env = getenv("KL_DEVICE_LANG");
+    }
     if (!env || !*env || strncmp(env, "C", 2) == 0) return;
     // "en_US.UTF-8" -> "en" + "US"
     char buf[64];
@@ -2036,6 +2100,18 @@ const klj_binding klj_bind_services[] = {
     {"com/oculus/metrics/MetricsService", "shutdown", "(Lcom.unity3d.player.UnityPlayerActivity;)V", klj_void_noop},
     {"com/oculus/metrics/MetricsService", "appendCsvDebugString", "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z", klj_void_noop},
     {"com/oculus/metrics/MetricsService", "setOverlayDebugString", "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z", klj_void_noop},
+    // Vuplex 3D WebView's process-wide switches (see klj_Vuplex_setting). Static,
+    // through ReflectionHelper. Only the three Wooorld calls on its way to its
+    // first scene; a web view itself (WebView3D.<init>) is not served.
+    {"com/vuplex/webview/WebView3D", "setAlternativePointerInputSystemEnabled", "(Z)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "setAutoplayEnabled", "(Z)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "resumeAll", "()V", klj_Vuplex_setting},
+    // The Voice SDK's telemetry connection (see klj_VoiceLogger_getService):
+    // the fragment is an inert object, the service behind it is never bound.
+    {"com/oculus/assistant/api/unity/logging/UnityPlatformLoggerServiceFragment", "createAndAttach",
+     "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Ljava/lang/Object;", klj_View_new},
+    {"com/oculus/assistant/api/unity/logging/UnityPlatformLoggerServiceFragment", "getService",
+     "()Ljava/lang/Object;", klj_VoiceLogger_getService},
     {"android/os/Vibrator", "hasVibrator", "()Z", klj_Vibrator_hasVibrator},
     {"android/content/pm/PackageManager", "getInstallerPackageName", "(Ljava/lang/String;)Ljava/lang/String;", klj_PackageManager_getInstallerPackageName},
     {"android/content/res/Resources", "getSystem", "()Landroid/content/res/Resources;", klj_Resources_getSystem},

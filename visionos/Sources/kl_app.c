@@ -1,4 +1,5 @@
 // See kl_app.h.
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>          // task_info(TASK_VM_INFO) — the heartbeat's footprint
@@ -118,6 +119,72 @@ const char *kl_app_assets_dir(void) { return g_assets[0] ? g_assets : NULL; }
 static void app_phase(const char *p);
 
 const char *kl_app_log_path(void) { return g_log; }
+
+// A cold start to look at, without losing the warm one.
+//
+// What makes a start "cold" is the system's own Metal cache in the app's
+// container (Library/Caches/<bundle id>/com.apple.metal): with it, a shader the
+// app compiled before is a lookup; without it every one is compiled again —
+// minutes for a game with thousands of pipelines. Whether a game says so on
+// its screen while that goes on can only be seen on a cold start, and a cold
+// start is not something to give away for one look.
+//
+// So: a one-word file `klepton-shader-test.txt` in Documents (it can be put
+// there from a Mac, `devicectl device copy to`). "cold" sets the cache aside
+// as com.apple.metal.kept the first time and starts every run with an empty
+// one; "restore" puts the kept one back and throws away what the test runs
+// compiled. No file, or any other word: nothing is touched. Called from the
+// App's init, before anything in this process has asked Metal for a shader —
+// a cache the system has already opened is not replaced by renaming it.
+static char g_shader_test_note[256];
+static int shader_test_rm(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return unlink(path);
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char sub[1200];
+        if (snprintf(sub, sizeof sub, "%s/%s", path, de->d_name) < (int)sizeof sub) shader_test_rm(sub);
+    }
+    closedir(d);
+    return rmdir(path);
+}
+void kl_app_shader_cache_test(void) {
+    const char *home = getenv("HOME");
+    char path[1024], word[16] = "";
+    if (!home || snprintf(path, sizeof path, "%s/Documents/klepton-shader-test.txt", home) >= (int)sizeof path) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    if (fscanf(f, "%15s", word) != 1) word[0] = 0;
+    fclose(f);
+    int cold = !strcmp(word, "cold"), restore = !strcmp(word, "restore");
+    if (!cold && !restore) return;
+    char caches[1024];
+    snprintf(caches, sizeof caches, "%s/Library/Caches", home);
+    DIR *d = opendir(caches);
+    if (!d) return;
+    struct dirent *de;
+    int n = 0;
+    while ((de = readdir(d)) != NULL) {
+        char live[1200], kept[1200];
+        if (de->d_name[0] == '.' ||
+            snprintf(live, sizeof live, "%s/%s/com.apple.metal", caches, de->d_name) >= (int)sizeof live ||
+            snprintf(kept, sizeof kept, "%s.kept", live) >= (int)sizeof kept) continue;
+        struct stat sl, sk;
+        int has_live = stat(live, &sl) == 0, has_kept = stat(kept, &sk) == 0;
+        if (cold && has_live) {
+            if (!has_kept) { if (rename(live, kept) == 0) n++; }
+            else           { if (shader_test_rm(live) == 0) n++; }
+        } else if (restore && has_kept) {
+            if (has_live) shader_test_rm(live);
+            if (rename(kept, live) == 0) n++;
+        }
+    }
+    closedir(d);
+    snprintf(g_shader_test_note, sizeof g_shader_test_note,
+             cold ? "klepton-shader-test.txt says cold — Metal's cache set aside or emptied (%d), this start compiles everything"
+                  : "klepton-shader-test.txt says restore — the kept Metal cache is back (%d)", n);
+}
 const char *kl_app_status(void)   { return g_status; }
 
 static int have(const char *p) { struct stat st; return p && *p && stat(p, &st) == 0; }
@@ -799,6 +866,7 @@ int kl_app_boot(void) {
 
     printf("=== Klepton on visionOS ===\n");
     printf("  target    : %s\n", g_target->name);
+    if (g_shader_test_note[0]) printf("  shader test: %s\n", g_shader_test_note);
     // The front door, with the reason. It is chosen from the ENVIRONMENT in
     // kl_app_configure — which runs before the log file is open, so it cannot
     // announce itself there — and an app launched from the Home View has no
@@ -1162,10 +1230,48 @@ static void *guest_thread(void *unused) {
         pthread_mutex_unlock(&g_guest.mu);
         if (stop) break;
 
+        // KL_GUEST_FRAME_STATS=<seconds> — every so many seconds, how long the
+        // guest's frames took and how late they started. One frame is one call
+        // here, offered one display period; "it stutters a little, regularly"
+        // is either frames that take longer than that or frames that start
+        // late, and from outside the two look the same. Off (0) unless set.
+        static int stats_s = -1;
+        static uint64_t st_since, st_n, st_over, st_over2, st_late;
+        static double st_sum, st_max, st_wait_sum, st_wait_max;
+        if (stats_s < 0) stats_s = (int)kl_env_uint("KL_GUEST_FRAME_STATS", 0);
+        uint64_t f0 = stats_s ? guest_now_ns() : 0;
+        double waited_ms = 0;
+        if (stats_s) {
+            pthread_mutex_lock(&g_guest.mu);
+            waited_ms = (double)(f0 - g_guest.published_ns) / 1.0e6;   // the offer's age at the start
+            pthread_mutex_unlock(&g_guest.mu);
+        }
+
         if (kl_app_frame() < 0) {
             printf("[guest] nativeRender is gone — the frame loop ends here\n");
             fflush(NULL);
             break;
+        }
+        if (stats_s) {
+            uint64_t f1 = guest_now_ns();
+            double ms = (double)(f1 - f0) / 1.0e6, period = 1000.0 / (double)kl_ovrp_display_frequency();
+            if (!st_since) st_since = f0;
+            st_n++; st_sum += ms; st_wait_sum += waited_ms;
+            if (ms > st_max) st_max = ms;
+            if (waited_ms > st_wait_max) st_wait_max = waited_ms;
+            if (ms > period) st_over++;
+            if (ms > 2.0 * period) st_over2++;
+            if (waited_ms > 0.5 * period) st_late++;
+            if (f1 - st_since > (uint64_t)stats_s * 1000000000ull) {
+                fprintf(stderr, "  [guest] %llu frames in %.1f s: %.2f ms a frame on average, longest %.1f; "
+                                "%llu took over one display period (%.1f ms), %llu over two; started on an "
+                                "offer %.1f ms old on average (oldest %.1f), %llu on one over half a period old\n",
+                        (unsigned long long)st_n, (double)(f1 - st_since) / 1.0e9, st_sum / (double)st_n, st_max,
+                        (unsigned long long)st_over, period, (unsigned long long)st_over2,
+                        st_wait_sum / (double)st_n, st_wait_max, (unsigned long long)st_late);
+                st_since = f1; st_n = st_over = st_over2 = st_late = 0;
+                st_sum = st_max = st_wait_sum = st_wait_max = 0;
+            }
         }
         // KL_GUEST_FRESH_POSE: start each frame ON a display frame. A pose
         // that was offered while the frame was still running is not carried

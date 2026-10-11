@@ -40,6 +40,11 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   unimplemented calls into third-party analytics SDKs (`com/gameanalytics/…`, `com/amplitude/…`).
   Default 1: such calls are dropped and answer zero/NULL/void, since there is
   no host to report to. Max Mustard aborted on `GameAnalytics.addErrorEvent`.
+- `KL_MP14_TRACE=1` — (`runtime/jni/kl_jni_ue4.c`) name the first few hundred
+  calls a guest makes on UE4's `MediaPlayer14` (position, frame fetch, playing,
+  complete, resolution change, start/pause/seek), each with the thread it came
+  from. The order of an engine's calls on its player is its playback logic;
+  this is how the GLES route's standing clock was found.
 - `KL_PLAT_USER=0|1` — (`runtime/xr/kl_ovrplat.c`) hand out a synthetic
   OFFLINE user for `ovr_GetLoggedInUserID` / `ovr_User_GetLoggedInUser`.
   "Who is playing", not an ownership answer. Default on for the titles listed
@@ -587,7 +592,8 @@ The guest's own memory management, and the three seams that used to disable it.
 - `KL_ELF_TLSDESC=0|1` — the loader serves `R_AARCH64_TLSDESC` relocations
   (ELF thread-local storage, dynamic model) for a library's own TLS: a block
   per thread and module, made at first use. Off, such a library does not
-  load, as before. Default 1 for `x3635172946605196`, else 0 — a title that
+  load, as before. Default 1 for `x3635172946605196` and `x4360608937312293`
+  (Wooorld, whose sign-in needs `libovravatar2`), else 0 — a title that
   works may ship an optional library it has been running without.
 - `KL_MADV_DONTNEED=remap|reusable|zero|passthrough` — how a guest
   `madvise(MADV_DONTNEED)` is served. Default `remap`. **`MADV_DONTNEED` is 4 on
@@ -1108,13 +1114,23 @@ puts the camera on the ground with its hands underneath it.
   left: with the sequence, `BeginFrame4` once then `DestroyLayer` reads as a
   teardown; without it, as a call count of 1. A print and nothing else — no
   register capture, no reads of guest memory.
+- `KL_OVRP_COLOR_SCALE=0|1` — apply `ovrp_SetColorScaleAndOffset` to the eye
+  picture (colour * scale + offset, in the reprojection's fragment shader). It
+  is how a game fades to black and stays black while it loads; dropped, Batman:
+  Arkham Shadow showed its level being put together where the Quest shows
+  black. Default 1; 0 accepts and ignores the call, as before. The log names
+  each change of value (`[ovrp] eye colour scale ...`).
 - `KL_OVRP_EYELESS_FRAMES=0|1` — an `ovrp_EndFrame4` submit list with no eye
   layer turns the compositor's eye pass off until one is submitted again, so
   such a frame shows its quads over black as on a Quest. Otherwise the eye
   textures' last contents stay on screen; Skydance's BEHEMOTH submits quads
   alone on its splash and level-loading screens, and what showed behind them
-  was undrawn eye storage, a magenta flicker. Default 1 for
-  `x5767635983306831`, else 0.
+  was undrawn eye storage, a magenta flicker; Asgard's Wrath 2 does the same
+  while a level loads, with three stale eye pictures shown in turn and not the
+  same one for both eyes. Default 1 for `x5767635983306831` and `wrath2`,
+  else 0. While the eye pass is off this way the compositor draws black behind
+  the frame's quads (a mixed space shows the room wherever no depth was
+  written).
 - `KL_OVRP_LAYERS=1` — census the whole `ovrp_EndFrame4` submit list: one line
   per distinct `(layer, shape, stage, viewport, pose, flags)`, printed when it
   first appears and when it changes, plus the union's per-shape tail. Every
@@ -1145,6 +1161,31 @@ puts the camera on the ground with its hands underneath it.
   OpenXR guest submits no frame for that long, every thread is sampled while the
   gap lasts and, when frames resume, the gap's length and the stacks of the
   threads that were not waiting are printed. Off unless set; 250 for `alyx`.
+  An OVRPlugin guest's frame is stamped as well (`ovrp_EndFrame`); 100 for
+  `walkabout` while its stutter is being looked into.
+- `KL_GUEST_FRAME_STATS=<seconds>` — (`visionos/Sources/kl_app.c`) every so
+  many seconds one line about the Unity frame loop: how long the guest's frames
+  took against the display's period, how many took more than one and more than
+  two periods, and how old the offered pose was when a frame started. Off (0)
+  unless set; 10 for `walkabout`.
+- `KL_GLFB_SLOW_MS=<ms>` — (`runtime/gfx/kl_glfb.c`, GLES guests) name every
+  shader compile, program link and draw that took longer than this, and sum up
+  the shader work between reports. Off (0) unless set.
+- `Documents/klepton-shader-test.txt` (a file on the device, not a variable;
+  `visionos/Sources/kl_app.c`) — one word. `cold`: Metal's own cache in the
+  app's container is set aside as `com.apple.metal.kept` and every start runs
+  with an empty one, to look at what a game shows while it compiles everything.
+  `restore`: the kept cache is put back. Put there with
+  `devicectl device copy to`; the boot log's head says what was done.
+- `KL_VK_CACHE_WAIT_MS=<ms>` — (`runtime/gfx/kl_vulkan.c`) how long
+  `vkCreatePipelineCache` waits for MoltenVK to read back a pipeline cache the
+  guest saved (1 MB or more). MoltenVK compiles every shader in it inside that
+  call: 0.2 s while Metal's own cache is warm, 95 s when it is not (Asgard's
+  Wrath 2, 30 MB, on a Mac) — a black start. Past the wait the guest gets an
+  empty cache and starts as after a fresh install, showing its own shader
+  screen where it has one, and the read finishes on a thread behind it, which
+  warms Metal's cache for the next start. Default 1500; 0 reads in place, as
+  before.
 - `KL_OVRP_HEAD=x,y,z[,yaw]` — a head pose for a run with no frontend (metres,
   yaw in degrees). Without it an OpenXR guest's head is on the floor at the
   origin, which Half-Life: Alyx answers with its orange out-of-bounds fade.
@@ -1399,7 +1440,18 @@ puts the camera on the ground with its hands underneath it.
   directory, as installed language packs, instead of an empty list. AC Nexus
   greys out every audio language it is not told is installed. Nothing is
   downloaded, deleted or reported as purchased. Default 1 for
-  `x5812519008825194`, else 0.
+  `x5812519008825194` and `wrath2`, else 0. For these titles
+  `ovr_LanguagePack_GetCurrent` / `ovr_LanguagePack_SetCurrent` are answered
+  as well (Asgard's Wrath 2 asks them): the current pack is a choice between
+  the files on the disk, kept in `android-files/klepton-language-pack.txt`;
+  with nothing chosen it is the pack of the language the game is told.
+- `KL_LOCALE_DEVICE=0|1` — (`runtime/jni/kl_jni_services.c`) tell the guest the
+  device's own language (`KL_DEVICE_LANG`, set by the app from the system's
+  first preferred language, e.g. `de_DE`) instead of en_US, where `LANG` is not
+  set — which on a headset is always. Default 1 for `wrath2`, whose text and
+  voices follow the device and nothing else, else 0. The start window's "Game
+  language" choice sets it. `.lang` voice packs in the OBB directory are part
+  of the read-through OBB index either way.
 - `KL_OVRP_ENQ_OWNS_OVERLAYS=0|1` — while the guest is filing panels through
   `ovrp_EnqueueSubmitLayer`, an `ovrp_EndFrame4` whose own list carries no
   overlay leaves the published set alone instead of emptying it (which blinked

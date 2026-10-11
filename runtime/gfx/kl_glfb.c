@@ -1865,6 +1865,62 @@ static const char *klfb_shader_src(uint32_t shader) {
 
 #define KLFB_GL_COMPILE_STATUS 0x8B81
 
+// KL_GLFB_SLOW_MS=<ms> — name every shader compile, program link and draw that
+// takes at least this long, and every few seconds what the shader work of
+// that stretch added up to. A hitch "now and then" in a GL guest is, more
+// often than anything else, ANGLE turning a program into Metal the first time
+// it is linked or — for the pipeline state — the first time it is drawn with;
+// this says so with the program's number and the time. 0 (the default) costs
+// nothing: no clock is read.
+static int klfb_slow_ms(void) {
+    static int ms = -1;
+    if (ms < 0) ms = kl_env_int("KL_GLFB_SLOW_MS", 0);
+    return ms;
+}
+static uint64_t klfb_slow_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static struct {
+    pthread_mutex_t mu;
+    uint64_t since_ns;
+    unsigned compiles, links, slow_draws;
+    double compile_ms, link_ms, slow_draw_ms, worst_ms;
+} g_slow = { .mu = PTHREAD_MUTEX_INITIALIZER };
+// kind: 0 compile, 1 link, 2 draw
+static void klfb_slow_note(int kind, uint32_t name, double ms, int verts) {
+    int limit = klfb_slow_ms();
+    pthread_mutex_lock(&g_slow.mu);
+    uint64_t now = klfb_slow_now();
+    if (!g_slow.since_ns) g_slow.since_ns = now;
+    if (kind == 0) { g_slow.compiles++; g_slow.compile_ms += ms; }
+    if (kind == 1) { g_slow.links++; g_slow.link_ms += ms; }
+    if (kind == 2) { g_slow.slow_draws++; g_slow.slow_draw_ms += ms; }
+    if (ms > g_slow.worst_ms) g_slow.worst_ms = ms;
+    int report = (now - g_slow.since_ns) > 5000000000ull &&
+                 (g_slow.compiles || g_slow.links || g_slow.slow_draws);
+    unsigned c = g_slow.compiles, l = g_slow.links, d = g_slow.slow_draws;
+    double cm = g_slow.compile_ms, lm = g_slow.link_ms, dm = g_slow.slow_draw_ms, w = g_slow.worst_ms;
+    if (report) {
+        g_slow.since_ns = now;
+        g_slow.compiles = g_slow.links = g_slow.slow_draws = 0;
+        g_slow.compile_ms = g_slow.link_ms = g_slow.slow_draw_ms = g_slow.worst_ms = 0;
+    }
+    pthread_mutex_unlock(&g_slow.mu);
+    if (ms >= (double)limit) {
+        if (kind == 2) {
+            int32_t prog = 0;
+            if (a_glGetIntegerv) a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &prog);
+            fprintf(stderr, "  [glfb] slow draw: %.1f ms, program %d, %d vertices\n", ms, prog, verts);
+        } else {
+            fprintf(stderr, "  [glfb] slow %s: %.1f ms, %s %u\n", kind ? "link" : "compile", ms,
+                    kind ? "program" : "shader", name);
+        }
+    }
+    if (report)
+        fprintf(stderr, "  [glfb] shader work since the last report: %u compiled (%.0f ms), %u linked "
+                        "(%.0f ms), %u slow draws (%.0f ms); the longest single one %.1f ms\n",
+                c, cm, l, lm, d, dm, w);
+}
+static __thread uint64_t g_draw_t0;
+
 static void klfb_CompileShader(uint32_t shader) {
     if (!g_real_CompileShader) return;
     // The status/info-log readers are not thunks (the guest must get ANGLE's
@@ -1874,7 +1930,9 @@ static void klfb_CompileShader(uint32_t shader) {
     if (!g_real_GetShaderInfoLog)
         g_real_GetShaderInfoLog = (void *)asym("glGetShaderInfoLog");
     pthread_mutex_lock(&g_compile_lock);
+    uint64_t slow_t0 = klfb_slow_ms() ? klfb_slow_now() : 0;
     g_real_CompileShader(shader);
+    if (slow_t0) klfb_slow_note(0, shader, (double)(klfb_slow_now() - slow_t0) / 1.0e6, 0);
     int32_t ok = 1;
     if (g_real_GetShaderiv)
         g_real_GetShaderiv(shader, KLFB_GL_COMPILE_STATUS, &ok);
@@ -1922,7 +1980,17 @@ static void klfb_CompileShader(uint32_t shader) {
 static void klfb_LinkProgram(uint32_t program) {
     if (!g_real_LinkProgram) return;
     pthread_mutex_lock(&g_compile_lock);
+    uint64_t slow_t0 = klfb_slow_ms() ? klfb_slow_now() : 0;
     g_real_LinkProgram(program);
+    if (slow_t0) {
+        // The link may be finished behind this call; asking for its status is
+        // what waits for it, and what the guest does next anyway.
+        static void (*status)(uint32_t, uint32_t, int32_t *);
+        if (!status) status = asym("glGetProgramiv");
+        int32_t linked = 0;
+        if (status) status(program, 0x8B82 /* LINK_STATUS */, &linked);
+        klfb_slow_note(1, program, (double)(klfb_slow_now() - slow_t0) / 1.0e6, 0);
+    }
     // The pins the rewrite took out of the shader text become a translation
     // table here — this is the first moment a name has a location to translate
     // to. See the block above klfb_strip_uniform_layout.
@@ -3542,6 +3610,13 @@ static int klfb_tex_info(uint32_t name, uint32_t *fmt, int32_t *w, int32_t *h) {
 // that is known: a movie that changes size is re-described to the engine one
 // tick later than its first frame arrives, and an upload larger than the
 // storage is an error that leaves the texture untouched.
+// Whether a name is a texture of the context current on this thread.
+int kl_glfb_is_texture(uint32_t tex) {
+    static uint8_t (*is)(uint32_t);
+    if (!is) is = asym("glIsTexture");
+    return is ? is(tex) != 0 : 0;
+}
+
 int kl_glfb_upload_picture(uint32_t tex, int w, int h, const void *pixels, int bgra) {
     static void (*bind)(uint32_t, uint32_t);
     static void (*sub)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
@@ -7431,6 +7506,7 @@ static void klfb_draw_experiments(void) {
 }
 
 static void klfb_note_draw(void) {
+    if (klfb_slow_ms()) g_draw_t0 = klfb_slow_now();
     klfb_draw_experiments();
     int32_t fb = -1;
     if (a_glGetIntegerv) a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
@@ -7606,6 +7682,11 @@ static void klfb_errprobe(const char *what, const char *detail);
 // klfb_probe_fbo: the scene target is an RGBA16F 4xMSAA renderbuffer, which a
 // direct RGBA/UNSIGNED_BYTE readback cannot see — it answers err 0x500.
 static void klfb_draw_probe(int verts) {
+    if (g_draw_t0) {
+        double ms = (double)(klfb_slow_now() - g_draw_t0) / 1.0e6;
+        g_draw_t0 = 0;
+        if (ms >= (double)klfb_slow_ms()) klfb_slow_note(2, 0, ms, verts);
+    }
     // KL_GLFB_DUMP_PC: read back the ambient-cube pixel constants (pc[5..10] in the
     // VertexLitGeneric PS — six cube-face colours weighted by the normal) for the bound
     // program. Forks the black-in-shadow props: zero here = the ambient VALUES never reach

@@ -573,7 +573,13 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
                 if (on < 0) {
                     extern const char *kl_driver_target_name(void);
                     const char *t = kl_driver_target_name();
-                    on = kl_env_on("KL_ELF_TLSDESC", t && strcmp(t, "x3635172946605196") == 0);
+                    // ...and Wooorld (x4360608937312293), where the library is
+                    // not optional: its sign-in calls into libovravatar2 right
+                    // after the platform user arrives, and with the library
+                    // refused that is a DllNotFoundException which ends the
+                    // chain on a black screen (2026-10-11).
+                    on = kl_env_on("KL_ELF_TLSDESC", t && (strcmp(t, "x3635172946605196") == 0 ||
+                                                           strcmp(t, "x4360608937312293") == 0));
                 }
                 if (!on) {
                     err("unhandled relocation type %u at %#llx (ELF TLS; KL_ELF_TLSDESC=1 serves it)",

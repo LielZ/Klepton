@@ -2786,6 +2786,10 @@ final class KleptonCompositor {
         // position carries the quad's real distance, so what lands in the
         // buffer is where the panel actually is.
         if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
+        if writeDepth, kl_ovrp_eyeless_black() != 0 {
+            encodeBlackBackdrop(enc, pipe: pipe, viewIndices: viewIndices, drawable: drawable,
+                                originFromHead: originFromHead)
+        }
         let n = Int(kl_ovrp_overlay_count())
         var drawn = 0
         var drewEquirect = false
@@ -2896,7 +2900,10 @@ final class KleptonCompositor {
                 enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
                 enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
             }
-            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            // Four for a quad; a cylinder's strip runs along its arc.
+            let stripVertices = uniforms.first(where: { $0.visible != 0 })
+                .map { u in var v = u; return Int(kl_overlay_strip_vertices(&v)) } ?? 4
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stripVertices)
             drawn += 1
             if !loggedOverlayDraw.contains(ov.layer_id) {
                 loggedOverlayDraw.insert(ov.layer_id)
@@ -2909,6 +2916,62 @@ final class KleptonCompositor {
         drawn += encodeLoadingCard(enc, viewIndices: viewIndices, drawable: drawable,
                                    originFromHead: originFromHead)
         return drawn
+    }
+
+    // Black behind the quads of a frame that carries no eye picture (kl_ovrp.c,
+    // kl_ovrp_eyeless_black). In a mixed space the system shows the room
+    // wherever this pass wrote no depth, so "nothing behind the loading screen"
+    // has to be drawn: one opaque black quad fixed to the head, far behind any
+    // panel a guest places (its own are tens to a few hundred metres away) and
+    // wide enough to fill the view, through the panels' own pipeline so that it
+    // writes depth like they do.
+    private var blackTexture: MTLTexture?
+    private func encodeBlackBackdrop(_ enc: MTLRenderCommandEncoder,
+                                     pipe: MTLRenderPipelineState,
+                                     viewIndices: [Int],
+                                     drawable: LayerRenderer.Drawable,
+                                     originFromHead: simd_float4x4) {
+        if blackTexture == nil {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1,
+                                                                height: 1, mipmapped: false)
+            desc.usage = .shaderRead
+            if let tex = device.makeTexture(descriptor: desc) {
+                var px: [UInt8] = [0, 0, 0, 255]
+                tex.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0,
+                            withBytes: &px, bytesPerRow: 4)
+                blackTexture = tex
+                NSLog("[cp] frames without an eye picture: black behind their quads")
+            }
+        }
+        guard let tex = blackTexture else { return }
+        var ov = kl_ovrp_overlay()
+        ov.shape = 0
+        ov.tex_w = 1; ov.tex_h = 1
+        ov.viewport.0 = (0, 0, 1, 1)
+        ov.viewport.1 = (0, 0, 1, 1)
+        // 600 m: a little behind where the eye picture itself is placed
+        // (500 m, which the system is known to take as content) and behind
+        // Unreal's splash quads at 200 m; 5 km across is ±76° from there.
+        ov.pose = (0, 0, 0, 1, 0, 0, -600)
+        ov.size = (5000, 5000)
+        ov.origin_top_left = 1
+        ov.head_locked = 1
+        var uniforms: [kl_overlay_uniforms] = []
+        for vi in viewIndices {
+            uniforms.append(kl_overlay_build(&ov, Int32(vi), originFromHead,
+                                             Self.headFromView(drawable.views[vi].transform,
+                                                               midpoint: eyeMidpointInDevice),
+                                             drawable.computeProjection(viewIndex: vi)))
+        }
+        guard uniforms.contains(where: { $0.visible != 0 }) else { return }
+        enc.setRenderPipelineState(pipe)
+        enc.setFragmentTexture(tex, index: 0)
+        if let sampler { enc.setFragmentSamplerState(sampler, index: 0) }
+        uniforms.withUnsafeBytes { buf in
+            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+        }
+        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
     }
 
     // The loading screen of a guest that says what it should show instead of

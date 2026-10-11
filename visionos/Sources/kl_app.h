@@ -31,6 +31,9 @@
 // case kl_app_status() explains which one. Checking here is the point: a
 // missing asset tree otherwise presents as a shim bug deep inside Unity.
 int kl_app_configure(const char *resources, const char *container);
+// A test of a cold shader start, asked for by a file in Documents; kl_app.c
+// has the story. From the App's init, before Metal is used.
+void kl_app_shader_cache_test(void);
 
 // Run the boot sequence. Returns 0 if initJni completed with no unimplemented
 // JNI call. Everything printed goes to the log file below as well as stdout,
