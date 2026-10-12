@@ -329,6 +329,11 @@ final class KleptonCompositor {
     // instead.
     private var displayQualityX: [Float] = []
     private var displayQualityY: [Float] = []
+    // ...and each view's own horizontal curve, left eye first, for a guest that
+    // can be given a map layer per eye (see updateGuestRateMap). Symmetrised:
+    // the right one is the left one mirrored, so both layers store the same
+    // number of texels.
+    private var displayEyeQualityX: [[Float]] = []
 
     // ARKit is the pose-in seam kl_ovrp.h describes: "on visionOS it is ARKit's
     // WorldTrackingProvider answering the same call" the SDL viewer answers on
@@ -1019,6 +1024,41 @@ final class KleptonCompositor {
         return (qx, qy)
     }
 
+    /// KL_CP_GAZE_TRACE: where each view's rate map is densest, four times a
+    /// second for the first two minutes — the measurement of whether the maps a
+    /// drawable carries follow the eyes. The centre of the full-rate plateau is
+    /// printed per view as a fraction of the screen (x from the left, y from the
+    /// map's row 0); a figure that moves as the person looks around is a map
+    /// that is rebuilt from the gaze, one that stays put is a fixed curve.
+    private var gazeTraceFrames = 0
+    private var gazeTraceLines = 0
+    private lazy var gazeTraceOn = klEnvOn("KL_CP_GAZE_TRACE", default: false)
+    private func traceGazeMaps(_ drawables: [LayerRenderer.Drawable]) {
+        guard gazeTraceOn, gazeTraceLines < 480 else { return }
+        gazeTraceFrames += 1
+        guard gazeTraceFrames % 25 == 0 else { return }
+        func centre(_ q: [Float]) -> Float {
+            var sum: Float = 0, weight: Float = 0
+            for (i, v) in q.enumerated() where v >= 0.9 {
+                sum += (Float(i) + 0.5) * v; weight += v
+            }
+            return weight > 0 ? sum / weight / Float(q.count) : -1
+        }
+        var line = "[cp] gaze-map f\(gazeTraceFrames):"
+        for (d, drawable) in drawables.enumerated() {
+            for (m, map) in drawable.rasterizationRateMaps.enumerated() {
+                for layer in 0..<map.layerCount {
+                    let (qx, qy) = Self.sampleCurve(map, layer: layer, zonesX: 48, zonesY: 48)
+                    let p = map.physicalSize(layer: layer)
+                    line += String(format: " d%d.m%d.l%d x=%.3f y=%.3f phys %dx%d |", d, m, layer,
+                                   centre(qx), centre(qy), p.width, p.height)
+                }
+            }
+        }
+        gazeTraceLines += 1
+        NSLog("%@", line)
+    }
+
     /// Take the display's own foveation curve off a drawable, so the guest
     /// rasterizes the way the compositor already does instead of the way we
     /// guessed.
@@ -1063,15 +1103,28 @@ final class KleptonCompositor {
         var qx = [Float](repeating: 0, count: nx)
         var qy = [Float](repeating: 0, count: ny)
         var sampled = 0
+        var perView: [[Float]] = []
         for map in maps {
             for layer in 0..<map.layerCount {
                 let (mx, my) = Self.sampleCurve(map, layer: layer, zonesX: nx, zonesY: ny)
                 for i in 0..<nx { qx[i] = max(qx[i], mx[i]) }
                 for i in 0..<ny { qy[i] = max(qy[i], my[i]) }
+                perView.append(mx)
                 sampled += 1
             }
         }
         guard sampled > 0 else { return }
+        // Two views: keep each eye's own horizontal curve as well. The pair is
+        // made an exact mirror image — each zone the denser of "the left eye
+        // here" and "the right eye at the mirrored place" — so that neither eye
+        // gets fewer samples than its display asks for and both map layers come
+        // out the same physical size, which the copy between the guest's
+        // swapchain and the compositor's eye textures relies on.
+        if perView.count == 2 {
+            var left = perView[0]
+            for i in 0..<nx { left[i] = max(left[i], perView[1][nx - 1 - i]) }
+            displayEyeQualityX = [left, Array(left.reversed())]
+        }
         // ...and the envelope's valleys are filled. The two eyes' dense regions
         // sit inboard of centre, mirrored, so their per-zone maximum has TWO
         // peaks with a dip between them — 1.00 either side and 0.83 in the two
@@ -1170,19 +1223,33 @@ final class KleptonCompositor {
         }
         // `__sampleCount:` is the pointer-taking initializer as Swift imports
         // it; the array-taking spelling does not exist here.
-        func makeLayer() -> MTLRasterizationRateLayerDescriptor {
-            qx.withUnsafeBufferPointer { hp in
+        // A layer per eye, each with that eye's OWN horizontal curve, where the
+        // guest draws both eyes in one layered pass (kl_glfb_rate_map_layers) and
+        // the display gave two. The envelope above is dense wherever either eye
+        // wants density, which for the pair of mirrored, inboard curves is most
+        // of the width: at 6890x5526 it stores 4509x2720 an eye where the
+        // display itself keeps 2624x2560. With its own curve an eye stores about
+        // what its display keeps — over 40% fewer fragments for the guest — and
+        // unwarpGrid reads each eye through its own layer. KL_VRR_PER_EYE=0 is
+        // the envelope for both, as before.
+        let perEye = layers == 2 && displayEyeQualityX.count == 2
+            && displayEyeQualityX[0].count == qx.count && source == "the display's own"
+            && klEnvOn("KL_VRR_PER_EYE", default: true)
+        func makeLayer(_ i: Int) -> MTLRasterizationRateLayerDescriptor {
+            let hx = perEye ? displayEyeQualityX[i] : qx
+            return hx.withUnsafeBufferPointer { hp in
                 qy.withUnsafeBufferPointer { vp in
                     MTLRasterizationRateLayerDescriptor(
-                        __sampleCount: MTLSize(width: qx.count, height: qy.count, depth: 0),
+                        __sampleCount: MTLSize(width: hx.count, height: qy.count, depth: 0),
                         horizontal: hp.baseAddress!, vertical: vp.baseAddress!)
                 }
             }
         }
+        if perEye { source += ", a curve per eye" }
         let desc = MTLRasterizationRateMapDescriptor()
         desc.screenSize = MTLSize(width: w, height: h, depth: 0)
         desc.label = "klepton guest foveation"
-        for i in 0..<layers { desc.setLayer(makeLayer(), at: i) }
+        for i in 0..<layers { desc.setLayer(makeLayer(i), at: i) }
         guard let map = device.makeRasterizationRateMap(descriptor: desc) else {
             guestRateRefused = true
             NSLog("[cp] makeRasterizationRateMap \(w)x\(h) failed — KL_VRR ignored")
@@ -1204,6 +1271,14 @@ final class KleptonCompositor {
         guestRateW = w; guestRateH = h
         kl_glfb_set_eye_rate_map(Int32(w), Int32(h), Int32(qx.count), Int32(qy.count),
                                  Unmanaged.passUnretained(map).toOpaque())
+        // What the guest will actually write of each eye: the larger layer, and
+        // two texels over for the rounding at its edge.
+        var pw = 0, ph = 0
+        for l in 0..<map.layerCount {
+            let p = map.physicalSize(layer: l)
+            pw = max(pw, p.width); ph = max(ph, p.height)
+        }
+        kl_glfb_set_eye_rate_physical(Int32(min(w, pw + 2)), Int32(min(h, ph + 2)))
     }
 
     /// kl_glfb calls this when the guest asks for storage for one (eye, stage).
@@ -2058,6 +2133,8 @@ final class KleptonCompositor {
         // The guest's stereo separation, refreshed from the display itself.
         pushEyeOffsets(main)
 
+        traceGazeMaps(drawables)
+
         var encoded = 0
         for drawable in drawables {
             // Per drawable, not once: each one is presented separately and each
@@ -2645,11 +2722,21 @@ final class KleptonCompositor {
                 foveated = rm.screenSize.width == bind0.width
                     && rm.screenSize.height == bind0.height
             }
-            // The unwarp grid is ONE block shared by both eyes, where this pass's
-            // uniforms were built for the layer grid's block per eye: left as it
-            // was, eye 1 indexes past the end of the grid and draws nothing.
+            // The unwarp grid is ONE block shared by both eyes unless the guest's
+            // map has a curve per eye (unwarpGrid's third answer), where this
+            // pass's uniforms were built for the layer grid's block per eye: left
+            // as it was against a shared grid, eye 1 indexes past its end and
+            // draws nothing. Against a grid that DOES carry a block per eye the
+            // uniforms are already right, and forcing both eyes onto block 0
+            // unwarps the right eye through the left eye's curve — a grossly
+            // distorted right eye beside a correct left one (on device,
+            // 2026-10-12, the first build with a curve per eye).
+            var unwarp: (MTLBuffer?, Int, Bool)? = nil
             if foveated {
-                for n in uniforms.indices { uniforms[n].grid_eye = 0 }
+                unwarp = unwarpGrid(bind0, viewport0: .zero, viewport1: .zero, viewportOf: .zero)
+                if unwarp?.2 != true {
+                    for n in uniforms.indices { uniforms[n].grid_eye = 0 }
+                }
             }
             enc.setRenderPipelineState(pipeline)
             enc.setFragmentTexture(bind0, index: 0)
@@ -2666,9 +2753,7 @@ final class KleptonCompositor {
             withUnsafePointer(to: pl) { p in
                 layerGrid.withUnsafeMutableBufferPointer { kl_proj_layer_grid(p, $0.baseAddress) }
             }
-            if foveated {
-                let (gridBuf, gridVerts, _) =
-                    unwarpGrid(bind0, viewport0: .zero, viewport1: .zero, viewportOf: .zero)
+            if foveated, let (gridBuf, gridVerts, _) = unwarp {
                 // Said once per size: what the grid actually holds, because "the
                 // unwarp ran" and "the unwarp did something" are different claims.
                 if let gridBuf, loggedLayerUnwarp != bind0.width {
@@ -3559,6 +3644,26 @@ final class KleptonCompositor {
         px?.pointee = p.x
         py?.pointee = p.y
     }
+    /// The same through the map's SECOND layer: the right eye of a guest whose
+    /// map carries a curve per eye (updateGuestRateMap).
+    private static let screenToPhysicalLayer1: kl_reproject_s2p = { ctx, sx, sy, px, py in
+        guard let ctx,
+              let map = Unmanaged<AnyObject>.fromOpaque(ctx)
+                  .takeUnretainedValue() as? MTLRasterizationRateMap else { return }
+        let p = map.physicalCoordinates(
+            screenCoordinates: MTLSamplePosition(x: sx, y: sy), layer: map.layerCount > 1 ? 1 : 0)
+        px?.pointee = p.x
+        py?.pointee = p.y
+    }
+    /// Does this map store the two eyes differently? Asked of the map itself —
+    /// a quarter of the way across, where two mirrored curves disagree most —
+    /// so the answer cannot drift from what the guest was rasterized through.
+    private static func layersDiffer(_ map: MTLRasterizationRateMap) -> Bool {
+        guard map.layerCount > 1 else { return false }
+        let at = MTLSamplePosition(x: Float(map.screenSize.width) * 0.25, y: 0)
+        return abs(map.physicalCoordinates(screenCoordinates: at, layer: 0).x
+                   - map.physicalCoordinates(screenCoordinates: at, layer: 1).x) > 0.5
+    }
 
     private var gridBuffer: MTLBuffer?
     private var gridMap: UnsafeMutableRawPointer?
@@ -3648,8 +3753,13 @@ final class KleptonCompositor {
         // Two blocks only when the eyes really disagree. Equal rects — every
         // guest measured here before BONELAB's symmetric projection — take the
         // single-block path unchanged, cache key and all.
-        let perEye = vp != vpR
-        if perEye, !loggedSplitViewports {
+        // ...or when the guest's map has a curve per eye: then each eye is read
+        // through its own layer, whatever the rects.
+        let layered = map.flatMap {
+            (Unmanaged<AnyObject>.fromOpaque($0).takeUnretainedValue() as? MTLRasterizationRateMap)
+                .map(Self.layersDiffer) } ?? false
+        let perEye = vp != vpR || layered
+        if vp != vpR, !loggedSplitViewports {
             loggedSplitViewports = true
             NSLog("[cp] the eyes submitted DIFFERENT render viewports "
                   + "(\(Int(vp.x)),\(Int(vp.y)) \(Int(vp.z))x\(Int(vp.w)) vs "
@@ -3681,9 +3791,12 @@ final class KleptonCompositor {
                     zx = gran.width  > 0 ? Int32(phys.width  / gran.width)  : 16
                     zy = gran.height > 0 ? Int32(phys.height / gran.height) : 16
                 }
-                let cap = Int32(KL_REPROJECT_GRID_MAX)
-                nx = UInt32(max(1, min(cap, zx)))
-                ny = UInt32(max(1, min(cap, zy)))
+                // Finer than the zones: the map is curved inside one, and a
+                // cell per zone was up to 3.3 texels off (kl_reproject.h).
+                let cap = Int32(KL_REPROJECT_GRID_CELLS_MAX)
+                let refine = Int32(KL_REPROJECT_GRID_REFINE)
+                nx = UInt32(max(1, min(cap, zx * refine)))
+                ny = UInt32(max(1, min(cap, zy * refine)))
                 let n = Int(kl_reproject_grid_entries_n(nx, ny, eyes))
                 var table = [SIMD2<Float>](repeating: .zero, count: n)
                 let scr = rm.screenSize
@@ -3696,13 +3809,16 @@ final class KleptonCompositor {
                                                         croppedEye[e] ? r.baseAddress : nil,
                                                         Float(scr.width), Float(scr.height),
                                                         Float(tw), Float(th),
-                                                        Self.screenToPhysical, map)
+                                                        layered && e == 1
+                                                            ? Self.screenToPhysicalLayer1
+                                                            : Self.screenToPhysical, map)
                         }
                     }
                 }
                 gridBuffer = queue?.device.makeBuffer(bytes: table,
                                                       length: n * MemoryLayout<SIMD2<Float>>.stride)
-                NSLog("[cp] unwarp grid \(nx)x\(ny)\(perEye ? " x2 eyes" : "") for a "
+                NSLog("[cp] unwarp grid \(nx)x\(ny)\(perEye ? " x2 eyes" : "")"
+                      + "\(layered ? " (a map layer per eye)" : "") for a "
                       + "\(tw)x\(th) eye texture "
                       + "(map screen \(scr.width)x\(scr.height), viewport "
                       + (cropped ? "\(Int(vp.x)),\(Int(vp.y)) \(Int(vp.z))x\(Int(vp.w))"

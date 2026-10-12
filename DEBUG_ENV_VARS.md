@@ -55,11 +55,39 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   list instead of refusing the request. For a title whose start waits for the
   answer; nothing is reported as for sale or as bought. Default on for Tales
   from the Galaxy's Edge (`x3484270071659289`) alone.
+- `KL_PLAT_IAP_CONFIRMED=0|1` — (`runtime/xr/kl_ovrplat.c`) answer
+  `ovr_IAP_GetViewerPurchases` with the SKUs in `klepton-entitlements.txt`,
+  as they are — the purchases the store confirmed, written on the Mac. For a
+  title that unlocks its add-ons on the purchase list alone; with no file the
+  list is empty. Default on for Maestro (`x6963344583787383`) alone.
 - `KL_PLAT_OBB_ASSETS=0|1` — (`runtime/xr/kl_ovrplat.c`) report the loose
   container files in the OBB directory (`*.pak`, `*.utoc`, `*.ucas`) to
   `ovr_AssetFile_GetList` as installed asset files. They are the store's asset
   files for such a title, on disk because the store delivered them; a file
-  that is not there is not listed. Default on for `x3484270071659289` alone.
+  that is not there is not listed. Default on for `x3484270071659289` and
+  Maestro (`x6963344583787383`).
+- `KL_GL_MSRTT=0|1` — (`runtime/gfx/kl_egl.c`) show the guest
+  `GL_OVR_multiview`, `GL_OVR_multiview_multisampled_render_to_texture` and
+  `GL_EXT_multisampled_render_to_texture` together, and attach its multisampled
+  multiview target single-sampled. For a Unity 6 title on Unity's OpenXR plugin
+  that renders SinglePassInstanced with anti-aliasing: without the first name
+  its eye framebuffer is incomplete, with the first two but not the third its
+  render pass never begins ("Missing resolve surface"). Default on for Beat
+  Saber from 1.45 on (`kl_guest_beatsaber_openxr`: the row is `beatsaber140` or
+  `beatsaber` and the APK ships `libUnityOpenXR.so`), off for every other guest
+  and for Beat Saber 1.40. The same test turns on that build's offline user,
+  its OVRPlugin version (1.106.0), its eye-size cap (4000) and `.full`.
+- `KL_NET_NO_META=0|1` — (`runtime/libc/kl_shim.c`) names under oculus.com,
+  oculuscdn.com, facebook.com, facebook.net, fbcdn.net and meta.com do not
+  resolve (`EAI_NONAME`, as on a headset without a network); every other host
+  resolves as before. For a guest that holds the synthetic offline user and
+  would send its made-up token to Meta's servers with every analytics,
+  feature-flag and leaderboard request. Default on for Beat Saber from 1.45 on
+  (`kl_guest_beatsaber_openxr`), off for every other guest. The first four
+  refusals are logged by name.
+- `KL_VROS_SDK=<n>` — (`runtime/jni/kl_jni_android.c`) what
+  `vros.os.VrosBuild.getSdkVersion()` answers, the Horizon OS release as a
+  number. Default 76.
 - `KL_HZ_ENTITLEMENT=0` — (`runtime/jni/kl_jni_net.c`) leave the Horizon
   Platform request `entitlements` / `get_is_viewer_entitled` without a reply,
   as every other Horizon request is. Default 1: that one request — the
@@ -81,6 +109,15 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   `glTexSubImage2D` upload as a PNG under `<dir>`. Armed before the guest runs
   (uploads happen all through init). Compressed uploads (ETC2/ASTC) are
   skipped rather than guessed at.
+
+- `KL_GL_ES31_LIMITS=1` — answer the ES 3.1 storage limits (shader storage
+  blocks and bindings, image units, compute invocations) with the spec minimums
+  for ANY target, as Sniper Elite VR gets them by name. An experiment: on its
+  own it makes Unity send compute kernels to GL, where
+  `glCreateShader(GL_COMPUTE_SHADER)` fails on the ES 3.0 ANGLE (Beat Saber 1.45
+  then throws `IndexOutOfRangeException: Invalid kernelIndex (0)`, which is
+  worse than its kernel being refused). `KL_GLFB_COMPUTE_TF` answers the same
+  limits and serves the kernel.
 
 ## ANGLE reference renderer (`runtime/gfx/kl_glfb.c`)
 
@@ -243,6 +280,30 @@ answers GL and kl_glfb never initializes.
 - `KL_GLFB_LOCK=1` — route every resolved GL entry point through a
   process-wide lock held across the call (`kl_gl_lock.S`). Serialises all
   guest GL; a probe, not a mode.
+- `KL_GLFB_COMPUTE_TF=0|1` — run compute kernels as transform feedback
+  (default on for Beat Saber from 1.45 — `kl_guest_beatsaber_openxr`, rows
+  `beatsaber140` and `beatsaber` — and off elsewhere). Beat Saber 1.45 builds
+  the quads of its tube lights in a kernel (`FillMeshData`, dispatched by
+  `BloomPrePassRendererSO.RenderAllLights`) that writes straight into a mesh's
+  vertex buffer; ANGLE on Metal is ES 3.0 and has no compute stage. With this
+  on, `glCreateShader(GL_COMPUTE_SHADER)` makes a vertex shader, the kernel's
+  source is rewritten at `glShaderSource` (input buffer -> vertex attributes,
+  output buffer -> captured varyings), and `glDispatchCompute` is one
+  `GL_POINTS` draw under `RASTERIZER_DISCARD`. `kl_egl.c` answers the ES 3.1
+  storage limits to match, or Unity refuses the kernel before GL sees it. Look
+  for `[glfb] compute-tf:` — one line per rewritten shader, per linked program
+  and for the first dispatch; a kernel of another shape says why it was not
+  rewritten. `=0` is the state before: the kernel is refused, Unity logs
+  "requires features ... 'randomWrite' 'uav'" every frame and the lights are
+  missing from the bloom pre-pass.
+- `KL_GLFB_COMPUTE_TF_LOG=1` — a `compute-tf: dispatch` line every 300th
+  dispatch as well, with the invocation count (the number of lights, rounded
+  up to work groups).
+- `KL_GLFB_COMPUTE_TF_SELFTEST=1` — run each kernel once, right after it
+  links, on three made-up lights and print the 4 vertices it wrote for each
+  (screen position, view position, colour, uv). For a run that never reaches a
+  scene with lights: the Mac run ends at the language screen and dispatches
+  nothing. A fourth element beyond the light count must come back as zeros.
 - `KL_GLFB_OUT=<dir>` — request a PNG capture on each `eglSwapBuffers`. Read
   by `kl_egl.c`'s SwapBuffers; the readback is serviced from the next call the
   context-owning thread makes (or immediately when the swap arrives on that
@@ -584,7 +645,16 @@ The guest's own memory management, and the three seams that used to disable it.
 - `KL_FS_REL_SDCARD=0|1` — resolve a relative path that begins with `sdcard/`
   (or another spelling of external storage) as the absolute one, as it is on a
   device where the app's working directory is `/`. AC Nexus opens its animator
-  controller bundle that way. Default 1 for `x5812519008825194`, else 0.
+  controller bundle that way. Default 1 for `x5812519008825194` and
+  `x2773034772778845` (Premium Bowling: every hall's scene bundle), else 0.
+- `KL_GLFB_BIND_PINS=0|1` — (`runtime/gfx/kl_glfb.c`) hand the uniform
+  locations a shader pins (`layout(location = N) uniform …`,
+  `UNITY_LOCATION(N)`) to the linker with `glBindUniformLocationCHROMIUM`
+  instead of only translating them at `glUniform*`. A Unity built for ES 3.1
+  uses the location it is told for a sampler as the texture unit; with the
+  linker's own numbering that can be 32 or more, which the engine refuses
+  ("Invalid texture unit!") — text as filled boxes. Default 1 for
+  `x2773034772778845` (Premium Bowling, Unity 6000.3.22f1), else 0.
 - `KL_FS_JAR_FILE=0|1` — a path of the form `jar:file:///…` with no `!/`
   entry part is read as the plain path it wraps; Unity's Android file layer
   strips that scheme itself. Default 1 for `x3635172946605196` (BRINK
@@ -592,9 +662,10 @@ The guest's own memory management, and the three seams that used to disable it.
 - `KL_ELF_TLSDESC=0|1` — the loader serves `R_AARCH64_TLSDESC` relocations
   (ELF thread-local storage, dynamic model) for a library's own TLS: a block
   per thread and module, made at first use. Off, such a library does not
-  load, as before. Default 1 for `x3635172946605196` and `x4360608937312293`
-  (Wooorld, whose sign-in needs `libovravatar2`), else 0 — a title that
-  works may ship an optional library it has been running without.
+  load, as before. Default 1 for `x3635172946605196`, `x4360608937312293`
+  (Wooorld, whose sign-in needs `libovravatar2`) and `x2773034772778845`
+  (Premium Bowling, same library), else 0 — a title that works may ship an
+  optional library it has been running without.
 - `KL_MADV_DONTNEED=remap|reusable|zero|passthrough` — how a guest
   `madvise(MADV_DONTNEED)` is served. Default `remap`. **`MADV_DONTNEED` is 4 on
   Linux and Darwin and means different things**: Linux frees the pages, Darwin
@@ -869,6 +940,8 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   matched against `Namespace.Class` instead (`@Mighty.Tester.` lists a whole
   namespace). How a guest's own functions are found when all there is of them
   is names in global-metadata.dat. Independent of `KL_PROBE_INPUT`.
+  Each method line ends in `@libil2cpp+0x...`, its methodPointer as an offset
+  into the file: where to start `llvm-objdump -d --start-address=` on it.
 - `KL_PROBE_CALL=<Namespace.Class>::<Method>` — call one of the guest's own
   parameterless methods once, at frame `KL_PROBE_CALL_FROM` (default 3000). A
   static one as it is; an instance one on the class's `Instance`, else on the
@@ -887,6 +960,29 @@ behind "no controllers render". Diagnostic only, off unless asked for.
 - `KL_PROBE_STRINGS=<Namespace.Class>::<field>` — a List of strings on the
   class's `Instance`, printed as it grows (a test driver's own results).
 - `KL_PROBE_FIND` with an `@Class` part lists that class's fields as well.
+- `KL_PROBE_SCRIPT=<frame>:<Namespace.Class>::<Method>[(args)][#n];<frame>:...`
+  — several calls like `KL_PROBE_CALL`'s, each at its frame (rising), separated
+  by `;`. Arguments, up to four: a quoted one is a string, `true`/`false` and
+  whole numbers go as the value they are; the overload is picked by their
+  COUNT, so a method with two one-argument overloads gets whichever comes first
+  (`MultiplayerLauncher::LoadScene` took a string for a `CourseInfoAsset` and
+  threw). With `#n` the call goes to the n-th object of that class in the
+  loaded scenes (inactive ones too, by instance id), and the line says that
+  object's name. How Walkabout is walked without its menu:
+  `XRRig::LoadScene("Vegas_Easy")` loads a course from wherever the game is —
+  the name's capitals matter, `vegas_easy` loads nothing —,
+  `Mighty.Homestar.HomestarManager::GoToBasement` enters the Homestar Runner
+  basement (part of the main menu), `Mighty.Homestar.HSLauncher::Launch#n`
+  starts one of the 36 launchers there and
+  `Mighty.Homestar.HomestarMenuUtility::ReturnToBasement` comes back.
+- `KL_PROBE_KEEP` without `KL_PROBE_CALL` only lists (and filters) at
+  `KL_PROBE_CALL_FROM` — how `tools/pipeline_tour.py` reads the names a guest
+  loads its scenes by.
+- **An object "not there" was once this probe's fault.** `KL_PROBE_CALL` looked
+  an instance up with `FindObjectOfType`, by name and argument count — which a
+  generic overload shares, so the lookup could return that one and find
+  nothing. It now asks the three-argument `FindObjectsByType`, the one of the
+  family no generic overload shares the count with.
 - `KL_PROBE_XR=1` — print `XRSettings`: the loaded device name, `enabled`, the
   **stereo rendering mode**, the eye texture size and the render viewport scale.
   Every one of those is a number WE answered (through ovrp), and this is the far
@@ -1396,6 +1492,13 @@ puts the camera on the ground with its hands underneath it.
   directory holding mods and configs beside them is left alone. Without it the
   engine stops with "Couldn't load default.cfg" and says nothing about where it
   looked; the staging census says so first, by name.
+- `KL_UNITY_BOOT_EXTRA="<k=v;k=v>"` — lines appended to a Unity guest's
+  `bin/Data/boot.config` as `AssetManager.open` serves it (the file on disk is
+  untouched); `;` separates lines, empty means none. Default empty, except
+  Eye of the Temple (x5361030930653377): `disable-gpu-skinning=1`, because its
+  compute-shader skinning cannot compile on ANGLE's ES 3.0 context
+  ("Internal-Skinning.main: GLSL compilation failed") and every skinned mesh,
+  the whip among them, was never drawn.
 - `KL_JKXR_ARGS="<args>"` — appended to the engine's command line, after the
   game token. It reaches the engine both ways it can (the string handed to
   `GLES3JNILib.onCreate` and the `JKXR/commandline.txt` the engine re-reads),
@@ -2746,6 +2849,20 @@ written down is a value found twice.
 - `KL_CP_FORMAT=16` — drawable back to `rgba16Float`; the default is 8-bit
   `bgra8Unorm_srgb` (ALVR's choice — half the composite bandwidth, hardware
   sRGB encode on write). The guest's eye textures stay RGBA16F either way.
+- `KL_VRR_PER_EYE=0` — (headset compositor) give both layers of a mirrored
+  guest's rate map the envelope of the two eyes' curves, as before. Default 1:
+  each layer gets its own eye's curve (the display's, made an exact mirror
+  pair), which stores about what the display keeps — at 6890x5526, 2784x2720
+  an eye where the envelope stored 4509x2720.
+- `KL_VRR_MIRROR_PHYS=0` — (`runtime/gfx/kl_glfb.c`) copy a foveated mirrored
+  eye as the whole texture again. Default 1: only the map's physical part,
+  which is all the guest wrote.
+- `KL_CP_GAZE_TRACE=1` — four times a second, for the first two minutes, where
+  each view's rate map on the drawable is densest (the centre of its full-rate
+  plateau, as a fraction of the screen). The measurement of whether the
+  display's foveation follows the eyes. On a Vision Pro M5 with visionOS 27.2
+  it does not: 166 samples in 37 seconds while the wearer looked left, right,
+  up and down were all x=0.635/0.365 (the two eyes, mirrored), y=0.468.
 - `KL_CP_FOVEATION=0` — no variable-rasterization-rate map and no
   `maxRenderQuality` ceiling (the quality knob is only accepted alongside
   foveation).

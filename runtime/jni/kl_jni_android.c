@@ -315,6 +315,17 @@ static klj_val klj_VRCInfo_getVersionCode(void *env, void *self, const klj_val *
     (void)env; (void)self; (void)a; (void)n;
     return klj_PackageInfo_versionCode();
 }
+// vros.os.VrosBuild.getSdkVersion() — the Horizon OS release a Quest runs, as a
+// number (v76 answers 76). The class is part of the OS image, not of any APK.
+// Beat Saber 1.45 reads it right after its analytics id request, once it has a
+// user; there was no entry and the run stopped here by name (on a Mac host,
+// 2026-10-12). One release is named rather than the newest: a guest may switch
+// on OS features by this number, and none of those exist here. KL_VROS_SDK
+// overrides.
+static klj_val klj_VrosBuild_getSdkVersion(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)kl_env_int("KL_VROS_SDK", 76)};
+}
 static klj_val klj_VRCInfo_getVersionName(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return klj_PackageInfo_versionName();
@@ -1280,6 +1291,33 @@ static klj_val klj_ClassLoader_findLibrary(void *env, void *self, const klj_val 
     return (klj_val){.l = found ? kl_jni_new_string(path) : NULL};
 }
 
+// Is this guest Beat Saber on Unity's OpenXR plugin — 1.45 and whatever the
+// store carries after it — rather than 1.40 and older on the Oculus XR plugin?
+//
+// The two are the same title under the same rows (`beatsaber140`, the one
+// players have installed, and `beatsaber`), and a row is a name, not a build:
+// which of them was translated into this bundle is a property of the APK. What
+// tells them apart without a version table is the library itself — the newer
+// one ships libUnityOpenXR.so and the older one does not. Asked of kl_can_load
+// for the reason findLibrary above is: in the bundle the translation is there
+// and the ELF is not.
+//
+// Everything that differs between the two hangs on this one answer (the GL
+// names in kl_egl.c, the platform user in kl_ovrplat.c, the plugin version and
+// the eye size in kl_ovrp.c, the immersion style in kl_app.c), so that 1.40
+// keeps exactly the answers it was verified with. Not cached: it is asked a
+// handful of times, and the first of them must not pin an answer taken before
+// the library directory was set.
+int kl_guest_beatsaber_openxr(void) {
+    extern const char *kl_driver_target_name(void);
+    extern int kl_can_load(const char *path);
+    const char *t = kl_driver_target_name();
+    if (!t || (strcmp(t, "beatsaber") != 0 && strcmp(t, "beatsaber140") != 0)) return 0;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/libUnityOpenXR.so", g_native_lib_dir);
+    return kl_can_load(path);
+}
+
     // getObbDir() and getObbDirs() are ONE answer asked two ways — Android's plural
 // form is the singular one followed by any adopted external volumes, and there
 // are none here. They used to disagree: the plural returned an empty array
@@ -1543,6 +1581,7 @@ const klj_binding klj_bind_android[] = {
     {"com/vrchat/android/plugin/Info", "instance", "()Ljava/lang/Object;", klj_VRCInfo_instance},
     {"com/vrchat/android/plugin/Info", "getVersionCode", "()I", klj_VRCInfo_getVersionCode},
     {"com/vrchat/android/plugin/Info", "getVersionName", "()Ljava/lang/String;", klj_VRCInfo_getVersionName},
+    {"vros/os/VrosBuild", "getSdkVersion", "()I", klj_VrosBuild_getSdkVersion},
     {"android/media/AudioManager", "isStreamMute", "(I)Z", klj_false},
     {"android/media/AudioManager", "isMicrophoneMute", "()Z", klj_false},
     {"java/lang/ClassLoader", "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", klj_ClassLoader_findLibrary},
@@ -1598,6 +1637,15 @@ const klj_binding klj_bind_android[] = {
      klj_Context_registerReceiver},
     {"android/content/Context", "registerReceiver",
      "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;I)Landroid/content/Intent;",
+     klj_Context_registerReceiver},
+    // Beat Saber 1.45's own receiver for debug commands sent to the headset as
+    // broadcasts (com.beatgames.beatsaber.terminal). Unity asks for it through
+    // reflection, so the signature carries the guest's dotted names and
+    // java.lang.Object as the return type. Registering is accepted as any other
+    // non-sticky filter is; nothing here broadcasts, so its callback never runs
+    // (the receiver's setCallback is in kl_jni_services.c).
+    {"android/content/Context", "registerReceiver",
+     "(Lcom.beatgames.beatsaber.terminal.TerminalBroadcastReceiver;Landroid.content.IntentFilter;)Ljava/lang/Object;",
      klj_Context_registerReceiver},
     // The in-headset UI panel — see the WebView block above for why every one
     // of these is accepted and none of them produces a pixel.

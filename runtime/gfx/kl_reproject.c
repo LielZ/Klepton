@@ -668,8 +668,8 @@ void kl_reproject_grid_build_eye(simd_float2 *out, uint32_t eye,
     // the correct picture for an unwarped, fully-drawn texture and merely the
     // wrong one otherwise — the strictly better failure of the two.
     if (!out) return;
-    if (nx == 0 || ny == 0 || nx > KL_REPROJECT_GRID_MAX ||
-        ny > KL_REPROJECT_GRID_MAX || !(tex_w > 0) || !(tex_h > 0) ||
+    if (nx == 0 || ny == 0 || nx > KL_REPROJECT_GRID_CELLS_MAX ||
+        ny > KL_REPROJECT_GRID_CELLS_MAX || !(tex_w > 0) || !(tex_h > 0) ||
         !(screen_w > 0) || !(screen_h > 0)) {
         // The identity, in this EYE's block of a 1x1 grid: the shader derives
         // every block's base from the header it reads, so collapsing the header

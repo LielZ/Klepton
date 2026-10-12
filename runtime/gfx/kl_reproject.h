@@ -297,12 +297,23 @@ const char *kl_reproject_msl(void);
 // PRE-UNWARPED texture coordinate, so the rasterizer's interpolation does the
 // rest and the fragment shader still just samples at `in.uv`.
 //
-// Exact, not an approximation. A Metal rate map is piecewise linear with its
-// breakpoints at the layer descriptor's zone boundaries, so a grid whose
-// vertices land on those boundaries reproduces the map exactly. Build it at the
-// map's zone count, or a multiple, and there is no error to trade off. The
-// coordinates are static for a given map, so this is built when the map is
-// made, not per frame.
+// A sampling of the map, and how fine it is matters. This used to say "exact":
+// that a Metal rate map is piecewise linear with its breakpoints at the layer
+// descriptor's zone boundaries, so a cell per zone reproduces it. It is not.
+// Metal interpolates the rate BETWEEN the sample points, so screen -> physical
+// is curved inside a zone, most where the rate changes fastest — the edge of
+// the dense region. Measured on a Mac (2026-10-12) with the display's own
+// 64-zone curve at 6890x5526, against -[MTLRasterizationRateMap
+// mapScreenToPhysicalCoordinates:]: a cell per zone is up to 3.3 physical
+// pixels off inside a cell at that edge (2.4 vertically), two cells a zone 1.2,
+// four 0.7, eight 0.3. On the headset the cell-per-zone grid read as a slight
+// wave where foveation begins — round menu buttons no longer quite round as the
+// eyes pass over the lower edge (owner, Beat Saber and other games).
+//
+// So the grid is built at KL_REPROJECT_GRID_REFINE cells a zone, up to
+// KL_REPROJECT_GRID_CELLS_MAX. The coordinates are static for a given map, so
+// this is built when the map is made, not per frame; what the finer grid costs
+// is vertices in the composite pass (256x256 cells are 393,216 an eye).
 //
 // Buffer layout, bound at buffer(1) of the VERTEX stage:
 //
@@ -331,6 +342,10 @@ const char *kl_reproject_msl(void);
 // worth knowing before hunting a soft periphery in a title that scales its
 // resolution.
 #define KL_REPROJECT_GRID_MAX 64
+// ...which is the most ZONES a map is sampled into (the display's own has 64).
+// The grid's cells are finer than the zones — see the note above.
+#define KL_REPROJECT_GRID_REFINE 4
+#define KL_REPROJECT_GRID_CELLS_MAX 256
 
 // Entries (each a simd_float2) a grid buffer needs, header included.
 static inline uint32_t kl_reproject_grid_entries(uint32_t nx, uint32_t ny) {

@@ -173,6 +173,7 @@ struct TuningView: View {
 final class KleptonRendering: ObservableObject {
     static let shared = KleptonRendering()
     private static let key = "klepton.foveation"
+    private static let resetKey = "klepton.foveation.reset"
 
     private static let scaleKey = "klepton.renderScale"
     private static let videoKey = "klepton.video"
@@ -190,6 +191,12 @@ final class KleptonRendering: ObservableObject {
     /// KLVideoDefault). Off for a bundle without the key.
     static let targetVideo: Bool =
         (Bundle.main.object(forInfoDictionaryKey: "KLVideoDefault") as? String) == "1"
+
+    /// The number a target raises to call a stored choice back once (targets.py
+    /// "foveation_reset", KLFoveationReset in Info.plist). 0 for a bundle
+    /// without the key: nothing is ever called back.
+    static let targetFoveationReset: Int =
+        (Bundle.main.object(forInfoDictionaryKey: "KLFoveationReset") as? String).flatMap(Int.init) ?? 0
 
     @Published var foveation: Bool {
         didSet { UserDefaults.standard.set(foveation, forKey: Self.key) }
@@ -211,6 +218,20 @@ final class KleptonRendering: ObservableObject {
     }()
 
     private init() {
+        // A target whose default changed drops what this copy stored, once:
+        // the number is remembered, so a choice made after that stays. A copy
+        // that never stored one gets the new default without this.
+        let applied = UserDefaults.standard.integer(forKey: Self.resetKey)
+        if Self.targetFoveationReset > applied {
+            let had = UserDefaults.standard.object(forKey: Self.key) as? Bool
+            UserDefaults.standard.removeObject(forKey: Self.key)
+            UserDefaults.standard.set(Self.targetFoveationReset, forKey: Self.resetKey)
+            NSLog("[cp] foveated rendering: stored choice "
+                  + (had.map { $0 ? "on" : "off" } ?? "none")
+                  + " dropped once for this target's new default "
+                  + (Self.targetFoveation ? "on" : "off")
+                  + " (reset \(Self.targetFoveationReset), was \(applied))")
+        }
         // Never chosen means the target's default (targets.py "foveation",
         // KLFoveationDefault in Info.plist), which is off unless the target
         // says otherwise.

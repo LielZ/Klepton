@@ -13,8 +13,8 @@
 <game dir> is the folder the game's files lie in (AVP Play's downloads folder for the game).
 
 A list is made from a RECORDING: the game run on this Mac with the pipeline recorder in it (build/m_boot_fz), taken
-through its content by a test driver of its own (visionos/pipelines/<target>.tour.json says which method to call and
-how fast to run the game's clock). The recording carries the game's shader code and stays on this Mac, under
+through its content by its own scene loader, called with one scene's name after another
+(visionos/pipelines/<target>.tour.json says which method that is and where the names are read from). The recording carries the game's shader code and stays on this Mac, under
 ~/Library/Application Support/Klepton/pipelines/<target>/; what goes into the repository is the recipe made of it
 (tools/unity_pipelines.py), which carries none.
 
@@ -23,8 +23,7 @@ list remembers, for every file of the game the list was made from (and every bun
 checksum of the SHADERS in it. A file that was only packed anew has the same shaders and needs no walk.
   - no file has other shaders than then: nothing to do;
   - only files of single levels have (a file named `<x>common_scenes_<scene>.bundle`, or `<x>common_assets_.bundle`,
-    which is all scenes of <x>): those scenes are walked — the game's test driver is given only them
-    (`keep` in <target>.tour.json);
+    which is all scenes of <x>): those scenes are walked;
   - a file that every level shares has: everything is walked.
 The new recording is merged with the one kept on this Mac (what did not change keeps its entries) and the list is
 written again.
@@ -138,16 +137,9 @@ def status(target, game, quiet=False):
     return due, lines
 
 
-def tour(target, game, scenes=None):
-    """Walk the game — everything, or the named scenes — and merge what it recorded into the kept recording."""
-    conf = json.load(open(os.path.join(PIPES, f"{target}.tour.json")))
-    runner = os.path.join(ROOT, "build", "m_boot_fz")
-    subprocess.run(["make", "-s", "build/m_boot_fz"], cwd=ROOT, check=True)
-    if not os.path.isdir(os.path.join(ROOT, target)) or not os.path.exists(os.path.join(ROOT, f"{target}.apk")):
-        raise SystemExit(f"{target}/ and {target}.apk are not in this toolchain copy — install the game once from it "
-                         f"(avpplay job start {target} --build-only --toolchain {ROOT}); that unpacks them")
-    # The game's data as the game expects to find it, made of links: nothing is copied and nothing of the game's is
-    # written to (it writes its own settings and saves beside them).
+def _files_dir(target, game, conf):
+    """The game's data as the game expects to find it, made of links: nothing is copied and nothing of the game's is
+    written to (it writes its own settings and saves beside them)."""
     files = os.path.join(keep_dir(target), "files")
     obb = os.path.join(files, "obb")
     loose = os.path.join(files, "Android", "obb", conf["package"])
@@ -163,29 +155,90 @@ def tour(target, game, scenes=None):
         elif name.lower().endswith(".bundle"):
             os.symlink(path, os.path.join(loose, name))
     grants = os.path.expanduser(f"~/Library/Application Support/Klepton/userdata/{target}/klepton-entitlements.txt")
-    if os.path.exists(grants) and not os.path.exists(os.path.join(files, "klepton-entitlements.txt")):
+    if os.path.exists(grants):
         with open(grants, "rb") as a, open(os.path.join(files, "klepton-entitlements.txt"), "wb") as b:
             b.write(a.read())
+    return files
+
+
+def scene_names(target, conf, env, runner):
+    """{scene as the files call it (lower case): the name the game loads it by}, from the game's own list of its
+    courses — a short run that only reads that list. Kept beside the recording; read anew for every walk, because a
+    new course is exactly what a walk is for."""
+    e = dict(env)
+    e.update({"KL_FRAMES": str(conf["from_frame"] + 200), "KL_PROBE_CALL_FROM": str(conf["from_frame"]),
+              "KL_PROBE_KEEP": conf["names"] + "=_", "KL_PROBE_KEEP_FIELD": conf.get("names_field", "")})
+    out = subprocess.run([runner, target], cwd=ROOT, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL).stdout.decode(errors="replace")
+    names = {}
+    for m in re.finditer(r"\[mprobe f\d+\] keep:\s+\d+\s+(\S+)\s+(\S+)\s+(?:kept|dropped)", out):
+        names[m.group(2).lower()] = m.group(2)
+    cache = os.path.join(keep_dir(target), "names.json")
+    if names:
+        json.dump(names, open(cache, "w"), indent=1, sort_keys=True)
+    else:                                       # the list could not be read: what the last walk knew
+        try:
+            names = json.load(open(cache))
+        except (OSError, ValueError):
+            pass
+    return names
+
+
+def tour(target, game, scenes=None):
+    """Walk the game — everything, or the named scenes — and merge what it recorded into the kept recording.
+
+    Each scene is loaded by the game's own loader, called with the scene's name (`load` in <target>.tour.json), one
+    after another, `frames_per_scene` apart. `before` are calls made first, where the game starts (Walkabout: into the
+    Homestar Runner basement, which is part of its main menu)."""
+    conf = json.load(open(os.path.join(PIPES, f"{target}.tour.json")))
+    runner = os.path.join(ROOT, "build", "m_boot_fz")
+    subprocess.run(["make", "-s", "build/m_boot_fz"], cwd=ROOT, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not os.path.isdir(os.path.join(ROOT, target)) or not os.path.exists(os.path.join(ROOT, f"{target}.apk")):
+        raise SystemExit(f"{target}/ and {target}.apk are not in this toolchain copy — install the game once from it "
+                         f"(avpplay job start {target} --build-only --toolchain {ROOT}); that unpacks them")
+    files = _files_dir(target, game, conf)
     rec = os.path.join(keep_dir(target), "walk")
     os.makedirs(rec, exist_ok=True)
     old = os.path.join(rec, "recorded.foz")
     if os.path.exists(old):
         os.remove(old)                          # each walk records anew; the kept recording is the memory
     env = dict(os.environ)
-    env.update({
-        "KL_FILES_DIR": files, "KL_VK_FOZ_DIR": rec, "KL_NET_OFFLINE": "1", "KL_GLFB": "1", "KL_LIFECYCLE": "1",
-        "KL_FRAMES": "40000000", "KL_ALARM": str(conf.get("alarm_seconds", 14400)),
-        "KL_PROBE_CALL": conf["call"], "KL_PROBE_CALL_FROM": str(conf.get("call_from_frame", 14000)),
-        "KL_PROBE_TIMESCALE": str(conf.get("timescale", 1)),
-    })
-    if scenes:
-        env["KL_PROBE_KEEP"] = conf["keep"] + "=" + "|".join(scenes)
-        if conf.get("keep_field"):
-            env["KL_PROBE_KEEP_FIELD"] = conf["keep_field"]
-    if conf.get("results"):
-        env["KL_PROBE_STRINGS"] = conf["results"]
+    env.update({"KL_FILES_DIR": files, "KL_VK_FOZ_DIR": rec, "KL_NET_OFFLINE": "1", "KL_GLFB": "1", "KL_LIFECYCLE": "1",
+                "KL_ALARM": str(conf.get("alarm_seconds", 14400))})
+    names = scene_names(target, conf, env, runner)
+    on_disk = sorted({m.group(3) for m in (LEVEL.match(n) for n in os.listdir(game)) if m and m.group(3)})
+    wanted = [s.lower() for s in scenes] if scenes else on_disk
+    nameless = [s for s in wanted if s not in names]
+    if nameless:
+        print("not in the game's own list of courses, so there is no name to load them by: " + " ".join(nameless))
+    walk = [s for s in wanted if s in names]
+    if not walk:
+        print("nothing to walk")
+        return None
+    per = int(conf.get("frames_per_scene", 3000))
+    frame = int(conf["from_frame"])
+    steps = []
+    for call in conf.get("before", []):
+        steps.append(f"{frame}:{call}")
+        frame += per
+    for s in walk:
+        steps.append(f'{frame}:{conf["load"]}("{names[s]}")')
+        frame += per
+    # Content that is entered from objects in the start scene rather than by a scene's name (Walkabout: the 36
+    # launchers in the Homestar Runner basement — its mini-games, and its notes that lead to places on the courses):
+    # `call` on each of them in turn, `then` to come back. Part of a walk of everything only.
+    objects = conf.get("objects") if not scenes else None
+    if objects:
+        steps.append(f'{frame}:{objects["then"]}')
+        frame += per
+        for n in range(int(objects["count"])):
+            steps.append(f'{frame}:{objects["call"]}#{n}')
+            frame += 2 * per
+            steps.append(f'{frame}:{objects["then"]}')
+            frame += per
+    env.update({"KL_PROBE_SCRIPT": ";".join(steps), "KL_FRAMES": str(frame), "KL_TRACE_FS": "1"})
     log = os.path.join(keep_dir(target), "walk.log")
-    print(f"walking {target}{' (' + ' '.join(scenes) + ')' if scenes else ''} — the log is {log}", flush=True)
+    print(f"walking {target}: {len(walk)} scene(s) — the log is {log}", flush=True)
     t0 = time.time()
     with open(log, "wb") as f:
         rc = subprocess.run([runner, target], cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT,
@@ -193,9 +246,17 @@ def tour(target, game, scenes=None):
     recorded = os.path.join(rec, "recorded.foz")
     size = os.path.getsize(recorded) if os.path.exists(recorded) else 0
     print(f"walk ended after {(time.time() - t0) / 60:.0f} min (exit {rc}); recording {size} bytes")
-    # What the game's own driver says it did — a scene it failed to enter is one the list does not have.
+    # A scene whose file the game never opened is one it did not enter, and one the list does not have.
+    opened = set()
     for line in open(log, errors="replace"):
-        if "[mprobe" in line and ("LaunchCourseSceneTest" in line or "CourseInitializedAndReadyTest" in line or " left" in line):
+        if line.startswith("[fs] open(") and "_scenes_" in line:
+            m = LEVEL.match(line.split('"')[1])
+            if m and m.group(3):
+                opened.add(m.group(3))
+    missed = [s for s in walk if s not in opened]
+    print(f"entered {len(walk) - len(missed)} of {len(walk)}" + (": not " + " ".join(missed) if missed else ""))
+    for line in open(log, errors="replace"):
+        if "[mprobe" in line and (" threw " in line or "there are" in line or "call: no " in line):
             print("  " + line.split("] ", 1)[-1].strip()[:150])
     if not size:
         return None

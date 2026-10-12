@@ -973,6 +973,20 @@ int klb_pthread_attr_init(bionic_attr *a) {
     return 0;
 }
 int klb_pthread_attr_destroy(bionic_attr *a) { (void)a; return 0; }
+// bionic stores the supplied Linux policy verbatim; validation belongs to
+// thread creation, not this attribute setter (libc/bionic/pthread_attr.cpp).
+// Write the guest's 32-bit field, never forward its 56-byte attr to Darwin.
+// As with existing scheduling attributes, visionOS owns actual scheduling.
+int klb_pthread_attr_setschedpolicy(bionic_attr *a, int policy) {
+    a->policy = policy;
+    return 0;
+}
+// Android's sched_param contains one 32-bit priority, unlike Darwin's
+// larger struct. bionic's setter saves it verbatim without range validation.
+int klb_pthread_attr_setschedparam(bionic_attr *a, const int32_t *priority) {
+    a->prio = *priority;
+    return 0;
+}
 int klb_pthread_attr_setstacksize(bionic_attr *a, size_t n) { a->stack_size = n; return 0; }
 int klb_pthread_attr_setdetachstate(bionic_attr *a, int st) {
     if (st) a->flags |= BIONIC_ATTR_DETACHED; else a->flags &= ~BIONIC_ATTR_DETACHED;

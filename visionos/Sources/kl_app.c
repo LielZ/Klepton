@@ -90,11 +90,19 @@ int kl_app_target_wants_full(void) {
     // Skydance's BEHEMOTH (x5767635983306831) by name: its splash and level-
     // loading screens submit quads with no eye layer (KL_OVRP_EYELESS_FRAMES),
     // which a Quest shows over black and .mixed showed over the room.
+    // Beat Saber from 1.45 on (kl_guest_beatsaber_openxr) as well: it renders
+    // the menu and a level at two eye sizes and makes a new swapchain at every
+    // change, and while it loads it submits nothing new — 17 to 50 compositor
+    // frames with no picture at each transition, through which .mixed showed the
+    // room (on device, 2026-10-12: "man sieht kurz das Passthrough"; black in
+    // .full). 1.40 keeps one swapchain and stays as it was.
+    extern int kl_guest_beatsaber_openxr(void);
     return g_target && (g_target->kind == KL_GUEST_NATIVE ||
                         g_target->kind == KL_GUEST_GLES3JNI ||
                         g_target->kind == KL_GUEST_LINUX ||
                         g_target->kind == KL_GUEST_SDL2 ||
-                        !strcmp(g_target->name, "x5767635983306831"));
+                        !strcmp(g_target->name, "x5767635983306831") ||
+                        kl_guest_beatsaber_openxr());
 }
 int kl_app_target_owns_frame_loop(void) {
     return g_target ? kl_driver_owns_frame_loop() : 0;

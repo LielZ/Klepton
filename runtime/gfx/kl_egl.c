@@ -371,9 +371,34 @@ static const char *const g_gl_extensions[] = {
 // so even a mistaken advertisement can't fault a per-eye draw — this door is about
 // steering each engine to the path it actually supports.)
 extern const char *kl_driver_target_name(void);
+// A Unity 6 title on Unity's OpenXR plugin: Beat Saber from 1.45 on
+// (kl_guest_beatsaber_openxr in kl_jni_android.c; 1.40 and older use the Oculus
+// XR plugin and draw an eye at a time). It renders SinglePassInstanced into an array swapchain, and with 4x
+// anti-aliasing its camera target is a multisampled ARRAY. What Unity makes of
+// that depends on three names together:
+//   - without GL_OVR_multiview it has no layered attachment at all and binds
+//     GL_TEXTURE_2D_MULTISAMPLE_ARRAY, which an ES 3.0 ANGLE refuses — the eye
+//     framebuffer is incomplete on every frame and the picture stays black;
+//   - with multiview and GL_OVR_multiview_multisampled_render_to_texture but
+//     WITHOUT GL_EXT_multisampled_render_to_texture it treats the target as
+//     explicitly resolved, finds no resolve surface ("RenderPass: Missing
+//     resolve surface for attachment 0") and never begins a render pass;
+//   - with all three the target resolves implicitly, and both attach calls are
+//     ours: single-sample (klgl_FramebufferTextureMultisampleMultiviewOVR here,
+//     klfb_FramebufferTexture2DMultisampleEXT in kl_glfb).
+// KL_GL_MSRTT overrides in either direction.
+static int klgl_want_msrtt(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern int kl_guest_beatsaber_openxr(void);
+        v = kl_env_on("KL_GL_MSRTT", kl_guest_beatsaber_openxr());
+    }
+    return v;
+}
 static int klgl_want_multiview(void) {
     const char *t = kl_driver_target_name();
     if (!t) return 0;
+    if (klgl_want_msrtt()) return 1;
     // ieytd/ieytd2/ieytd-<n> (Unity), and the HL2Q3VR Source-VR family (hl2, portal
     // — both liblauncher) whose single-pass stereo is baked around GL_OVR_multiview.
     // doom3quest (id Tech 4 / d3es): its GLSL is written for multiview outright —
@@ -399,7 +424,7 @@ static int klgl_want_multiview(void) {
 // and read a NULL texture in FMobileSceneRenderer::RenderForward.
 static int klgl_want_multiview_ms(void) {
     extern int kl_ovrp_gl_array(void);
-    return kl_ovrp_gl_array();
+    return kl_ovrp_gl_array() || klgl_want_msrtt();
 }
 
 // ...and none of it is offered below ES 3. Steam Link is told GLES 2.0
@@ -414,6 +439,11 @@ static int klgl_base_count(void) {
     // ...and the texture-buffer name behind them goes with the multisampled one.
     if (!klgl_want_multiview()) n -= 4;
     else if (!klgl_want_multiview_ms()) n -= 2;
+    else {
+        // The texture-buffer name is Unreal's; a klgl_want_msrtt guest is not shown it.
+        extern int kl_ovrp_gl_array(void);
+        if (!kl_ovrp_gl_array()) n -= 1;
+    }
     return n;
 }
 
@@ -440,6 +470,8 @@ static const char *klgl_ext_extra(void) {
     if (!t) return NULL;
     if (strcmp(t, "cs1") == 0) return "GL_OES_texture_npot";
     if (g_es_major >= 3 && strcmp(t, "x3484270071659289") == 0) return "GL_EXT_texture_buffer";
+    // The third of the three names klgl_want_msrtt is about.
+    if (g_es_major >= 3 && klgl_want_msrtt()) return "GL_EXT_multisampled_render_to_texture";
     return NULL;
 }
 static int klgl_ext_count(void) {
@@ -643,7 +675,15 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     // here was verified against the zeros.
     {
         const char *t = kl_driver_target_name();
-        if (t && strcmp(t, "x2544573735586536") == 0) {
+        // KL_GL_ES31_LIMITS=1: the same answer for any target, as an experiment
+        // (Beat Saber 1.45's FillMeshData kernel is refused on the zeros; this
+        // shows what Unity sends to GL once it is not). Off by default.
+        static int es31_any = -1;
+        if (es31_any < 0) es31_any = getenv("KL_GL_ES31_LIMITS") != NULL;
+        // ...and for a target whose compute kernels kl_glfb runs as transform
+        // feedback (Beat Saber 1.45's FillMeshData): refused on the zeros, the
+        // kernel never reaches the GL layer that would serve it.
+        if (es31_any || kl_glfb_compute_tf() || (t && strcmp(t, "x2544573735586536") == 0)) {
             static const struct { uint32_t pname; int32_t value; } es31[] = {
                 {0x8F38 /* MAX_IMAGE_UNITS                     */, 4},
                 {0x90D6 /* MAX_VERTEX_SHADER_STORAGE_BLOCKS    */, 4},

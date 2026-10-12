@@ -548,6 +548,19 @@ static klj_val klj_UnityPlayer_addPhoneCallListener(void *env, void *self,
     return (klj_val){.j = 0};
 }
 
+// UnityPlayer.setRunWithoutFocus(boolean) — Unity 6000.3 hands
+// Application.runInBackground to the Java player, which then decides whether a
+// lost window focus pauses the game. There is no Java player here: pause and
+// resume come from the host's own lifecycle, so the wish is recorded and
+// nothing else changes. Unanswered, it fataled at the first frame.
+static klj_val klj_UnityPlayer_setRunWithoutFocus(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("UnityPlayer.setRunWithoutFocus(%d) — recorded, pausing stays with the host lifecycle",
+            n > 0 ? (int)(a[0].j & 1) : -1);
+    return (klj_val){.j = 0};
+}
+
 // System.nanoTime() — and it must be the *same clock* the Choreographer stamps
 // its frameTimeNanos from. The engine subtracts one from the other to get its
 // frame delta, so two different monotonic clocks would produce a delta made of
@@ -1813,6 +1826,24 @@ static const char *klj_stream_bytes(klj_stream *st) {
     free(st);
 }
 
+// Lines appended to the guest's boot.config as Unity reads it — the engine's
+// own switches, which on Android it takes from this file and nowhere else.
+//
+// Eye of the Temple (x5361030930653377, Unity 2019.4.36f1) skins on the GPU
+// with a compute shader, because the ES 3.2 we describe makes Unity set its
+// compute capability from the version alone (MAX_COMPUTE_* are not consulted).
+// ANGLE's ES 3.0 context cannot compile one: "Shader Internal-Skinning.main:
+// GLSL compilation failed", and every skinned mesh is never drawn — the whip
+// works but is invisible. disable-gpu-skinning is a stock boot.config
+// parameter (registered beside gfx-enable-gfx-jobs) that selects CPU skinning.
+// KL_UNITY_BOOT_EXTRA="k=v;k=v" overrides the per-target default; "" for none.
+static const char *klj_boot_config_extra(void) {
+    const char *t = kl_driver_target_name();
+    const char *dflt = t && strcmp(t, "x5361030930653377") == 0
+        ? "disable-gpu-skinning=1" : "";
+    return kl_env_str("KL_UNITY_BOOT_EXTRA", dflt);
+}
+
 static klj_val klj_AssetManager_open(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     const char *rel = n > 0 ? klj_str(a[0].l) : NULL;
@@ -1824,14 +1855,25 @@ static klj_val klj_AssetManager_open(void *env, void *self, const klj_val *a, in
     KLJ_LOG("AssetManager.open(\"%s\") -> %s", rel, f ? path : "MISSING");
     if (!f) return (klj_val){.l = NULL};   // guest catches IOException
 
+    const char *extra = strcmp(rel, "bin/Data/boot.config") == 0
+        ? klj_boot_config_extra() : "";
+    size_t xlen = extra ? strlen(extra) : 0;
+
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     klj_stream *st = calloc(1, sizeof *st);
-    st->data = malloc((size_t)sz + 1);
+    st->data = malloc((size_t)sz + xlen + 2);
     st->len  = fread(st->data, 1, (size_t)sz, f);
     st->data[st->len] = '\0';
     fclose(f);
+    if (xlen) {
+        if (st->len && st->data[st->len - 1] != '\n') st->data[st->len++] = '\n';
+        for (size_t i = 0; i < xlen; i++)
+            st->data[st->len++] = extra[i] == ';' ? '\n' : extra[i];
+        st->data[st->len] = '\0';
+        KLJ_LOG("boot.config += \"%s\"", extra);
+    }
 
     void *obj = kl_jni_new_object("java/io/InputStream");
     klj_as_object(obj)->data = st;
@@ -2067,6 +2109,7 @@ const klj_binding klj_bind_services[] = {
     {"java/lang/System", "currentTimeMillis", "()J", klj_System_currentTimeMillis},
     {"com/unity3d/player/UnityPlayer", "getNetworkProxySettings", "(Ljava/lang/String;)Ljava/lang/String;", klj_UnityPlayer_getNetworkProxySettings},
     {"com/unity3d/player/UnityPlayer", "addPhoneCallListener", "()V", klj_UnityPlayer_addPhoneCallListener},
+    {"com/unity3d/player/UnityPlayer", "setRunWithoutFocus", "(Z)V", klj_UnityPlayer_setRunWithoutFocus},
     {"java/lang/Class",  "getName",  "()Ljava/lang/String;", klj_Class_getName},
     // Unity builds this signature from Class.getName(), so it is spelled with
     // dots where a real JNI signature would have slashes. Matched as the string
@@ -2093,6 +2136,14 @@ const klj_binding klj_bind_services[] = {
     // OculusDeviceConfig's is) when a new game starts. There is no metrics
     // service here, and binding to nothing is the honest no-op: the call returns
     // void and the game carries on. Unimplemented, it stopped the run.
+    // Beat Saber 1.45's receiver for debug broadcasts — see registerReceiver in
+    // kl_jni_android.c. Nothing broadcasts here, so the callback is never used.
+    // It is unregistered when its scene goes: the first time after the language
+    // screen, where the missing entry ended the run (on device, 2026-10-12).
+    {"android/content/Context", "unregisterReceiver",
+     "(Lcom.beatgames.beatsaber.terminal.TerminalBroadcastReceiver;)V", klj_void_noop},
+    {"com/beatgames/beatsaber/terminal/TerminalBroadcastReceiver", "setCallback",
+     "(Lcom.beatgames.beatsaber.terminal.TerminalBroadcastReceiver$Callback;)V", klj_void_noop},
     {"com/oculus/metrics/MetricsService", "bind", "(Lcom.unity3d.player.UnityPlayerActivity;)V", klj_void_noop},
     // ...and the rest of that helper, which the same game calls as play begins.
     // The boolean ones answer false ("nothing was recorded"), which is the truth

@@ -9,6 +9,10 @@
 #include <stdio.h>
 
 int  kl_glfb_enabled(void);
+// Whether compute kernels are run as transform feedback (KL_GLFB_COMPUTE_TF; on
+// for Beat Saber from 1.45). kl_egl.c answers the ES 3.1 storage limits to match:
+// without them Unity refuses a kernel before it reaches GL.
+int  kl_glfb_compute_tf(void);
 int  kl_glfb_init(void);
 void kl_glfb_set_size(int w, int h);
 
@@ -345,6 +349,12 @@ void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
 // give still gets.
 // How many layers a guest rate map needs (two for a mirrored multiview guest).
 int kl_glfb_rate_map_layers(void);
+// Will a guest whose eyes are copied out of an array swapchain be foveated this
+// run (see klfb_mirror_vrr)? Answerable before the guest boots.
+int kl_glfb_mirror_foveation_wanted(void);
+// The physical size of the map just given to kl_glfb_set_eye_rate_map (the
+// larger of its layers'), so a foveated eye is copied as what was written.
+void kl_glfb_set_eye_rate_physical(int pw, int ph);
 int kl_glfb_mirror_eye_layer(int eye, int image, uint32_t source,
                              uint32_t src_tex, int src_layer,
                              int w, int h, uint32_t internal_fmt);

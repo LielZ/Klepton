@@ -606,7 +606,40 @@ struct BootView: View {
         }
     }
 
+    /// What is installed, for the corner of the start screen: the game's version,
+    /// its version code and the toolchain the app was built with. The installer
+    /// stamps the bundle "<version code>.<toolchain>" (KLEPTON_APP_BUILD); a
+    /// build stamped any other way shows what it has. Asked for by the owner
+    /// once a game could be installed in more than one version: "dann sieht man
+    /// was man installiert hat".
+    private static let versionStamp: String? = {
+        let info = Bundle.main.infoDictionary
+        guard let short = info?["CFBundleShortVersionString"] as? String, !short.isEmpty else { return nil }
+        let build = (info?["CFBundleVersion"] as? String) ?? ""
+        let parts = build.split(separator: ".")
+        if parts.count == 2, parts.allSatisfy({ $0.allSatisfy(\.isNumber) }) {
+            return "\(short) (\(parts[0])) · Toolchain \(parts[1])"
+        }
+        return build.isEmpty || build == short ? short : "\(short) (\(build))"
+    }()
+
     private var startFront: some View {
+        startFrontContent
+            // Small and out of the way: nobody starts a game to read this, but
+            // it is the one place on the headset that says which version is on it.
+            .overlay(alignment: .bottomTrailing) {
+                if let stamp = Self.versionStamp {
+                    Text(stamp)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 14)
+                        .accessibilityLabel(klT("Installed version \(stamp)", "Installierte Fassung \(stamp)"))
+                }
+            }
+    }
+
+    private var startFrontContent: some View {
         ZStack(alignment: .bottom) {
             if let hero = UIImage(named: "StartHero") {
                 Image(uiImage: hero)

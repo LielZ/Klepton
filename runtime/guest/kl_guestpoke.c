@@ -39,9 +39,11 @@
 // Matches 20NN.N[N].N[N]<a|b|f|p>N... at b+i, and returns the length of the
 // match, or 0. `want_rev` additionally requires the '_<revision>' suffix that
 // makes a stamp the build's own rather than a version merely mentioned.
+// Unity 6 counts differently — "6000.3.22f1_1c726e1fb402" — and is matched as
+// well; read as "20NN" only, such a build reported the decoy "2018.3.0a1".
 static size_t unity_version_at(const char *b, size_t n, size_t i, int want_rev) {
     if (i + 10 >= n) return 0;
-    if (b[i] != '2' || b[i + 1] != '0') return 0;
+    if ((b[i] != '2' && b[i] != '6') || b[i + 1] != '0') return 0;
     size_t j = i + 2;
     if (!isdigit((unsigned char)b[j]) || !isdigit((unsigned char)b[j + 1])) return 0;
     j += 2;
@@ -278,6 +280,24 @@ static const struct poke_cap_row k_poke_caps[] = {
     // memsz 0x103c60), a singleton pointer filled at runtime. Used on this
     // title only; another title on the same build is told it was declined.
     { "2022.3.62f3", 0x10cd2c0, 0xec, 1, "x2010043642376517" },
+    // Unity 6000.3.22f1 — Premium Bowling 1.32.3 (x2773034772778845, 2026-10-12).
+    // ~105k "Invalid texture unit!" in 26 seconds at the cap of 32, and every
+    // glyph of its menus a filled box. Measured by the recipe above against
+    // this build's libunity:
+    //   0x169307   "OpenGL Error: Invalid texture unit!"
+    //   0xea54c0   bl 0x71c184            ; the singleton getter
+    //   0xea54c4   ldr w8, [x0, #0xec]    ; the cap
+    //   0xea54c8   cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x71c184   adrp x8, 0x1796000 / ldr x0, [x8, #0xe40]
+    // 0x1796e40 lands in .bss (va 0x1734d40, size 0x158f80), a singleton
+    // pointer filled at runtime. Measured and NOT used: raised to 64, the run
+    // faults within two frames, branching to 0 out of the bind at 0xec6df4.
+    // This build's GL layer keeps its per-unit caches for 32 units (bound
+    // texture at +0xffc, its target 0x80 further on, the bind dispatch table
+    // right behind at +0x1178), and the cap is min(MAX_COMBINED, 32) at
+    // 0xec1ee4 — 32 on a Quest as well. The units above 31 came from the
+    // location answers instead; see KL_GLFB_BIND_PINS in kl_glfb.c.
+    { "6000.3.22f1", 0x1796e40, 0xec, 0, "x2773034772778845" },
 };
 #define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])
 

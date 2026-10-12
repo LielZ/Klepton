@@ -206,8 +206,11 @@ static id<MTLBuffer> klvm_grid_buffer(id<MTLTexture> src, const float *vp,
             }
             if (nx < 1) nx = 1;
             if (ny < 1) ny = 1;
-            if (nx > KL_REPROJECT_GRID_MAX) nx = KL_REPROJECT_GRID_MAX;
-            if (ny > KL_REPROJECT_GRID_MAX) ny = KL_REPROJECT_GRID_MAX;
+            // Finer than the zones: the map is curved inside one (kl_reproject.h).
+            nx *= KL_REPROJECT_GRID_REFINE;
+            ny *= KL_REPROJECT_GRID_REFINE;
+            if (nx > KL_REPROJECT_GRID_CELLS_MAX) nx = KL_REPROJECT_GRID_CELLS_MAX;
+            if (ny > KL_REPROJECT_GRID_CELLS_MAX) ny = KL_REPROJECT_GRID_CELLS_MAX;
             uint32_t n = kl_reproject_grid_entries(nx, ny);
             simd_float2 *tmp = calloc(n, sizeof *tmp);
             kl_reproject_grid_build(tmp, nx, ny, cropped ? want_vp : NULL,

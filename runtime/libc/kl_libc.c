@@ -1436,15 +1436,18 @@ static void kl_casefix(char *path, size_t prefix) {
 // directory is the app's own and the relative spelling names nothing. AC Nexus
 // builds exactly one asset-bundle path this way (its animator controllers,
 // "Unable to open archive file: sdcard/Android/obb/…" at every level load,
-// followed by the Addressables failures that depend on it). Tied to the one
-// target it was measured on; a guest that has chdir'd somewhere of its own is
-// why this is not the rule for all.
+// followed by the Addressables failures that depend on it). Premium Bowling
+// (x2773034772778845) names every hall's scene bundle this way, so no hall
+// loads: "Failed to load scene SteamPunkHall" and an error notice instead of
+// the first room. Tied to the targets it was measured on; a guest that has
+// chdir'd somewhere of its own is why this is not the rule for all.
 static int kl_fs_rel_sdcard(void) {
     static int v = -1;
     if (v < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
-        v = kl_env_on("KL_FS_REL_SDCARD", t && strcmp(t, "x5812519008825194") == 0);
+        v = kl_env_on("KL_FS_REL_SDCARD", t && (strcmp(t, "x5812519008825194") == 0 ||
+                                                 strcmp(t, "x2773034772778845") == 0));
     }
     return v;
 }

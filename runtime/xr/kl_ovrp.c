@@ -587,6 +587,12 @@ static uint64_t klovrp_SetAppChromaticCorrection(uint64_t on) {
 // OnInstanceCreate returned an error", left OVRPlugin uninitialised
 // (userPresent stayed false) and sat on its black startup fade. KL_OVRP_VERSION
 // overrides for any guest.
+// Beat Saber from 1.45 on (kl_guest_beatsaber_openxr) is the same kind of guest
+// and ships OVRPlugin 1.106.0. Told 1.60.0 it logged the same line, never asked
+// this plugin for a controller again, and showed its language screen with no
+// sabers and no pointer — nothing to press Continue with (on device,
+// 2026-10-12). 1.40 ships 1.60.0 and is told 1.60.0 under the same row.
+extern int kl_guest_beatsaber_openxr(void);
 static const char *klovrp_version_str(void) {
     static const char *v;
     if (!v) {
@@ -594,6 +600,7 @@ static const char *klovrp_version_str(void) {
         const char *t = kl_driver_target_name();
         if (e && *e)                                        v = e;
         else if (t && strcmp(t, "x2111191602278229") == 0)  v = "1.117.0";
+        else if (kl_guest_beatsaber_openxr())               v = "1.106.0";
         else                                                v = KLOVRP_VERSION_DEFAULT;
     }
     return v;
@@ -1357,6 +1364,24 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
         // resolution could be higher"). A light scene; the larger target is
         // the anti-aliasing it has.
         if (t && strcmp(t, "x6963344583787383") == 0) cap_dflt = 4000;
+        // Beat Saber from 1.45 on (kl_guest_beatsaber_openxr) is the same case
+        // in Unity: its camera target is a 4x multisampled multiview array,
+        // which is attached single-sampled here (klgl_want_msrtt in kl_egl.c),
+        // so the game that had anti-aliasing as 1.40 has none. Its owner on
+        // device, 2026-10-12: "Treppchen" — stair-stepped edges — at 3072, a
+        // better picture and a smooth one at 4000, and a slight judder at 5000.
+        if (kl_guest_beatsaber_openxr()) cap_dflt = 4000;
+        // ...and with the guest's own pass foveated through the display's map
+        // (klfb_mirror_vrr) the same game can be told the display's size
+        // itself. The display asks for 6888x5525 at full quality and stores
+        // 2624x2560 of it; this guest renders a level at 1.2 times what it is
+        // told, so 5740 makes a level exactly the display's screen size — one
+        // guest fragment for every fragment the drawable keeps, a third of the
+        // fragments 4800x3850 unfoveated cost. The map is the display's own
+        // FIXED one: measured on device (2026-10-12, KL_CP_GAZE_TRACE), its
+        // dense region does not move with the eyes.
+        extern int kl_glfb_mirror_foveation_wanted(void);
+        if (kl_guest_beatsaber_openxr() && kl_glfb_mirror_foveation_wanted()) cap_dflt = 5740;
     }
     int cap = kl_env_int("KL_OVRP_EYE_MAX", cap_dflt);
     if (cap > 0 && (w > cap || h > cap)) {
@@ -8689,6 +8714,10 @@ static const char *const g_ovrp_result_unsupported[] = {
     // takes no argument and its result IS the state; UNSUPPORTED reads as
     // failed, which agrees with the refused init.
     "ovrp_GetInsightPassthroughInitializationState",
+    // TRIANGLE STRATEGY still sets a layer style after init is refused.
+    // This ovrpResult entry uses the same named UNSUPPORTED handler; neither
+    // its layer ID nor its input style is read and no passthrough is fabricated.
+    "ovrp_SetInsightPassthroughStyle",
     // Parametric haptics: a newer OVRPlugin's amplitude/frequency curves, next to
     // the buffered and PCM paths answered further up. Marvel's Deadpool VR asks
     // for the controller's parametric properties while it sets haptics up, and

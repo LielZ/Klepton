@@ -753,6 +753,23 @@ static void mprobe_find_methods(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Every object of a type in the loaded scenes, inactive ones too. The three-
+// argument FindObjectsByType is asked for by its argument count because it is
+// the one overload of the family that count does not share with a generic one:
+// FindObjectOfType(Type) does, and a lookup by name and count may hand back
+// FindObjectOfType<T>(bool) instead — which is how this probe once said "no
+// such object" of objects that were there.
+static Il2CppObject *mprobe_objects(Il2CppObject *type, uint32_t *count) {
+    *count = 0;
+    const MethodInfo *fa = find_method("UnityEngine", "Object", "FindObjectsByType", 3);
+    if (!fa || !type) return NULL;
+    int32_t inactive = 1 /* FindObjectsInactive.Include */, sort = 1 /* FindObjectsSortMode.InstanceID: the same order each time */;
+    void *args[3] = { type, &inactive, &sort };
+    Il2CppObject *arr = invoke(fa, args, "Object.FindObjectsByType");
+    if (arr) *count = *(uint32_t *)((char *)arr + 24);
+    return arr;
+}
+
 // KL_PROBE_CALL=<Namespace.Class>::<Method> — call one of the guest's own
 // parameterless methods, once, at frame KL_PROBE_CALL_FROM (default 3000).
 //
@@ -761,41 +778,87 @@ static void mprobe_find_methods(void) {
 // walk every course), and starting one is how every course's pipelines are
 // seen without a person playing them. A static method is called as it is; for
 // an instance method the object is the class's `Instance` (get_Instance), else
-// the first one FindObjectOfType finds, else — with KL_PROBE_CALL_CREATE=1 — a
+// the first one in the loaded scenes, else — with KL_PROBE_CALL_CREATE=1 — a
 // new GameObject that is given the component.
-static void mprobe_call(unsigned frame) {
-    const char *spec = kl_env_str("KL_PROBE_CALL", NULL);
+//
+// `nth` >= 0 (a KL_PROBE_SCRIPT step with `#n`) calls it on the n-th object
+// FindObjectsOfType returns instead, and says the object's name — for a class
+// a scene has several of (the six launchers on a wall).
+static void mprobe_call_spec(unsigned frame, const char *spec, int nth) {
     if (!spec || !*spec) return;
     char buf[300];
     snprintf(buf, sizeof buf, "%s", spec);
     char *sep = strstr(buf, "::");
     if (!sep) { fprintf(stderr, "  [mprobe] call: '%s' is not Class::Method\n", spec); return; }
     *sep = 0;
-    const char *meth = sep + 2;
+    char *meth = sep + 2;
+    // Method("text",true,3): up to four arguments — a quoted one is a string,
+    // true/false and whole numbers go as the value they are. (A script step's
+    // arguments: how a guest's own loader is told WHICH scene.)
+    void *argv[4];
+    static int32_t ival[4];
+    int argc = 0;
+    char *paren = strchr(meth, '(');
+    if (paren) {
+        *paren++ = 0;
+        char *close = strrchr(paren, ')');
+        if (close) *close = 0;
+        for (char *tok = paren; tok && *tok && argc < 4; ) {
+            char *next = strchr(tok, ',');
+            if (next) *next++ = 0;
+            if (*tok == '"') {
+                tok++;
+                char *q = strrchr(tok, '"');
+                if (q) *q = 0;
+                argv[argc] = il.string_new(tok);
+            } else {
+                ival[argc] = !strcmp(tok, "true") ? 1 : !strcmp(tok, "false") ? 0 : (int32_t)strtol(tok, NULL, 0);
+                argv[argc] = &ival[argc];
+            }
+            argc++;
+            tok = next;
+        }
+    }
     char *dot = strrchr(buf, '.');
     const char *ns = "", *cls = buf;
     if (dot) { *dot = 0; ns = buf; cls = dot + 1; }
     Il2CppClass *k = find_class(ns, cls);
     if (!k) { fprintf(stderr, "  [mprobe f%u] call: no class %s.%s\n", frame, ns, cls); return; }
-    const MethodInfo *m = il.class_get_method_from_name(k, meth, 0);
-    if (!m) { fprintf(stderr, "  [mprobe f%u] call: %s has no %s()\n", frame, cls, meth); return; }
+    const MethodInfo *m = il.class_get_method_from_name(k, meth, argc);
+    if (!m) { fprintf(stderr, "  [mprobe f%u] call: %s has no %s with %d argument(s)\n", frame, cls, meth, argc); return; }
     kl_image *img = kl_find_image("libil2cpp.so");
     typedef uint32_t (*m_flags_fn)(const MethodInfo *, uint32_t *);
     m_flags_fn m_flags = img ? (m_flags_fn)kl_sym(img, "il2cpp_method_get_flags") : NULL;
     int is_static = m_flags && (m_flags(m, NULL) & 0x10);
     Il2CppObject *self = NULL;
     const char *how = "static";
+    char named[160];
     if (!is_static) {
-        const MethodInfo *gi = il.class_get_method_from_name(k, "get_Instance", 0);
+        const MethodInfo *gi = nth < 0 ? il.class_get_method_from_name(k, "get_Instance", 0) : NULL;
         if (gi) { self = invoke(gi, NULL, "get_Instance"); how = "its Instance"; }
         Il2CppObject *type = il.type_get_object(il.class_get_type(k));
-        if (!self && type) {
-            const MethodInfo *fo = find_method("UnityEngine", "Object", "FindObjectOfType", 1);
-            void *args[1] = { type };
-            self = fo ? invoke(fo, args, "Object.FindObjectOfType") : NULL;
-            how = "the one FindObjectOfType found";
+        if (nth >= 0) {
+            uint32_t count;
+            Il2CppObject *arr = mprobe_objects(type, &count);
+            if ((uint32_t)nth >= count) {
+                fprintf(stderr, "  [mprobe f%u] call: %s #%d — there are %u\n", frame, cls, nth, count);
+                return;
+            }
+            self = ((Il2CppObject **)((char *)arr + 32))[nth];
+            const MethodInfo *gn = find_method("UnityEngine", "Object", "get_name", 0);
+            char nm[96] = "?";
+            if (self && gn) str_ascii(invoke_on(self, gn, NULL, "Object.get_name"), nm, sizeof nm);
+            snprintf(named, sizeof named, "#%d of %u, '%s'", nth, count, nm);
+            how = named;
         }
-        if (!self && type && kl_env_on("KL_PROBE_CALL_CREATE", 0)) {
+        if (!self && type && nth < 0) {
+            uint32_t count;
+            Il2CppObject *arr = mprobe_objects(type, &count);
+            if (count) self = ((Il2CppObject **)((char *)arr + 32))[0];
+            snprintf(named, sizeof named, "the first of %u in the scenes", count);
+            how = named;
+        }
+        if (!self && type && nth < 0 && kl_env_on("KL_PROBE_CALL_CREATE", 0)) {
             // new GameObject(name).AddComponent(type)
             Il2CppClass *go_k = find_class("UnityEngine", "GameObject");
             typedef Il2CppObject *(*object_new_fn)(Il2CppClass *);
@@ -817,9 +880,46 @@ static void mprobe_call(unsigned frame) {
             return;
         }
     }
-    fprintf(stderr, "  [mprobe f%u] call: %s.%s::%s() on %s\n", frame, ns, cls, meth, how);
-    invoke_on(self, m, NULL, meth);
+    fprintf(stderr, "  [mprobe f%u] call: %s.%s::%s(%d) on %s\n", frame, ns, cls, meth, argc, how);
+    invoke_on(self, m, argc ? argv : NULL, meth);
     fprintf(stderr, "  [mprobe f%u] call: %s() returned\n", frame, meth);
+}
+
+static void mprobe_call(unsigned frame) { mprobe_call_spec(frame, kl_env_str("KL_PROBE_CALL", NULL), -1); }
+
+// KL_PROBE_SCRIPT=<frame>:<Namespace.Class>::<Method>[(args)][#n];<frame>:... — several
+// such calls, each at its frame (rising). For content a guest's own test driver
+// does not reach: Walkabout's Homestar Runner basement is entered with
+// HomestarManager::GoToBasement and each mini-game in it with HSLauncher::Launch
+// on one of the launchers there, `#n` saying which.
+static void mprobe_script(unsigned frame) {
+    static const char *at;
+    static unsigned next;
+    static int done;
+    if (done) return;
+    if (!at) {
+        at = kl_env_str("KL_PROBE_SCRIPT", NULL);
+        if (!at || !*at) { done = 1; return; }
+        next = (unsigned)strtoul(at, NULL, 10);
+    }
+    while (frame >= next) {
+        const char *colon = strchr(at, ':');
+        const char *end = strchr(at, ';');
+        if (!end) end = at + strlen(at);
+        if (!colon || colon > end) { fprintf(stderr, "  [mprobe] script: '%s' is not <frame>:Class::Method\n", at); done = 1; return; }
+        char step[300];
+        size_t n = (size_t)(end - colon - 1);
+        if (n >= sizeof step) n = sizeof step - 1;
+        memcpy(step, colon + 1, n);
+        step[n] = 0;
+        int nth = -1;
+        char *hash = strrchr(step, '#');
+        if (hash) { *hash = 0; nth = atoi(hash + 1); }
+        if (mprobe_init()) mprobe_call_spec(frame, step, nth);
+        if (!*end) { done = 1; return; }
+        at = end + 1;
+        next = (unsigned)strtoul(at, NULL, 10);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1149,15 @@ void kl_mprobe_tick(unsigned frame) {
         if (!call_from) call_from = kl_env_uint("KL_PROBE_CALL_FROM", 3000u);
         if (frame >= call_from && mprobe_init()) { call_done = 1; mprobe_keep(frame); mprobe_call(frame); }
     }
+    // KL_PROBE_KEEP without KL_PROBE_CALL: only the listing (and the filter), at
+    // the same frame — how a walk learns the names a guest loads its scenes by.
+    static int keep_done;
+    if (!keep_done && !kl_env_str("KL_PROBE_CALL", NULL) && kl_env_str("KL_PROBE_KEEP", NULL)
+        && frame >= kl_env_uint("KL_PROBE_CALL_FROM", 3000u) && mprobe_init()) {
+        keep_done = 1;
+        mprobe_keep(frame);
+    }
+    if (kl_env_str("KL_PROBE_SCRIPT", NULL)) mprobe_script(frame);
     if (frame % 300 == 0 && kl_env_str("KL_PROBE_STRINGS", NULL) && mprobe_init()) mprobe_strings(frame);
     static int find_done;
     if (!find_done && frame >= 600 && kl_env_str("KL_PROBE_FIND", NULL) && mprobe_init()) {

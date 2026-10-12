@@ -29,6 +29,8 @@
 	<string>$(KL_AUTOBOOT_DEFAULT)</string>
 	<key>KLFoveationDefault</key>
 	<string>$(KL_FOVEATION_DEFAULT)</string>
+	<key>KLFoveationReset</key>
+	<string>$(KL_FOVEATION_RESET)</string>
 	<key>KLStartScreen</key>
 	<string>$(KL_START_SCREEN)</string>
 	<key>KLMetaApkID</key>

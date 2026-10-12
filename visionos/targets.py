@@ -104,6 +104,15 @@ TARGETS = {
         "obb_file":    "main.1716.com.beatgames.beatsaber.obb",
         "meta_apk_id": "30506607092319862",
         "meta_obb_id": "30506602615653643",
+        # Foveated rendering is on by default (it is for every row) and a copy
+        # that stored "off" gets it back once. For Beat Saber from 1.45 on it is
+        # another thing than the setting people switched off: the game renders
+        # through the display's own map, a curve per eye, at the display's full
+        # size, and the unwarp no longer waves at the edge of the dense region.
+        # On device (2026-10-12) that held the panel's 120 Hz for a whole
+        # session at 6890x5526 an eye, where the same game unfoveated at 4000
+        # fell to 60 Hz inside a level. A choice made after this start stays.
+        "foveation_reset": 1,
     },
     "beatsaber128": {
         # Beat Saber 1.28 (Unity 2019.4), a third row for the same reason as
@@ -1063,6 +1072,23 @@ STORE_DEFAULTS = {
     # Its Unity decodes with no surface and uploads the bytes itself, like
     # Arkham Shadow's, which is the path that is served.
     "x5812519008825194": {"video": True},
+    # Eye of the Temple. Foveated rendering off by default: in this game the
+    # fixed sharp patch is very plainly visible and buys hardly any frame time
+    # (the author on a headset, 2026-10-12), so the picture wins.
+    # "foveation_reset" calls back
+    # a choice a player's copy has already stored, once, so that the new default
+    # reaches the people who play it now and not only new installs; see
+    # KleptonRendering. They can turn it on again afterwards and it stays on.
+    "x5361030930653377": {"foveation": False, "foveation_reset": 1},
+    # Premium Bowling. Foveation off: it draws each eye into a texture of its
+    # own, without multisampling, and copies that into the eye texture. Only
+    # the copy is foveated (kl_glfb foveates the eye textures and a
+    # MULTISAMPLED scene target), so nothing is saved — the scene is shaded in
+    # full at 4915x3942 either way — and the copy thins the finished picture
+    # to a third of its pixels with one tap each: stair-stepped edges
+    # everywhere but the middle (on device, 2026-10-12; with it off the author
+    # found the picture "deutlich besser").
+    "x2773034772778845": {"foveation": False},
 }
 
 
@@ -1166,6 +1192,38 @@ def bundle_for(name):
     return f"{scope}.{ident}" if scope else ident
 
 
+def _follow_unpacked_build(t):
+    """The data panel's OBB name and store ids are a property of the BUILD.
+
+    A row states them for the build it was written against (Beat Saber 1.40.8:
+    main.1716...obb). The same row is built from a newer APK once the store
+    carries one — the installer unpacks whatever the player's recipe names into
+    <root>/<tree>/ — and the game then opens main.<its own version code>...obb.
+    Left as written, the app would look for 1716's file beside a 1.45 build,
+    find it missing and offer to download 1.40's data.
+
+    So where the unpacked APK is another build than the row's, the name follows
+    the APK and the ids are dropped: they name the other build's files, and no
+    download is better than the wrong one. Nothing changes for the build the
+    row was written against, or while nothing is unpacked.
+    """
+    import os, re
+    m = re.match(r"main\.(\d+)\.(.+)\.obb$", t.get("obb_file") or "")
+    if not m:
+        return
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        with open(os.path.join(root, t["tree"], "AndroidManifest.xml"), errors="replace") as f:
+            head = f.read(4000)
+    except OSError:
+        return
+    tag = re.search(r"<manifest[^>]*>", head)
+    code = re.search(r'\sandroid:versionCode="(\d+)"', tag.group(0)) if tag else None
+    if code and code.group(1) != m.group(1):
+        t["obb_file"] = f"main.{code.group(1)}.{m.group(2)}.obb"
+        t["meta_apk_id"] = t["meta_obb_id"] = ""
+
+
 def resolve(name):
     if name not in TARGETS:
         print(f"!! unknown target {name!r} — one of: {', '.join(sorted(TARGETS))}",
@@ -1188,6 +1246,10 @@ def resolve(name):
     t.setdefault("video", False)
     t.setdefault("autoboot", True)
     t.setdefault("foveation", True)
+    # A number a target raises to drop the stored foveation choice once, when
+    # its default changes and the players it already has should get the new
+    # one. 0: a stored choice is never touched.
+    t.setdefault("foveation_reset", 0)
     # How a plain gamepad's four face buttons are laid over Touch A/B/X/Y where
     # the default (cross=a, circle=b, square=x, triangle=y) puts an action under
     # the wrong thumb for this game. "" keeps the default.
@@ -1198,6 +1260,7 @@ def resolve(name):
     for k in ("obb_file", "meta_apk_id", "meta_obb_id"):
         t.setdefault(k, "")
     t["data_panel"] = "obb_file" in TARGETS[name]
+    _follow_unpacked_build(t)
     if t["kind"] == "linux":
         t["libs"] = lx_libs(name)
     elif t["libs"] is None:

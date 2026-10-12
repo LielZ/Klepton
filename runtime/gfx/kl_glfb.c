@@ -973,16 +973,51 @@ static unsigned g_fb_nshaders;
 // glLinkProgram, and applied to every glUniform* call. The guest keeps its own
 // numbering throughout and never learns ours.
 #define KLFB_PIN_SHADERS 64
+#define KLFB_PIN_SHADERS_BOUND 1024
 #define KLFB_PINS        32
 static struct { uint32_t shader; unsigned n;
                 struct { int32_t at; char name[40]; } p[KLFB_PINS]; }
-    g_shader_pins[KLFB_PIN_SHADERS];
+    g_shader_pins[KLFB_PIN_SHADERS_BOUND];
 static unsigned g_shader_pins_n;
+
+// KL_GLFB_BIND_PINS: give the linker the pins instead of translating them.
+//
+// A Unity built for ES 3.1 writes `UNITY_LOCATION(n) uniform sampler2D _Tex`,
+// asks the driver where the sampler went, and uses THAT NUMBER AS THE TEXTURE
+// UNIT (glUniform1i(loc, loc)). On a Quest the answer is the n in the text, a
+// unit below the engine's cap of 32. Here the qualifier is stripped (ES 3.0),
+// the linker numbers the uniforms in its own order, and a sampler declared
+// after thirty-odd other uniforms is "at" 35: the engine takes 35 for the unit
+// and refuses it — "OpenGL Error: Invalid texture unit!" — so the sampler reads
+// whatever is on unit 0. Premium Bowling (Unity 6000.3.22f1): 105k of those in
+// 26 seconds and every glyph of its menus a filled box (TextMeshPro's shader
+// has the uniforms to get there).
+//
+// ANGLE can be told where a uniform goes before the link
+// (GL_CHROMIUM_bind_uniform_location), which is the ES 3.0 spelling of the
+// qualifier that was taken out. With that the linker's numbering IS the
+// guest's: the by-name answer is the pinned number, the remap below is the
+// identity whichever way the guest addresses a uniform, and the uniforms that
+// pin nothing are placed around the pins by the linker itself.
+//
+// Tied to the title it was measured on. Every Unity title that works was
+// verified with its samplers on the linker's units, and the two fixed-size
+// tables here meet a guest's whole shader set for the first time this way.
+static int klfb_bind_pins(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_GLFB_BIND_PINS", t && strcmp(t, "x2773034772778845") == 0);
+    }
+    return v;
+}
 
 static int klfb_pin_slot(uint32_t shader) {
     for (unsigned i = 0; i < g_shader_pins_n; i++)
         if (g_shader_pins[i].shader == shader) return (int)i;
-    if (g_shader_pins_n >= KLFB_PIN_SHADERS) return -1;
+    if (g_shader_pins_n >= (klfb_bind_pins() ? KLFB_PIN_SHADERS_BOUND : KLFB_PIN_SHADERS))
+        return -1;
     int i = (int)g_shader_pins_n++;
     g_shader_pins[i].shader = shader;
     g_shader_pins[i].n = 0;
@@ -1124,6 +1159,41 @@ static int32_t klfb_actual_loc(uint32_t prog, const char *name) {
         if (strcmp(name, g_glsl_builtin_vars[i].from) == 0)
             return g_real_GetUniformLocation(prog, g_glsl_builtin_vars[i].to);
     return -1;
+}
+
+// Before the link: hand each pin of the attached shaders to the linker
+// (KL_GLFB_BIND_PINS). A name the program does not use binds nothing.
+static void klfb_pins_bind(uint32_t program) {
+    if (!g_shader_pins_n || !klfb_bind_pins()) return;
+    static void (*r_GetAttachedShaders)(uint32_t, int32_t, int32_t *, uint32_t *);
+    static void (*r_Bind)(uint32_t, int32_t, const char *);
+    static int said;
+    if (!r_GetAttachedShaders) r_GetAttachedShaders = asym("glGetAttachedShaders");
+    if (!r_Bind) r_Bind = asym("glBindUniformLocationCHROMIUM");
+    if (!r_GetAttachedShaders || !r_Bind) {
+        if (!said) { said = 1;
+            fprintf(stderr, "  [glfb] KL_GLFB_BIND_PINS: this GL has no "
+                            "glBindUniformLocationCHROMIUM — pins are translated as before\n"); }
+        return;
+    }
+    uint32_t sh[8]; int32_t ns = 0;
+    r_GetAttachedShaders(program, 8, &ns, sh);
+    unsigned bound = 0;
+    for (int32_t i = 0; i < ns && i < 8; i++)
+        for (unsigned s = 0; s < g_shader_pins_n; s++) {
+            if (g_shader_pins[s].shader != sh[i]) continue;
+            for (unsigned k = 0; k < g_shader_pins[s].n; k++) {
+                const char *name = g_shader_pins[s].p[k].name;
+                for (size_t b = 0; b < sizeof g_glsl_builtin_vars / sizeof g_glsl_builtin_vars[0]; b++)
+                    if (strcmp(name, g_glsl_builtin_vars[b].from) == 0)
+                        name = g_glsl_builtin_vars[b].to;
+                r_Bind(program, g_shader_pins[s].p[k].at, name);
+                bound++;
+            }
+        }
+    if (bound && !said) { said = 1;
+        fprintf(stderr, "  [glfb] uniform pins are bound at link "
+                        "(KL_GLFB_BIND_PINS): program %u, %u of them\n", program, bound); }
 }
 
 static void klfb_pins_link(uint32_t program) {
@@ -1716,6 +1786,546 @@ static char *klfb_rewrite_glsl(char *buf, size_t cap, uint32_t shader) {
     return changed ? buf : NULL;
 }
 
+static uint32_t (*g_real_CreateShader)(uint32_t);
+static void (*g_real_DeleteShader)(uint32_t);
+static void (*g_real_BindBuffer)(uint32_t, uint32_t);
+// ----------------------------------------- compute kernels as transform feedback
+//
+// Beat Saber 1.45 builds the quads of its tube lights and lasers in a compute
+// kernel (FillMeshData): one invocation per light reads 144 bytes of
+// `_LightData` and writes 4 vertices straight into the vertex buffer of the mesh
+// the bloom pre-pass then draws. 1.40 did that on the CPU; 1.45 has no such path
+// left, and ANGLE's Metal backend is ES 3.0 — no compute stage, no shader
+// storage. Refused, the kernel leaves the mesh empty and the pre-pass (the
+// source of the fog's colour) without its lights.
+//
+// A kernel of that shape — every invocation reads only its own element of one
+// read-only buffer and writes only its own stride of one output buffer — is a
+// vertex shader with transform feedback, which ES 3.0 has:
+//
+//   compute shader object   a GL_VERTEX_SHADER, its source rewritten
+//   invocation i            vertex i of one GL_POINTS draw
+//   readonly buffer X       X as the vertex buffer: element i is vertex i's
+//                           attributes, a uvec4 per 16 bytes (nothing Unity's
+//                           reflection of the program's uniforms can trip over)
+//   buffer Y, written       uvec4 varyings captured into Y (one each: ANGLE
+//                           does not capture arrays)
+//   glDispatchCompute       that draw, under RASTERIZER_DISCARD
+//
+// The game's own GLSL does the arithmetic; only the storage access is rewritten.
+// What it cannot express is refused at glShaderSource (the shader then fails to
+// compile, as it did before). KL_GLFB_COMPUTE_TF=0/1; on for Beat Saber from
+// 1.45 (kl_guest_beatsaber_openxr), the one guest it was seen with.
+#define KLFB_GL_COMPUTE_SHADER 0x91B9
+#define KLFB_GL_SSBO           0x90D2
+#define KLFB_CS_MAX            8
+#define KLFB_CS_BINDINGS       8
+typedef struct {
+    uint32_t name;                       // shader, then (in g_cs_progs) program
+    uint32_t fs;                         // program only: the fragment stage we add
+    int group, in_words, out_words;      // local_size_x; uints per element read / written
+    int in_binding, out_binding;         // the kernel's shader-storage binding points
+    int ready;                           // program only
+} klfb_cs_obj;
+static klfb_cs_obj g_cs_shaders[KLFB_CS_MAX], g_cs_progs[KLFB_CS_MAX];
+static struct { uint32_t buf; intptr_t off, size; } g_cs_ssbo[KLFB_CS_BINDINGS];
+static uint32_t g_cs_generic;            // what the guest has bound to GL_SHADER_STORAGE_BUFFER
+static struct { void *ctx; uint32_t vao; } g_cs_vaos[4];   // a VAO belongs to one context
+
+int kl_glfb_compute_tf(void) {
+    static int on = -1;
+    if (!kl_glfb_enabled()) return 0;
+    if (on < 0) {
+        extern int kl_guest_beatsaber_openxr(void);
+        int env = kl_env_int("KL_GLFB_COMPUTE_TF", -1);
+        if (env >= 0) on = env != 0;
+        else {
+            // The guest's answer is only good once its library directory is
+            // set (see kl_guest_beatsaber_openxr); a yes is, and so is any
+            // answer given after GL came up. Until then: no, and ask again.
+            int g = kl_guest_beatsaber_openxr();
+            if (!g && !g_ready) return 0;
+            on = g;
+        }
+    }
+    return on;
+}
+static klfb_cs_obj *klfb_cs_find(klfb_cs_obj *tab, uint32_t name) {
+    if (!name) return NULL;
+    for (int i = 0; i < KLFB_CS_MAX; i++) if (tab[i].name == name) return &tab[i];
+    return NULL;
+}
+static klfb_cs_obj *klfb_cs_add(klfb_cs_obj *tab, uint32_t name) {
+    klfb_cs_obj *o = klfb_cs_find(tab, name);
+    for (int i = 0; !o && i < KLFB_CS_MAX; i++) if (!tab[i].name) o = &tab[i];
+    if (!o) { fprintf(stderr, "  [glfb] compute-tf: table full, object %u not tracked\n", name); return NULL; }
+    memset(o, 0, sizeof *o);
+    o->name = name;
+    return o;
+}
+
+// Replace every `<head>EXPR]` with `<pre>EXPR<post>` in place. EXPR is whatever
+// stands before the closing bracket; HLSLcc writes these indices with
+// parentheses only. Returns the number of replacements, -1 when out of room.
+static int klfb_cs_reindex(char *buf, size_t cap, const char *head, const char *pre, const char *post) {
+    size_t hl = strlen(head), prl = strlen(pre), pol = strlen(post);
+    int n = 0;
+    for (char *p = buf; (p = strstr(p, head)) != NULL; n++) {
+        char *e = strchr(p + hl, ']');
+        if (!e) return -1;
+        size_t len = strlen(buf);
+        if (len + prl + pol + 1 > cap + hl) return -1;
+        size_t el = (size_t)(e - (p + hl)), tl = strlen(e + 1) + 1;
+        // whichever of the two moves away from the other goes first
+        if (prl <= hl) { memmove(p + prl, p + hl, el); memmove(p + prl + el + pol, e + 1, tl); }
+        else           { memmove(p + prl + el + pol, e + 1, tl); memmove(p + prl, p + hl, el); }
+        memcpy(p, pre, prl);
+        memcpy(p + prl + el, post, pol);
+        p += prl + el + pol;
+    }
+    return n;
+}
+// Cut [from, the end of the first `stop` at or after it). 0 if either is missing.
+static int klfb_cs_cut(char *from, const char *stop) {
+    char *e = from ? strstr(from, stop) : NULL;
+    if (!e) return 0;
+    e += strlen(stop);
+    memmove(from, e, strlen(e) + 1);
+    return 1;
+}
+// The rewrite. `buf` holds the kernel as HLSLcc wrote it; on success it holds
+// the vertex shader and `cs` the numbers the dispatch needs.
+static int klfb_cs_rewrite(char *buf, size_t cap, klfb_cs_obj *cs) {
+    char in[64] = "", out[64] = "", t[256];
+    const char *why = NULL;
+    char *p, *ro = strstr(buf, ") readonly buffer ");
+    // the two storage blocks: `layout(std430, binding = N) [readonly] buffer NAME {`
+    if (!ro || sscanf(ro + 18, "%63[A-Za-z0-9_]", in) != 1) why = "no read-only buffer block";
+    for (p = buf; !why && (p = strstr(p, ") buffer ")) != NULL; p += 9) {
+        if (out[0]) { why = "more than one written buffer"; break; }
+        sscanf(p + 9, "%63[A-Za-z0-9_]", out);
+    }
+    if (!why && !out[0]) why = "no written buffer block";
+    if (!why && strstr(ro + 18, ") readonly buffer ")) why = "more than one read-only buffer";
+    if (!why) {
+        char *b;
+        snprintf(t, sizeof t, ") readonly buffer %s {", in);
+        for (b = strstr(buf, t); b && b > buf && *b != '\n'; b--) {}
+        if (!b || sscanf(b, " layout(std430, binding = %d", &cs->in_binding) != 1) why = "read-only block binding";
+        snprintf(t, sizeof t, ") buffer %s {", out);
+        for (b = strstr(buf, t); b && b > buf && *b != '\n'; b--) {}
+        if (!why && (!b || sscanf(b, " layout(std430, binding = %d", &cs->out_binding) != 1)) why = "written block binding";
+    }
+    // element size read, work group size, bytes written per invocation
+    if (!why) {
+        snprintf(t, sizeof t, "struct %s_type {", in);
+        p = strstr(buf, t);
+        if (!p || sscanf(p + strlen(t), " uint[%d] value;", &cs->in_words) != 1) why = "element is not a uint[N]";
+    }
+    if (!why) {
+        int y = 0, z = 0, stride = 0;
+        p = strstr(buf, "layout(local_size_x = ");
+        if (!p || sscanf(p, "layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;",
+                         &cs->group, &y, &z) != 3 || y != 1 || z != 1) why = "work group is not N x 1 x 1";
+        p = strstr(buf, "gl_GlobalInvocationID.x) * ");
+        if (!why && (!p || sscanf(p + 27, "%d", &stride) != 1)) why = "no output stride";
+        cs->out_words = stride / 4;
+        if (!why && (stride % 16 || cs->out_words < 4 || cs->out_words > 56)) why = "output stride does not fit the varyings";
+        if (!why && (cs->in_words % 4 || cs->in_words < 4 || cs->in_words > 48 || cs->group < 1))
+            why = "input does not fit the vertex attributes";
+        if (!why && (cs->in_binding < 0 || cs->in_binding >= KLFB_CS_BINDINGS ||
+                     cs->out_binding < 0 || cs->out_binding >= KLFB_CS_BINDINGS)) why = "binding point out of range";
+    }
+    // the declarations go, ours take their place
+    if (!why) {
+        char decl[1024];
+        snprintf(t, sizeof t, "struct %s_type {", in);
+        p = strstr(buf, t);
+        int cut = klfb_cs_cut(p, "};\n");
+        snprintf(t, sizeof t, ") readonly buffer %s {", in);
+        for (p = strstr(buf, t); p && p > buf && p[-1] != '\n'; p--) {}
+        cut += klfb_cs_cut(p, "};\n");
+        snprintf(t, sizeof t, ") buffer %s {", out);
+        for (p = strstr(buf, t); p && p > buf && p[-1] != '\n'; p--) {}
+        cut += klfb_cs_cut(p, "};\n");
+        char *at = p;                      // where the written block stood
+        cut += klfb_cs_cut(strstr(buf, "layout(local_size_x = "), "\n");
+        if (cut != 4) why = "declarations not where expected";
+        int n = why ? 0 : snprintf(decl, sizeof decl,
+            "uvec4 kl_in_v[%d];\n"
+            "uint kl_out[%d];\n"
+            "uvec3 kl_gid;\n"
+            "int kl_first;\n"
+            "uint kl_in(int w) { return kl_in_v[w >> 2][w & 3]; }\n",
+            cs->in_words / 4, cs->out_words);
+        for (int i = 0; !why && i < cs->in_words / 4; i++)
+            n += snprintf(decl + n, sizeof decl - (size_t)n, "in uvec4 kl_a%d;\n", i);
+        for (int i = 0; !why && i < cs->out_words / 4; i++)
+            n += snprintf(decl + n, sizeof decl - (size_t)n, "flat out uvec4 kl_o%d;\n", i);
+        if (!why && strlen(buf) + (size_t)n + 1 > cap) why = "no room";
+        if (!why) klfb_splice(buf, cap, at, 0, decl);
+    }
+    if (!why) {
+        snprintf(t, sizeof t, "%s_buf[gl_GlobalInvocationID.x].value[", in);
+        int r = klfb_cs_reindex(buf, cap, t, "kl_in(int(", "))");
+        snprintf(t, sizeof t, "%s_buf[", out);
+        int w = klfb_cs_reindex(buf, cap, t, "kl_out[int(", ") - kl_first]");
+        if (r <= 0 || w <= 0) why = "no storage access to rewrite";
+        snprintf(t, sizeof t, "%s_buf", in);
+        if (!why && strstr(buf, t)) why = "read-only buffer indexed by something else";
+    }
+    if (!why) {
+        for (p = buf; (p = strstr(p, "gl_GlobalInvocationID")) != NULL; )
+            klfb_splice(buf, cap, p, strlen("gl_GlobalInvocationID"), "kl_gid");
+        p = strstr(buf, "void main()");
+        if (!p) why = "no main";
+        else klfb_splice(buf, cap, p, strlen("void main()"), "void kl_cs_main()");
+        if (strstr(buf, "gl_LocalInvocation") || strstr(buf, "gl_WorkGroupID") || strstr(buf, "gl_NumWorkGroups") ||
+            strstr(buf, "imageStore") || strstr(buf, "imageLoad") || strstr(buf, "atomic"))
+            why = "uses something a vertex shader has not";
+    }
+    if (!why) {
+        char tail[2048];
+        int n = snprintf(tail, sizeof tail,
+            "\nvoid main() {\n"
+            "    kl_gid = uvec3(uint(gl_VertexID), 0u, 0u);\n"
+            "    kl_first = gl_VertexID * %d;\n"
+            "    for (int i = 0; i < %d; i++) kl_out[i] = 0u;\n", cs->out_words, cs->out_words);
+        for (int i = 0; i < cs->in_words / 4; i++)
+            n += snprintf(tail + n, sizeof tail - (size_t)n, "    kl_in_v[%d] = kl_a%d;\n", i, i);
+        n += snprintf(tail + n, sizeof tail - (size_t)n, "    kl_cs_main();\n");
+        for (int i = 0; i < cs->out_words / 4; i++)
+            n += snprintf(tail + n, sizeof tail - (size_t)n,
+                          "    kl_o%d = uvec4(kl_out[%d], kl_out[%d], kl_out[%d], kl_out[%d]);\n",
+                          i, i * 4, i * 4 + 1, i * 4 + 2, i * 4 + 3);
+        n += snprintf(tail + n, sizeof tail - (size_t)n,
+                      "    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n    gl_PointSize = 1.0;\n}\n");
+        size_t len = strlen(buf);
+        if (len + (size_t)n + 1 > cap) why = "no room";
+        else memcpy(buf + len, tail, (size_t)n + 1);
+    }
+    if (why) {
+        fprintf(stderr, "  [glfb] compute-tf: shader %u NOT rewritten (%s); it will fail to compile\n", cs->name, why);
+        return 0;
+    }
+    fprintf(stderr, "  [glfb] compute-tf: shader %u is a kernel reading %s (binding %d, %d bytes each) and writing %s "
+                    "(binding %d, %d bytes each), %d per group — now a vertex shader\n", cs->name, in, cs->in_binding,
+            cs->in_words * 4, out, cs->out_binding, cs->out_words * 4, cs->group);
+    return 1;
+}
+
+// glAttachShader: a program that gets one of our kernels gets a fragment stage
+// and its capture list as well — a vertex shader alone does not link.
+static void (*g_real_AttachShader)(uint32_t, uint32_t);
+static void klfb_AttachShader(uint32_t program, uint32_t shader) {
+    if (g_real_AttachShader) g_real_AttachShader(program, shader);
+    klfb_cs_obj *cs = klfb_cs_find(g_cs_shaders, shader);
+    if (!cs || !cs->group) return;
+    klfb_cs_obj *pr = klfb_cs_add(g_cs_progs, program);
+    if (!pr) return;
+    *pr = *cs;
+    pr->name = program;
+    static const char *const fsrc =
+        "#version 300 es\nprecision mediump float;\nout vec4 kl_c;\nvoid main() { kl_c = vec4(0.0); }\n";
+    char names[14][8];
+    const char *cap[14];
+    int rows = pr->out_words / 4;
+    for (int i = 0; i < rows && i < 14; i++) { snprintf(names[i], sizeof names[i], "kl_o%d", i); cap[i] = names[i]; }
+    void (*compile)(uint32_t) = asym("glCompileShader");
+    void (*source)(uint32_t, int32_t, const char *const *, const int32_t *) = asym("glShaderSource");
+    void (*tfv)(uint32_t, int32_t, const char *const *, uint32_t) = asym("glTransformFeedbackVaryings");
+    pr->fs = g_real_CreateShader ? g_real_CreateShader(0x8B30 /* FRAGMENT_SHADER */) : 0;
+    if (pr->fs && source && compile && tfv && g_real_AttachShader) {
+        source(pr->fs, 1, &fsrc, NULL);
+        compile(pr->fs);
+        g_real_AttachShader(program, pr->fs);
+        tfv(program, rows, cap, 0x8C8C /* INTERLEAVED_ATTRIBS */);
+        void (*bindattr)(uint32_t, uint32_t, const char *) = asym("glBindAttribLocation");
+        for (int i = 0; bindattr && i < pr->in_words / 4; i++) {
+            char a[8];
+            snprintf(a, sizeof a, "kl_a%d", i);
+            bindattr(program, (uint32_t)i, a);
+        }
+    }
+}
+static void klfb_cs_selftest(klfb_cs_obj *pr);
+static void klfb_DispatchCompute(uint32_t gx, uint32_t gy, uint32_t gz);
+// ...and after the link, whether it took.
+static void klfb_cs_linked(uint32_t program) {
+    klfb_cs_obj *pr = klfb_cs_find(g_cs_progs, program);
+    if (!pr) return;
+    void (*piv)(uint32_t, uint32_t, int32_t *) = asym("glGetProgramiv");
+    int32_t ok = 0;
+    if (piv) piv(program, 0x8B82 /* LINK_STATUS */, &ok);
+    pr->ready = ok;
+    if (!ok) {
+        char log[1024]; log[0] = 0;
+        void (*ilog)(uint32_t, int32_t, int32_t *, char *) = asym("glGetProgramInfoLog");
+        if (ilog) ilog(program, sizeof log, NULL, log);
+        fprintf(stderr, "  [glfb] compute-tf: program %u did NOT link: %s\n", program, log);
+    } else {
+        fprintf(stderr, "  [glfb] compute-tf: program %u linked\n", program);
+        if (kl_env_on("KL_GLFB_COMPUTE_TF_SELFTEST", 0)) klfb_cs_selftest(pr);
+    }
+}
+// glGetProgramiv: ANGLE's answer, except the one question only a compute
+// program is asked — its work group size, which Unity hands the game
+// (ComputeShader.GetKernelThreadGroupSizes) and the game divides by.
+static void (*g_real_GetProgramiv)(uint32_t, uint32_t, int32_t *);
+static void klfb_GetProgramiv(uint32_t program, uint32_t pname, int32_t *params) {
+    if (pname == 0x8267 /* COMPUTE_WORK_GROUP_SIZE */) {
+        klfb_cs_obj *pr = klfb_cs_find(g_cs_progs, program);
+        if (pr && params) { params[0] = pr->group; params[1] = 1; params[2] = 1; return; }
+    }
+    if (g_real_GetProgramiv) g_real_GetProgramiv(program, pname, params);
+}
+static void klfb_cs_forget(klfb_cs_obj *tab, uint32_t name) {
+    klfb_cs_obj *o = klfb_cs_find(tab, name);
+    if (!o) return;
+    if (o->fs && g_real_DeleteShader) g_real_DeleteShader(o->fs);
+    memset(o, 0, sizeof *o);
+}
+
+// The shader-storage binding points are ours: ANGLE has no such target. The
+// indexed ones are what a dispatch reads; the generic one is where the guest
+// uploads, and those calls borrow GL_COPY_WRITE_BUFFER for their duration
+// (borrow, not take: the guest caches what it bound there).
+static void (*g_real_BindBufferBase)(uint32_t, uint32_t, uint32_t);
+static void (*g_real_BindBufferRange)(uint32_t, uint32_t, uint32_t, intptr_t, intptr_t);
+static void klfb_BindBufferBase(uint32_t target, uint32_t index, uint32_t buffer) {
+    if (target == KLFB_GL_SSBO && kl_glfb_compute_tf()) {
+        g_cs_generic = buffer;
+        if (index < KLFB_CS_BINDINGS) { g_cs_ssbo[index].buf = buffer; g_cs_ssbo[index].off = 0; g_cs_ssbo[index].size = -1; }
+        return;
+    }
+    if (g_real_BindBufferBase) g_real_BindBufferBase(target, index, buffer);
+}
+static void klfb_BindBufferRange(uint32_t target, uint32_t index, uint32_t buffer, intptr_t off, intptr_t size) {
+    if (target == KLFB_GL_SSBO && kl_glfb_compute_tf()) {
+        g_cs_generic = buffer;
+        if (index < KLFB_CS_BINDINGS) { g_cs_ssbo[index].buf = buffer; g_cs_ssbo[index].off = off; g_cs_ssbo[index].size = size; }
+        return;
+    }
+    if (g_real_BindBufferRange) g_real_BindBufferRange(target, index, buffer, off, size);
+}
+#define KLFB_GL_COPY_WRITE 0x8F37
+// Bind `buffer` to GL_COPY_WRITE_BUFFER and return what was there.
+static uint32_t klfb_cs_borrow(uint32_t buffer) {
+    int32_t was = 0;
+    if (!g_real_BindBuffer) g_real_BindBuffer = asym("glBindBuffer");
+    if (a_glGetIntegerv) a_glGetIntegerv(0x8F37 /* COPY_WRITE_BUFFER_BINDING */, &was);
+    if (g_real_BindBuffer) g_real_BindBuffer(KLFB_GL_COPY_WRITE, buffer);
+    return (uint32_t)was;
+}
+static void klfb_cs_giveback(uint32_t was) {
+    if (g_real_BindBuffer) g_real_BindBuffer(KLFB_GL_COPY_WRITE, was);
+}
+
+// glDispatchCompute: one GL_POINTS draw, captured into the kernel's output
+// buffer. Never forwarded — on ES 3.0 it is only an error.
+static void klfb_DispatchCompute(uint32_t gx, uint32_t gy, uint32_t gz) {
+    static int said;
+    int32_t cur = 0;
+    if (a_glGetIntegerv) a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &cur);
+    klfb_cs_obj *pr = klfb_cs_find(g_cs_progs, (uint32_t)cur);
+    if (!pr || !pr->ready || gy != 1 || gz != 1) {
+        if (said++ < 4)
+            fprintf(stderr, "  [glfb] glDispatchCompute(%u,%u,%u): program %d is not a kernel we run — nothing done\n",
+                    gx, gy, gz, cur);
+        return;
+    }
+    uint32_t in = g_cs_ssbo[pr->in_binding].buf, out = g_cs_ssbo[pr->out_binding].buf;
+    intptr_t in_off = g_cs_ssbo[pr->in_binding].off, out_off = g_cs_ssbo[pr->out_binding].off;
+    static void (*bufpar)(uint32_t, uint32_t, int32_t *);
+    static void (*geti)(uint32_t, uint32_t, int32_t *);
+    static void (*begin)(uint32_t), (*end)(void), (*draw)(uint32_t, int32_t, int32_t);
+    static void (*enable)(uint32_t), (*disable)(uint32_t), (*bindvao)(uint32_t), (*genvao)(int32_t, uint32_t *);
+    static void (*bindtf)(uint32_t, uint32_t), (*enattr)(uint32_t);
+    static void (*attri)(uint32_t, int32_t, uint32_t, int32_t, const void *);
+    static uint8_t (*isenabled)(uint32_t);
+    static uint32_t (*geterr)(void);
+    static void *(*curctx)(void);
+    if (!draw) {
+        bufpar = asym("glGetBufferParameteriv"); geti = asym("glGetIntegeri_v");
+        begin = asym("glBeginTransformFeedback"); end = asym("glEndTransformFeedback");
+        enable = asym("glEnable"); disable = asym("glDisable"); isenabled = asym("glIsEnabled");
+        bindvao = asym("glBindVertexArray"); genvao = asym("glGenVertexArrays");
+        enattr = asym("glEnableVertexAttribArray"); attri = asym("glVertexAttribIPointer");
+        bindtf = asym("glBindTransformFeedback"); geterr = asym("glGetError");
+        curctx = asym("eglGetCurrentContext");
+        if (!g_real_BindBufferRange) g_real_BindBufferRange = asym("glBindBufferRange");
+        if (!g_real_BindBufferBase) g_real_BindBufferBase = asym("glBindBufferBase");
+        if (!g_real_BindBuffer) g_real_BindBuffer = asym("glBindBuffer");
+        draw = asym("glDrawArrays");
+    }
+    if (!in || !out || !draw || !begin || !end || !bufpar || !geti || !bindvao || !genvao || !enattr || !attri ||
+        !g_real_BindBufferRange || !g_real_BindBufferBase || !g_real_BindBuffer || !a_glGetIntegerv) {
+        if (said++ < 4)
+            fprintf(stderr, "  [glfb] compute-tf: dispatch without its buffers (in %u, out %u) — nothing done\n", in, out);
+        return;
+    }
+    // as many invocations as were asked for and both buffers hold
+    intptr_t in_el = (intptr_t)pr->in_words * 4, out_el = (intptr_t)pr->out_words * 4;
+    int32_t in_size = 0, out_size = 0;
+    uint32_t was = klfb_cs_borrow(in);
+    bufpar(KLFB_GL_COPY_WRITE, 0x8764 /* BUFFER_SIZE */, &in_size);
+    g_real_BindBuffer(KLFB_GL_COPY_WRITE, out);
+    bufpar(KLFB_GL_COPY_WRITE, 0x8764, &out_size);
+    klfb_cs_giveback(was);
+    intptr_t count = (intptr_t)gx * pr->group;
+    if ((in_size - in_off) / in_el < count) count = (in_size - in_off) / in_el;
+    if ((out_size - out_off) / out_el < count) count = (out_size - out_off) / out_el;
+    if (count < (intptr_t)gx * pr->group && said++ < 4)
+        fprintf(stderr, "  [glfb] compute-tf: %u groups of %d asked, buffers hold %ld elements (in %d bytes, out %d bytes)\n",
+                gx, pr->group, (long)count, in_size, out_size);
+    if (count <= 0) return;
+    // what we touch, as the guest left it
+    int32_t arr = 0, tfb = 0, tfb_i = 0, tfb_start = 0, tfb_size = 0, vao = 0, tfo = 0;
+    a_glGetIntegerv(0x8894 /* ARRAY_BUFFER_BINDING */, &arr);
+    a_glGetIntegerv(0x8E25 /* TRANSFORM_FEEDBACK_BINDING */, &tfo);
+    if (tfo && bindtf) bindtf(0x8E22 /* TRANSFORM_FEEDBACK */, 0);
+    a_glGetIntegerv(0x8C8F /* TRANSFORM_FEEDBACK_BUFFER_BINDING */, &tfb);
+    geti(0x8C8F, 0, &tfb_i);
+    geti(0x8C84 /* TRANSFORM_FEEDBACK_BUFFER_START */, 0, &tfb_start);
+    geti(0x8C85 /* TRANSFORM_FEEDBACK_BUFFER_SIZE */, 0, &tfb_size);
+    a_glGetIntegerv(0x85B5 /* VERTEX_ARRAY_BINDING */, &vao);
+    int discard = isenabled ? isenabled(0x8C89 /* RASTERIZER_DISCARD */) : 0;
+    // our own vertex array, one per context: element i of the input is vertex i
+    void *ctx = curctx ? curctx() : NULL;
+    int vi = 0;
+    while (vi < 3 && g_cs_vaos[vi].vao && g_cs_vaos[vi].ctx != ctx) vi++;
+    if (g_cs_vaos[vi].ctx != ctx || !g_cs_vaos[vi].vao) {
+        g_cs_vaos[vi].ctx = ctx;
+        genvao(1, &g_cs_vaos[vi].vao);
+    }
+    bindvao(g_cs_vaos[vi].vao);
+    g_real_BindBuffer(0x8892 /* ARRAY_BUFFER */, in);
+    for (int i = 0; i < pr->in_words / 4; i++) {
+        enattr((uint32_t)i);
+        attri((uint32_t)i, 4, 0x1405 /* UNSIGNED_INT */, (int32_t)in_el, (const void *)(in_off + i * 16));
+    }
+    if (!discard && enable) enable(0x8C89);
+    if (geterr) while (geterr()) {}
+    g_real_BindBufferRange(0x8C8E /* TRANSFORM_FEEDBACK_BUFFER */, 0, out, out_off, count * out_el);
+    begin(0x0000 /* POINTS */);
+    draw(0x0000, 0, (int32_t)count);
+    end();
+    uint32_t err = geterr ? geterr() : 0;
+    if (!discard && disable) disable(0x8C89);
+    g_real_BindBuffer(0x8892, (uint32_t)arr);
+    bindvao((uint32_t)vao);
+    if (tfb_i && tfb_size) g_real_BindBufferRange(0x8C8E, 0, (uint32_t)tfb_i, tfb_start, tfb_size);
+    else g_real_BindBufferBase(0x8C8E, 0, (uint32_t)tfb_i);
+    g_real_BindBuffer(0x8C8E, (uint32_t)tfb);
+    if (tfo && bindtf) bindtf(0x8E22, (uint32_t)tfo);
+    static unsigned long runs;
+    runs++;
+    static int log_every = -1;
+    if (log_every < 0) log_every = kl_env_on("KL_GLFB_COMPUTE_TF_LOG", 0);
+    if (err || runs == 1 || (log_every && runs % 300 == 0))
+        fprintf(stderr, "  [glfb] compute-tf: dispatch #%lu, program %d, %ld invocation(s), buffer %u -> %u%s",
+                runs, cur, (long)count, in, out, err ? "" : "\n");
+    if (err) fprintf(stderr, " — GL error 0x%x\n", err);
+}
+// KL_GLFB_COMPUTE_TF_SELFTEST=1: run a freshly linked kernel once on made-up
+// input and print what it wrote — the dispatch above, start to end, on a
+// screen that has no light to dispatch for (the Mac run ends at the language
+// screen). The input is Beat Saber's: 144 bytes a light, its transform at byte
+// 80; three lights 5 m ahead of a camera at the origin, the fourth element
+// left zero. What comes back is not checked against anything — the kernel is
+// the game's — only shown: four vertices a light, or nothing arrived.
+static void klfb_cs_selftest(klfb_cs_obj *pr) {
+    void (*gen)(int32_t, uint32_t *) = asym("glGenBuffers");
+    void (*del)(int32_t, const uint32_t *) = asym("glDeleteBuffers");
+    void (*data)(uint32_t, intptr_t, const void *, uint32_t) = asym("glBufferData");
+    void *(*map)(uint32_t, intptr_t, intptr_t, uint32_t) = asym("glMapBufferRange");
+    uint8_t (*unmap)(uint32_t) = asym("glUnmapBuffer");
+    void (*use)(uint32_t) = asym("glUseProgram");
+    void (*geti)(uint32_t, uint32_t, int32_t *) = asym("glGetIntegeri_v");
+    void (*blockiv)(uint32_t, uint32_t, uint32_t, int32_t *) = asym("glGetActiveUniformBlockiv");
+    uint32_t (*bidx)(uint32_t, const char *) = asym("glGetUniformBlockIndex");
+    if (!g_real_BindBufferBase) g_real_BindBufferBase = asym("glBindBufferBase");
+    if (!g_real_BindBufferRange) g_real_BindBufferRange = asym("glBindBufferRange");
+    if (!g_real_BindBuffer) g_real_BindBuffer = asym("glBindBuffer");
+    if (!gen || !del || !data || !map || !unmap || !use || !geti || !blockiv || !bidx || !a_glGetIntegerv ||
+        !g_real_BindBufferBase || !g_real_BindBufferRange || !g_real_BindBuffer || pr->in_words != 36) return;
+    enum { N = 4 };
+    float in[N][36], globals[40];
+    memset(in, 0, sizeof in); memset(globals, 0, sizeof globals);
+    for (int l = 0; l < 3; l++) {
+        for (int w = 0; w < 20; w++) in[l][w] = 1.0f;                 // colour, sizes, multipliers
+        in[l][10] = 0.5f;                                             // byte 40: where along its length the light is centred
+        in[l][20] = in[l][25] = in[l][30] = in[l][35] = 1.0f;         // byte 80: identity...
+        in[l][32] = (float)(l - 1) * 2.0f; in[l][34] = 5.0f;          // ...moved to x = -2, 0, 2 and z = 5
+    }
+    // CGlobals, std140: uint count; mat4 view at 16; mat4 projection at 80; float width at 144
+    uint32_t count = 3;
+    memcpy(&globals[0], &count, 4);
+    globals[4] = 1.0f; globals[9] = 1.0f; globals[14] = -1.0f; globals[19] = 1.0f;      // view: looking down +z
+    globals[20] = 1.0f; globals[25] = 1.0f; globals[30] = -1.002f; globals[31] = -1.0f; globals[34] = -0.2f;
+    globals[36] = 0.05f;
+    uint32_t b[3] = {0, 0, 0}, bi = bidx(pr->name, "CGlobals");
+    int32_t point = 0, cur = 0, ubo = 0, ubo_i = 0, ubo_start = 0, ubo_size = 0;
+    if (bi == 0xFFFFFFFFu) { fprintf(stderr, "  [glfb] compute-tf selftest: no CGlobals block\n"); return; }
+    blockiv(pr->name, bi, 0x8A3F /* UNIFORM_BLOCK_BINDING */, &point);
+    a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &cur);
+    a_glGetIntegerv(0x8A28 /* UNIFORM_BUFFER_BINDING */, &ubo);
+    geti(0x8A28, (uint32_t)point, &ubo_i);
+    geti(0x8A29, (uint32_t)point, &ubo_start);
+    geti(0x8A2A, (uint32_t)point, &ubo_size);
+    gen(3, b);
+    uint32_t was = klfb_cs_borrow(b[0]);
+    data(KLFB_GL_COPY_WRITE, sizeof in, in, 0x88E8 /* DYNAMIC_DRAW */);
+    g_real_BindBuffer(KLFB_GL_COPY_WRITE, b[1]);
+    data(KLFB_GL_COPY_WRITE, (intptr_t)N * pr->out_words * 4, NULL, 0x88E8);
+    g_real_BindBuffer(KLFB_GL_COPY_WRITE, b[2]);
+    data(KLFB_GL_COPY_WRITE, sizeof globals, globals, 0x88E8);
+    g_real_BindBufferBase(0x8A11 /* UNIFORM_BUFFER */, (uint32_t)point, b[2]);
+    typeof(g_cs_ssbo[0]) keep_in = g_cs_ssbo[pr->in_binding], keep_out = g_cs_ssbo[pr->out_binding];
+    g_cs_ssbo[pr->in_binding].buf = b[0]; g_cs_ssbo[pr->in_binding].off = 0;
+    g_cs_ssbo[pr->out_binding].buf = b[1]; g_cs_ssbo[pr->out_binding].off = 0;
+    use(pr->name);
+    klfb_DispatchCompute(1, 1, 1);
+    use((uint32_t)cur);
+    g_cs_ssbo[pr->in_binding] = keep_in; g_cs_ssbo[pr->out_binding] = keep_out;
+    g_real_BindBuffer(KLFB_GL_COPY_WRITE, b[1]);
+    const float *o = map(KLFB_GL_COPY_WRITE, 0, (intptr_t)N * pr->out_words * 4, 0x0001 /* MAP_READ_BIT */);
+    if (!o) fprintf(stderr, "  [glfb] compute-tf selftest: output buffer could not be read back\n");
+    for (int l = 0; o && l < N; l++)
+        for (int v = 0; v < 4; v++) {
+            const float *f = o + (l * pr->out_words) + v * (pr->out_words / 4);
+            fprintf(stderr, "  [glfb] compute-tf selftest: light %d vertex %d:", l, v);
+            for (int k = 0; k < pr->out_words / 4; k++) fprintf(stderr, " %.3g", (double)f[k]);
+            fprintf(stderr, "\n");
+        }
+    if (o) unmap(KLFB_GL_COPY_WRITE);
+    klfb_cs_giveback(was);
+    if (ubo_i && ubo_size) g_real_BindBufferRange(0x8A11, (uint32_t)point, (uint32_t)ubo_i, ubo_start, ubo_size);
+    else g_real_BindBufferBase(0x8A11, (uint32_t)point, (uint32_t)ubo_i);
+    g_real_BindBuffer(0x8A11, (uint32_t)ubo);
+    del(3, b);
+}
+static void klfb_MemoryBarrier(uint32_t barriers) {
+    static void (*real)(uint32_t);
+    if (kl_glfb_compute_tf()) return;        // the draw above is in order with everything after it
+    if (!real) real = asym("glMemoryBarrier");
+    if (real) real(barriers);
+}
+
+// The guest's own upload calls on GL_SHADER_STORAGE_BUFFER, re-aimed: the
+// handler runs once more on GL_COPY_WRITE_BUFFER with the guest's buffer bound
+// there (and the bookkeeping slot saying so), then both are put back.
+#define KLFB_CS_VIA_COPY_WRITE(call)                                              \
+    do {                                                                          \
+        uint32_t was_ = klfb_cs_borrow(g_cs_generic);                             \
+        uint32_t slot_ = g_tb_bound_buf[5];                                       \
+        g_tb_bound_buf[5] = g_cs_generic;                                         \
+        call;                                                                     \
+        g_tb_bound_buf[5] = slot_;                                                \
+        klfb_cs_giveback(was_);                                                   \
+    } while (0)
+#define KLFB_CS_GENERIC(target) ((target) == KLFB_GL_SSBO && kl_glfb_compute_tf())
+
 static void klfb_ShaderSource(uint32_t shader, int32_t count,
                               const char *const *strings, const int32_t *lengths) {
     if (strings && count > 0) {
@@ -1758,6 +2368,16 @@ static void klfb_ShaderSource(uint32_t shader, int32_t count,
             }
             // Either flag sends `buf` to ANGLE instead of the guest's strings.
             int dbg_modified = trimmed;
+            // A compute kernel becomes the vertex shader its object already is
+            // (see "compute kernels as transform feedback" above).
+            {
+                klfb_cs_obj *cs = klfb_cs_find(g_cs_shaders, shader);
+                if (cs) {
+                    if (!klfb_cs_rewrite(buf, cap, cs)) cs->group = 0;
+                    off = strlen(buf);
+                    dbg_modified = 1;
+                }
+            }
             // `invariant gl_Position;` for an engine that renders in passes that
             // must agree on depth to the last bit. id Tech 4 fills depth with one
             // program and then lights with others under GL_EQUAL. On Metal a
@@ -1981,7 +2601,9 @@ static void klfb_LinkProgram(uint32_t program) {
     if (!g_real_LinkProgram) return;
     pthread_mutex_lock(&g_compile_lock);
     uint64_t slow_t0 = klfb_slow_ms() ? klfb_slow_now() : 0;
+    klfb_pins_bind(program);
     g_real_LinkProgram(program);
+    klfb_cs_linked(program);
     if (slow_t0) {
         // The link may be finished behind this call; asking for its status is
         // what waits for it, and what the guest does next anyway.
@@ -2381,13 +3003,18 @@ static uint32_t klfb_CreateShader(uint32_t type) {
     // when it is already current, and glCreateShader requires a current context
     // regardless, so this is correct for every title, not just hl2.
     kl_glfb_make_current();
+    // A compute shader is a vertex shader here; its source is rewritten to match.
+    int cs = type == KLFB_GL_COMPUTE_SHADER && kl_glfb_compute_tf();
+    if (cs) type = 0x8B31 /* GL_VERTEX_SHADER */;
     uint32_t name = g_real_CreateShader ? g_real_CreateShader(type) : 0;
     if (name) klfb_note_type(name, type);   // stage, for the varying-location strip
+    if (name) { if (cs) klfb_cs_add(g_cs_shaders, name); else klfb_cs_forget(g_cs_shaders, name); }
     return name;
 }
 static void (*g_real_DeleteShader)(uint32_t);
 static void klfb_DeleteShader(uint32_t s) {
     klfb_census_killed(KLC_SHADER, 1);
+    klfb_cs_forget(g_cs_shaders, s);          // the program keeps its own copy of the numbers
     if (g_real_DeleteShader) g_real_DeleteShader(s);
 }
 static uint32_t (*g_real_CreateProgram)(void);
@@ -2398,6 +3025,7 @@ static uint32_t klfb_CreateProgram(void) {
 static void (*g_real_DeleteProgram)(uint32_t);
 static void klfb_DeleteProgram(uint32_t p) {
     klfb_census_killed(KLC_PROG, 1);
+    klfb_cs_forget(g_cs_progs, p);
     if (g_real_DeleteProgram) g_real_DeleteProgram(p);
 }
 
@@ -2768,6 +3396,11 @@ static uint32_t klfb_bound_buffer(uint32_t target) {
 }
 static void *klfb_MapBufferRange(uint32_t target, intptr_t offset, intptr_t length,
                                  uint32_t access) {
+    if (KLFB_CS_GENERIC(target)) {
+        void *r = NULL;
+        KLFB_CS_VIA_COPY_WRITE(r = klfb_MapBufferRange(KLFB_GL_COPY_WRITE, offset, length, access));
+        return r;
+    }
     if (!g_real_MapBufferRange_t) return NULL;
     void *p = NULL;
     // ANGLE's Metal backend returns NULL (no GL error) for the dynamic maps
@@ -2876,6 +3509,11 @@ static void *klfb_MapBufferRange(uint32_t target, intptr_t offset, intptr_t leng
     return p;
 }
 static uint8_t klfb_UnmapBuffer(uint32_t target) {
+    if (KLFB_CS_GENERIC(target)) {
+        uint8_t r = 0;
+        KLFB_CS_VIA_COPY_WRITE(r = klfb_UnmapBuffer(KLFB_GL_COPY_WRITE));
+        return r;
+    }
     // A CPU-shadow map (see klfb_MapBufferRange): push the guest's writes into the
     // real buffer with glBufferSubData and report success WITHOUT calling the real
     // glUnmapBuffer — the real buffer was never mapped.
@@ -2918,6 +3556,10 @@ static uint8_t klfb_UnmapBuffer(uint32_t target) {
 // GL_INVALID_OPERATION on a buffer GL does not consider mapped.
 static void (*g_real_FlushMappedBufferRange_t)(uint32_t, intptr_t, intptr_t);
 static void klfb_FlushMappedBufferRange(uint32_t target, intptr_t offset, intptr_t length) {
+    if (KLFB_CS_GENERIC(target)) {
+        KLFB_CS_VIA_COPY_WRITE(klfb_FlushMappedBufferRange(KLFB_GL_COPY_WRITE, offset, length));
+        return;
+    }
     uint32_t buf = klfb_bound_buffer(target);
     for (int i = 0; i < KLFB_MAX_EMAPS; i++)
         if (g_emaps[i].active == 1 && g_emaps[i].target == target &&
@@ -2944,6 +3586,10 @@ static void klfb_buffer_refused(const char *fn, uint32_t target, intptr_t size, 
 }
 static void klfb_BufferData(uint32_t target, intptr_t size, const void *data,
                             uint32_t usage) {
+    if (KLFB_CS_GENERIC(target)) {
+        KLFB_CS_VIA_COPY_WRITE(klfb_BufferData(KLFB_GL_COPY_WRITE, size, data, usage));
+        return;
+    }
     if (g_real_BufferData_t) g_real_BufferData_t(target, size, data, usage);
     if (glfb_errscan()) klfb_buffer_refused("glBufferData", target, size, usage);
     { int ks = klfb_tb_tgtslot(target);
@@ -4097,10 +4743,43 @@ static int klfb_mirror_vrr(void) {
     static int on = -1;
     if (on < 0) {
         extern const char *kl_driver_target_name(void);
+        extern int kl_guest_beatsaber_openxr(void);
         const char *t = kl_driver_target_name();
-        on = kl_env_on("KL_VRR_MIRROR", t && strcmp(t, "doom3quest") == 0);
+        // ...and Beat Saber from 1.45 on, whose scene also goes straight into
+        // its array swapchain, one multiview pass for both eyes. Seen on
+        // device, 2026-10-12: no distortion in menu or level, and nothing else
+        // it draws at the eye size is read back through screen coordinates.
+        on = kl_env_on("KL_VRR_MIRROR", (t && strcmp(t, "doom3quest") == 0) ||
+                                        kl_guest_beatsaber_openxr());
     }
     return on;
+}
+// Whether a guest of the mirrored kind will be foveated this run: the setting
+// (or KL_VRR) is on and the guest is one klfb_mirror_vrr names. Asked by
+// kl_ovrp_set_eye_texture_size before any swapchain exists, because the size a
+// foveated guest can afford is another one than an unfoveated guest's.
+int kl_glfb_mirror_foveation_wanted(void) {
+    return kl_glfb_foveation_wanted(NULL, NULL) && klfb_mirror_vrr();
+}
+// The part of an eye texture a foveated guest actually writes: the map's
+// physical size, the larger of its layers'. Metal rasterizes into that corner
+// (rows and columns from 0) and leaves the rest of the screen-sized texture
+// untouched, so it is all the mirror copy has to bring across — at 6890x5526
+// about 2840x2720 of it, a fifth, where the whole-texture copy moved 76 million
+// texels a frame for the pair of eyes. Told by whoever built the map, right
+// after kl_glfb_set_eye_rate_map; 0 until then, and the copy is the whole
+// texture. KL_VRR_MIRROR_PHYS=0 is the whole texture again.
+static int g_eye_rate_pw, g_eye_rate_ph;
+void kl_glfb_set_eye_rate_physical(int pw, int ph) {
+    if (pw > 0 && ph > 0 && pw <= g_eye_rate_w && ph <= g_eye_rate_h &&
+        kl_env_on("KL_VRR_MIRROR_PHYS", 1)) {
+        if (pw != g_eye_rate_pw || ph != g_eye_rate_ph)
+            fprintf(stderr, "  [glfb] a foveated eye is copied as its physical %dx%d of %dx%d\n",
+                    pw, ph, g_eye_rate_w, g_eye_rate_h);
+        g_eye_rate_pw = pw; g_eye_rate_ph = ph;
+    } else {
+        g_eye_rate_pw = g_eye_rate_ph = 0;
+    }
 }
 // The sample floor the size rule was installed with, so it is retired with the same.
 static int g_eye_rate_min = KL_RATE_MIN_SAMPLES;
@@ -4208,6 +4887,7 @@ void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate
     g_eye_rate_map = rate_map;
     g_eye_rate_w   = rate_map ? w : 0;
     g_eye_rate_h   = rate_map ? h : 0;
+    g_eye_rate_pw  = g_eye_rate_ph = 0;      // the new map's is told next
     g_eye_rate_zx  = rate_map ? zones_x : 0;
     g_eye_rate_zy  = rate_map ? zones_y : 0;
 
@@ -5793,8 +6473,14 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t source,
         klfb_rate_rule(0);
         if (g_eye_mtl[eye][slot].tex) a_SetRateMap(g_eye_mtl[eye][slot].tex, NULL);
     }
+    // ...and of a foveated eye only the part that was written is copied.
+    int cw = w, ch = h;
+    if (unmap && mw == w && mh == h && g_eye_rate_pw > 0 && g_eye_rate_pw <= w &&
+        g_eye_rate_ph > 0 && g_eye_rate_ph <= h) {
+        cw = g_eye_rate_pw; ch = g_eye_rate_ph;
+    }
     uint32_t e = (mw == w && mh == h)
-        ? klfb_mirror_blit(src_tex, src_layer, m->tex, w, h)
+        ? klfb_mirror_blit(src_tex, src_layer, m->tex, cw, ch)
         : klfb_blit_subrect(src_tex, src_layer, m->tex, w, h, 0, 0, mw, mh);
     if (unmap) {
         klfb_rate_rule(rule_was);
@@ -9149,6 +9835,7 @@ static void klfb_TexBufferRange(uint32_t target, uint32_t internalformat, uint32
 // or unmap can name the buffer it wrote and refresh a texel-buffer texture over it.
 static void (*g_real_BindBuffer)(uint32_t, uint32_t);
 static void klfb_BindBuffer(uint32_t target, uint32_t buffer) {
+    if (KLFB_CS_GENERIC(target)) { g_cs_generic = buffer; return; }   // ours: ANGLE has no such target
     if (!g_real_BindBuffer) g_real_BindBuffer = asym("glBindBuffer");
     if (g_real_BindBuffer) g_real_BindBuffer(target, buffer);
     int s = klfb_tb_tgtslot(target);
@@ -9157,6 +9844,10 @@ static void klfb_BindBuffer(uint32_t target, uint32_t buffer) {
 // glBufferSubData writes into the bound buffer — if that buffer backs a texel-
 // buffer texture, its emulated 2D copy is now stale; re-upload the current bytes.
 static void klfb_BufferSubData(uint32_t target, intptr_t offset, intptr_t size, const void *data) {
+    if (KLFB_CS_GENERIC(target)) {
+        KLFB_CS_VIA_COPY_WRITE(klfb_BufferSubData(KLFB_GL_COPY_WRITE, offset, size, data));
+        return;
+    }
     if (!g_real_BufferSubData_t) g_real_BufferSubData_t = asym("glBufferSubData");
     if (g_real_BufferSubData_t) g_real_BufferSubData_t(target, offset, size, data);
     int s = klfb_tb_tgtslot(target);
@@ -9507,6 +10198,13 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glShaderSource", (void *)klfb_ShaderSource, (void **)&g_real_ShaderSource},
     {"glCompileShader", (void *)klfb_CompileShader, (void **)&g_real_CompileShader},
     {"glLinkProgram",   (void *)klfb_LinkProgram,   (void **)&g_real_LinkProgram},
+    // compute kernels as transform feedback (see klfb_cs_rewrite)
+    {"glAttachShader",    (void *)klfb_AttachShader,    (void **)&g_real_AttachShader},
+    {"glGetProgramiv",    (void *)klfb_GetProgramiv,    (void **)&g_real_GetProgramiv},
+    {"glBindBufferBase",  (void *)klfb_BindBufferBase,  (void **)&g_real_BindBufferBase},
+    {"glBindBufferRange", (void *)klfb_BindBufferRange, (void **)&g_real_BindBufferRange},
+    {"glDispatchCompute", (void *)klfb_DispatchCompute, (void **)&g_res_sink},
+    {"glMemoryBarrier",   (void *)klfb_MemoryBarrier,   (void **)&g_res_sink},
     // the texture storage census — which format the AGX abort follows
     {"glTexStorage2D", (void *)klfb_TexStorage2D, (void **)&g_real_TexStorage2D},
     {"glTexStorage3D", (void *)klfb_TexStorage3D, (void **)&g_real_TexStorage3D},

@@ -230,6 +230,10 @@ static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
 static int kl_fclose(void *f)                      { return fclose(kl_host_file(f)); }
 static int kl_fflush(void *f)                      { return fflush(f ? kl_host_file(f) : NULL); }
 static char *kl_fgets(char *s, int n, void *f)     { return fgets(s, n, kl_host_file(f)); }
+// bionic's fgets_unlocked (API 28): Darwin has no such name. The locked fgets
+// is a correct stand-in — the guest only promised it needs no lock. UE4 reads
+// /proc/meminfo with it at start.
+static char *kl_fgets_unlocked(char *s, int n, void *f) { return fgets(s, n, kl_host_file(f)); }
 static int kl_getc_(void *f)                       { return getc(kl_host_file(f)); }
 static int kl_feof(void *f)                        { return feof(kl_host_file(f)); }
 static int kl_ferror(void *f)                      { return ferror(kl_host_file(f)); }
@@ -473,9 +477,56 @@ static void kl_hexdump(const char *tag, const void *buf, ssize_t n) {
     for (ssize_t i = 0; i < n; i++) fputc(p[i] >= 0x20 && p[i] < 0x7f ? p[i] : '.', stderr);
     fprintf(stderr, "|\n");
 }
+// Meta's own hosts, for a guest that would otherwise present the synthetic
+// offline user to them.
+//
+// Beat Saber from 1.45 on gets that user because its start waits for one
+// (klplat_user_default), and with a user it does what it does on a Quest: it
+// asks graph.oculus.com for an analytics id, sends analytics batches, fetches
+// feature flags and leaderboards — every request carrying the offline token
+// klplat_User_GetAccessToken handed it. Meta refuses each one ("Failed to
+// decrypt", OAuthException 190; several dozen in a seven-minute session on
+// device, 2026-10-12) and the game falls back to its defaults, so nothing was
+// gained by sending them, and a made-up credential went to somebody else's
+// server each time. Its owner asked for them to stop.
+//
+// So for that guest these names do not resolve — the answer a headset without
+// a network gives, for these hosts only; everything else resolves as before.
+// By name, at the one door every request shares: the game's REST client and
+// Unity's own both come through getaddrinfo (seen with KL_TRACE_NET on a Mac
+// host). KL_NET_NO_META overrides in either direction, for any guest.
+static int kl_net_meta_host(const char *node) {
+    static const char *const dom[] = { "oculus.com", "oculuscdn.com", "facebook.com",
+                                       "facebook.net", "fbcdn.net", "meta.com" };
+    if (!node) return 0;
+    size_t n = strlen(node);
+    for (size_t i = 0; i < sizeof dom / sizeof dom[0]; i++) {
+        size_t l = strlen(dom[i]);
+        if (n >= l && strcasecmp(node + n - l, dom[i]) == 0 && (n == l || node[n - l - 1] == '.'))
+            return 1;
+    }
+    return 0;
+}
+static int kl_net_no_meta(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern int kl_guest_beatsaber_openxr(void);
+        on = kl_env_on("KL_NET_NO_META", kl_guest_beatsaber_openxr());
+    }
+    return on;
+}
 static void kl_sa_to_guest(struct sockaddr *sa, socklen_t *len);
 static int kl_getaddrinfo(const char *node, const char *serv,
                           const void *hints, void *res) {
+    if (kl_net_meta_host(node) && kl_net_no_meta()) {
+        static int said;
+        if (said < 4 || kl_net_trace()) {
+            said++;
+            fprintf(stderr, "  [net] getaddrinfo(\"%s\") -> EAI_NONAME — Meta's hosts are not asked "
+                            "with the offline user (KL_NET_NO_META=0 lets it through)\n", node);
+        }
+        return EAI_NONAME;
+    }
     if (kl_net_offline()) {
         if (kl_net_trace())
             fprintf(stderr, "  [net] getaddrinfo(\"%s\") -> EAI_NONAME (offline)\n",
@@ -1932,6 +1983,7 @@ X(klb_pthread_rwlock_init) X(klb_pthread_rwlock_destroy) X(klb_pthread_rwlock_rd
 X(klb_pthread_rwlock_wrlock) X(klb_pthread_rwlock_unlock)
 X(klb_pthread_attr_init) X(klb_pthread_attr_destroy) X(klb_pthread_attr_setstacksize)
 X(klb_pthread_attr_setdetachstate) X(klb_pthread_attr_getstack) X(klb_pthread_getattr_np)
+X(klb_pthread_attr_setschedpolicy) X(klb_pthread_attr_setschedparam)
 X(klb_pthread_key_create) X(klb_pthread_key_delete) X(klb_pthread_getspecific)
 X(klb_pthread_setspecific) X(klb_pthread_once)
 X(klb_pthread_create) X(klb_pthread_join) X(klb_pthread_detach) X(klb_pthread_exit)
@@ -2193,6 +2245,7 @@ static const kl_entry g_shim[] = {
     E("__sF", g_sF),
     E("fputc", kl_fputc), E("fputs", kl_fputs), E("fwrite", kl_fwrite), E("fread", kl_fread),
     E("fclose", kl_fclose), E("fflush", kl_fflush), E("fgets", kl_fgets), E("getc", kl_getc_),
+    E("fgets_unlocked", kl_fgets_unlocked),
     E("feof", kl_feof), E("ferror", kl_ferror), E("clearerr", kl_clearerr),
     E("fseek", kl_fseek), E("fseeko", kl_fseeko), E("ftell", kl_ftell), E("ftello", kl_ftello),
     E("setvbuf", kl_setvbuf),
@@ -2413,6 +2466,8 @@ static const kl_entry g_shim[] = {
     E("pthread_rwlock_unlock", klb_pthread_rwlock_unlock),
     E("pthread_attr_init", klb_pthread_attr_init),
     E("pthread_attr_destroy", klb_pthread_attr_destroy),
+    E("pthread_attr_setschedpolicy", klb_pthread_attr_setschedpolicy),
+    E("pthread_attr_setschedparam", klb_pthread_attr_setschedparam),
     E("pthread_attr_setstacksize", klb_pthread_attr_setstacksize),
     E("pthread_attr_setdetachstate", klb_pthread_attr_setdetachstate),
     E("pthread_attr_getstack", klb_pthread_attr_getstack),

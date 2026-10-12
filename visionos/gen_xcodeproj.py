@@ -236,6 +236,10 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # foveated-rendering setting starts at ("foveation").
                         + f"\t\t\t\tKL_AUTOBOOT_DEFAULT = {1 if KLT['autoboot'] else 0};\n"
                         + f"\t\t\t\tKL_FOVEATION_DEFAULT = {1 if KLT['foveation'] else 0};\n"
+                        # ...and the number that drops a stored foveation
+                        # choice once (targets.py "foveation_reset"),
+                        # KLFoveationReset in Info.plist.
+                        + f"\t\t\t\tKL_FOVEATION_RESET = {int(KLT['foveation_reset'])};\n"
                         # ...and which front the app shows: the boot report
                         # this project was developed against, or the start
                         # screen an installed game presents (KleptonApp.swift,

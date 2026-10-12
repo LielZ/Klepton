@@ -564,7 +564,31 @@ static const kl_gp_word k_csvr_hud_place[] = {
     { 0x119d14, 0x14000002, 0x1f04096b, "fmadd s11, s11, s4, s2; falls into scvtf s0" },
 };
 
+// Pistol Whip 1.5.73.2104 (x2104963472963790) — tolerate unavailable end-of-run
+// score state. Sent in by a user (fix 27); measured by them, not by the project.
+//
+// Returning from gameplay invokes ScoreManager.OnNewGameScore (metadata method
+// RID 9388, libil2cpp.so 0x11e5ad0). Here one of the optional score/platform
+// objects is absent. Every generated null guard in this method converges at
+// 0x11e6080, which raises NullReferenceException; the exception escapes into
+// the scene-transition coroutine before FadeFromColor and the loading-screen
+// cleanup can run, and the fade stays black. The native exception-boundary
+// trace measured LR=libil2cpp.so+0x11e6084, so this sink is the one reached.
+//
+// The missing state is treated as "score finalization unavailable": the sink
+// branches back to the method's own epilogue (0x11e6064, seven instructions
+// up) instead of calling the raise helper. What ran before the guard stays
+// done and the enclosing transition finishes. No score is made up or sent.
+static const kl_gp_word k_pistol_whip_score_null_exit[] = {
+    { 0x11e6080, 0x97f6c9f4, 0x17fffff9,
+      "bl <raise NullReferenceException> -> b 0x11e6064: OnNewGameScore's normal return" },
+};
+
 static const kl_gp_patch k_patches[] = {
+    { "pistol-whip-score-null-exit", "libil2cpp.so",
+      "missing optional end-of-run score state does not abort the scene transition",
+      k_pistol_whip_score_null_exit,
+      sizeof k_pistol_whip_score_null_exit / sizeof *k_pistol_whip_score_null_exit },
     { "csvr-hud-smaller-lower", "libxash.so",
       "the VR HUD is drawn at 3/4 of its size and 1/16 of the image lower",
       k_csvr_hud_place, sizeof k_csvr_hud_place / sizeof *k_csvr_hud_place },

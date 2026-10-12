@@ -578,8 +578,14 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
                     // after the platform user arrives, and with the library
                     // refused that is a DllNotFoundException which ends the
                     // chain on a black screen (2026-10-11).
+                    // ...and Premium Bowling (x2773034772778845): it carries on
+                    // without libovravatar2 ("shutting down AvatarSDK"), but a
+                    // NullReferenceException follows when its first menu comes
+                    // up; with the library loaded there is none (Mac host,
+                    // 2026-10-12).
                     on = kl_env_on("KL_ELF_TLSDESC", t && (strcmp(t, "x3635172946605196") == 0 ||
-                                                           strcmp(t, "x4360608937312293") == 0));
+                                                           strcmp(t, "x4360608937312293") == 0 ||
+                                                           strcmp(t, "x2773034772778845") == 0));
                 }
                 if (!on) {
                     err("unhandled relocation type %u at %#llx (ELF TLS; KL_ELF_TLSDESC=1 serves it)",

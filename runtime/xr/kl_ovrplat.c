@@ -130,7 +130,8 @@ static int plat_is_iap_catalog(const char *name) {
 // The read side of the OWNED half: "which IAPs has this viewer already bought?"
 // For every title but Walkabout the answer is still "the request could not be
 // made" (request id 0): no purchase message, so the guest learns of nothing it
-// did not already have. Walkabout is the exception, and only there:
+// did not already have. Walkabout is the exception, and a title under
+// KL_PLAT_IAP_CONFIRMED (Maestro): there
 // klplat_IAP_GetViewerPurchases returns the purchases the store confirmed for
 // this viewer, read from klepton-entitlements.txt (klplat_load_entitlements).
 // A bundle on disk is not a purchase, and with no such file the list is empty.
@@ -398,6 +399,13 @@ static uint64_t klplat_called(const char *name) {
 // found again in Eye of the Temple's.
 #define KLPLAT_MSG_LEADERBOARD_GET_ENTRIES 0x5DB3474Cu // Leaderboard_GetEntries
 #define KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY 0x117FC8FEu // Leaderboard_WriteEntry
+// The rest of the family's plain requests, read out of Beat Saber 1.45's running
+// IL2CPP runtime (KL_PROBE_ENUM=Oculus.Platform.Message/MessageType on a Mac
+// host, 2026-10-12); the two values above came back identical in the same list.
+#define KLPLAT_MSG_LEADERBOARD_GET             0x6AD44EF8u // Leaderboard_Get
+#define KLPLAT_MSG_LEADERBOARD_GET_AFTER_RANK  0x18378BEFu // Leaderboard_GetEntriesAfterRank
+#define KLPLAT_MSG_LEADERBOARD_GET_BY_IDS      0x39607BFCu // Leaderboard_GetEntriesByIds
+#define KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY_SM  0x72C692FAu // Leaderboard_WriteEntryWithSupplementaryMetric
 #define KLPLAT_INIT_SUCCESS        0            // PlatformInitializeResult.Success
 #define KLPLAT_AGE_ADULT           3            // AccountAgeCategory.Ad
 
@@ -1225,6 +1233,29 @@ static int klplat_owns_sku(const char *sku) {
     return 0;
 }
 
+// KL_PLAT_IAP_CONFIRMED — the viewer's purchases are what the store confirmed.
+//
+// A title whose add-ons unlock on the purchase list alone needs no table here:
+// Maestro (x6963344583787383, UE4) asks ovr_IAP_GetViewerPurchases, takes each
+// SKU as the name of an add-on of its own (Maestro_DLC_Classical), and looks
+// the pak up in its own config ([Maestro/DLCToAssetName] in DefaultGame.ini:
+// Maestro_DLC_Classical=pakchunk4-). The pak it mounts at start from its OBB
+// directory, bought or not — the store does not deliver one that is not, and
+// the purchase is still asked. Refused (request id 0), the add-on stayed
+// locked with its pak mounted.
+//
+// So for such a title the answer is the file's SKUs as they are, nothing
+// derived and nothing added, and with no file the list is empty.
+// Default on for that title alone; the switch overrides in either direction.
+static int klplat_iap_confirmed(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_PLAT_IAP_CONFIRMED", t && strcmp(t, "x6963344583787383") == 0);
+    }
+    return on;
+}
+
 // A course is bought when the store confirmed any one of its ids.
 static int klplat_course_owned(int row) {
     if (row < 0) return 0;
@@ -1304,12 +1335,20 @@ static int klplat_scan_delivered(void) {
 // The id is the store's where the index names one for the file; without, it
 // is a number made from the file name, which the title only hands back to
 // requests that are refused here anyway (download, delete).
-// Default on for x3484270071659289 alone; the switch overrides.
+//
+// Maestro (x6963344583787383) asks the same list at every start, after its
+// purchases, to see which of its add-on paks the store has a newer file for
+// (UAsyncAction_GetUpdatableDLCs_Oculus: mounted, "entitled" and "available"),
+// and again when an owned add-on is to be mounted. Its paks are asset files in
+// the OBB directory too, so the answer is the same one: what is there, as
+// installed — never "available", so it asks for no download.
+// Default on for those two; the switch overrides.
 static int klplat_obb_assets_on(void) {
     static int on = -1;
     if (on < 0) {
         const char *t = kl_driver_target_name();
-        on = kl_env_on("KL_PLAT_OBB_ASSETS", t && strcmp(t, "x3484270071659289") == 0);
+        on = kl_env_on("KL_PLAT_OBB_ASSETS", t && (strcmp(t, "x3484270071659289") == 0 ||
+                                                   strcmp(t, "x6963344583787383") == 0));
     }
     return on;
 }
@@ -1355,7 +1394,15 @@ static void klplat_scan_courses(void) {
     g_ncourses = 0;
     g_npurchases = 0;
     g_nsuffix = 0;
-    if (!klplat_is_walkabout()) { klplat_scan_delivered(); klplat_scan_obb_assets(); return; }
+    if (!klplat_is_walkabout()) {
+        if (klplat_iap_confirmed()) {
+            klplat_load_entitlements();
+            for (int i = 0; i < g_nowned; i++) klplat_add_purchase(g_owned[i]);
+        }
+        klplat_scan_delivered();
+        klplat_scan_obb_assets();
+        return;
+    }
     // What the store confirmed is reported as it is, whether or not this
     // course table knows the SKU or the course's files are here.
     klplat_load_entitlements();
@@ -1642,6 +1689,12 @@ static int klplat_iap_empty(void) {
 
 static uint64_t klplat_iap_purchases(const char *what, uint32_t type) {
     if (!klplat_is_walkabout()) {
+        if (klplat_iap_confirmed()) {
+            klplat_scan_courses();
+            fprintf(stderr, "  [plat] %s -> %d store-confirmed purchase%s (KL_PLAT_IAP_CONFIRMED)\n",
+                    what, g_npurchases, g_npurchases == 1 ? "" : "s");
+            return klplat_request_kind(what, type, g_npurchases, KLPLAT_KIND_PURCHASES);
+        }
         if (!klplat_iap_empty()) return 0;
         g_npurchases = 0;
         return klplat_request_kind(what, type, 0, KLPLAT_KIND_PURCHASES);
@@ -1905,7 +1958,21 @@ static int klplat_user_default(void) {
                                 // failed." and the game stays in its boot scene:
                                 // sound, and two draws a frame of black (on
                                 // device, 2026-10-11).
-                                "x4360608937312293" };
+                                "x4360608937312293",
+                                // Premium Bowling: the same chain. "Entitlement
+                                // Check OK => Start GetLoggedInOculusUserRoutine",
+                                // then "Request failed." and nothing more: no
+                                // file is opened and no scene loaded for 2400
+                                // frames (Mac host, 2026-10-12). With the user
+                                // it goes on to load its first hall.
+                                "x2773034772778845" };
+    // Beat Saber from 1.45 on (Unity 6; kl_guest_beatsaber_openxr): its start
+    // asks for the user FIRST and goes no further without one — no entitlement
+    // request, no scene, one draw a frame of black and silence (on device,
+    // 2026-10-12). 1.40 asks the same question fourth and carries on with a 0,
+    // so it is the build and not the row that decides.
+    extern int kl_guest_beatsaber_openxr(void);
+    if (kl_guest_beatsaber_openxr()) return 1;
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
@@ -2125,6 +2192,39 @@ static uint64_t klplat_Leaderboard_WriteEntry(const char *name, long long score,
     return klplat_request_err("ovr_Leaderboard_WriteEntry",
                               KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY);
 }
+// The family's other plain requests, answered the same way and for the same
+// reason. Beat Saber 1.45 asks GetEntriesAfterRank when its menu comes up, once
+// it has a user; there was no entry point and the run ended there by name (on
+// device, 2026-10-12). The three beside it are what the same C# class reaches
+// next. The paging requests (GetNextEntries / GetPreviousEntries) take a handle
+// out of a successful answer, which nothing here ever gives.
+static uint64_t klplat_Leaderboard_Get(const char *name) {
+    (void)name;
+    plat_hit("ovr_Leaderboard_Get");
+    return klplat_request_err("ovr_Leaderboard_Get", KLPLAT_MSG_LEADERBOARD_GET);
+}
+static uint64_t klplat_Leaderboard_GetEntriesAfterRank(const char *name, int limit,
+                                                       unsigned long long after_rank) {
+    (void)name; (void)limit; (void)after_rank;
+    plat_hit("ovr_Leaderboard_GetEntriesAfterRank");
+    return klplat_request_err("ovr_Leaderboard_GetEntriesAfterRank",
+                              KLPLAT_MSG_LEADERBOARD_GET_AFTER_RANK);
+}
+static uint64_t klplat_Leaderboard_GetEntriesByIds(const char *name, int limit, int start_at,
+                                                   const uint64_t *user_ids, unsigned n_ids) {
+    (void)name; (void)limit; (void)start_at; (void)user_ids; (void)n_ids;
+    plat_hit("ovr_Leaderboard_GetEntriesByIds");
+    return klplat_request_err("ovr_Leaderboard_GetEntriesByIds",
+                              KLPLAT_MSG_LEADERBOARD_GET_BY_IDS);
+}
+static uint64_t klplat_Leaderboard_WriteEntryWithSupplementaryMetric(
+        const char *name, long long score, long long metric,
+        const void *extra, unsigned extra_size, int force) {
+    (void)name; (void)score; (void)metric; (void)extra; (void)extra_size; (void)force;
+    plat_hit("ovr_Leaderboard_WriteEntryWithSupplementaryMetric");
+    return klplat_request_err("ovr_Leaderboard_WriteEntryWithSupplementaryMetric",
+                              KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY_SM);
+}
 
 static uint64_t klplat_AppVersion_code(const void *h) {
     plat_hit("ovr_ApplicationVersion_GetCode");
@@ -2272,6 +2372,13 @@ static const char *const g_plat_request[] = {
     "ovr_User_GetOrgScopedID",
     "ovr_User_LaunchFriendRequestFlow",
     "ovr_User_GetLoggedInUserManagedInfo",
+    // Device attestation: the platform service signs a token for the nonce the
+    // game passes, and the game's own server checks it. There is no service
+    // here to sign anything, and a made-up token would be a forged attestation;
+    // 0 says the request could not be made. Premium Bowling
+    // (x2773034772778845) asks once at start, beside its entitlement request,
+    // and logs "Request failed." before carrying on.
+    "ovr_DeviceApplicationIntegrity_GetIntegrityToken",
 };
 
 // Whole families where EVERY entry point is request-returning, so the same
@@ -2567,6 +2674,10 @@ static const char *klplat_MessageType_ToString(uint32_t type) {
     case KLPLAT_MSG_ORG_SCOPED_ID:          return "ovrMessage_User_GetOrgScopedID";
     case KLPLAT_MSG_LEADERBOARD_GET_ENTRIES: return "ovrMessage_Leaderboard_GetEntries";
     case KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY: return "ovrMessage_Leaderboard_WriteEntry";
+    case KLPLAT_MSG_LEADERBOARD_GET:            return "ovrMessage_Leaderboard_Get";
+    case KLPLAT_MSG_LEADERBOARD_GET_AFTER_RANK: return "ovrMessage_Leaderboard_GetEntriesAfterRank";
+    case KLPLAT_MSG_LEADERBOARD_GET_BY_IDS:     return "ovrMessage_Leaderboard_GetEntriesByIds";
+    case KLPLAT_MSG_LEADERBOARD_WRITE_ENTRY_SM: return "ovrMessage_Leaderboard_WriteEntryWithSupplementaryMetric";
     case KLPLAT_MSG_IAP_PURCHASES:          return "ovrMessage_IAP_GetViewerPurchases";
     case KLPLAT_MSG_IAP_PRODUCTS:           return "ovrMessage_IAP_GetProductsBySKU";
     default:                                return "ovrMessage_Unknown";
@@ -2665,6 +2776,11 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovrID_FromString",                       (void *)klplat_ID_FromString},
     {"ovr_Leaderboard_GetEntries",             (void *)klplat_Leaderboard_GetEntries},
     {"ovr_Leaderboard_WriteEntry",             (void *)klplat_Leaderboard_WriteEntry},
+    {"ovr_Leaderboard_Get",                    (void *)klplat_Leaderboard_Get},
+    {"ovr_Leaderboard_GetEntriesAfterRank",    (void *)klplat_Leaderboard_GetEntriesAfterRank},
+    {"ovr_Leaderboard_GetEntriesByIds",        (void *)klplat_Leaderboard_GetEntriesByIds},
+    {"ovr_Leaderboard_WriteEntryWithSupplementaryMetric",
+                                               (void *)klplat_Leaderboard_WriteEntryWithSupplementaryMetric},
     {"ovr_Message_GetAchievementDefinitionArray", (void *)klplat_Message_GetPayload},
     {"ovr_Achievements_GetAllProgress",        (void *)klplat_Achievements_GetAllProgress},
     {"ovr_Message_GetAchievementProgressArray", (void *)klplat_Message_GetPayload},
