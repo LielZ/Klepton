@@ -155,6 +155,10 @@ static volatile float s_eye_scale[4] = { 1, 1, 1, 1 }, s_eye_offset[4];
 void kl_reproject_set_eye_color(const float scale[4], const float offset[4]) {
     for (int i = 0; i < 4; i++) { s_eye_scale[i] = scale[i]; s_eye_offset[i] = offset[i]; }
 }
+// What the eye picture's alpha means — kl_reproject.h. One word, written by the
+// guest's frame thread and read by the compositor's, like the colour above.
+static volatile int s_eye_alpha;
+void kl_reproject_set_eye_alpha(int mode) { s_eye_alpha = mode; }
 
 static const char kl_msl_reproject[] =
 "#include <metal_stdlib>\n"
@@ -176,6 +180,7 @@ static const char kl_msl_reproject[] =
 "    packed_float3 chromaKey;  // packed: matches the C side's three floats\n"
 "    packed_float4 colorFade;  // 1 - the guest's colour scale; kl_reproject.h\n"
 "    packed_float4 colorOffset;\n"
+"    uint     eyeAlpha;   // KL_EYE_ALPHA_* — kl_reproject.h\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -195,6 +200,19 @@ static const char kl_msl_reproject[] =
 "{\n"
 "    float3 c = tex.sample(samp, uv, slice).rgb;\n"
 "    return float4(srgbDecode != 0u ? kl_srgb_to_linear(c) : c, 1.0);\n"
+"}\n"
+"\n"
+// The same sample with the guest's alpha read as how much of the pixel is the
+// game's (KL_EYE_ALPHA_*), for the one pass that may show the room through the
+// picture. The probes below keep kl_eye_sample and its forced 1.0.
+"static float4 kl_eye_sample_alpha(texture2d_array<float> tex, sampler samp,\n"
+"                                  float2 uv, uint slice, uint srgbDecode,\n"
+"                                  uint eyeAlpha)\n"
+"{\n"
+"    float4 t = tex.sample(samp, uv, slice);\n"
+"    float a = eyeAlpha == 2u ? 1.0 - t.a : t.a;\n"
+"    return float4(srgbDecode != 0u ? kl_srgb_to_linear(t.rgb) : t.rgb,\n"
+"                  saturate(a));\n"
 "}\n"
 "\n"
 // `slice` travels as a flat varying because the fragment stage has no
@@ -221,7 +239,7 @@ static const char kl_msl_reproject[] =
 // would otherwise read. Unlike the struct above these are varyings, not buffer
 // members, so a float3 here costs nothing and hides nothing.
 "              uint chromaOn [[flat]]; float3 chromaKey [[flat]];\n"
-"              float2 chromaRange [[flat]]; };\n"
+"              float2 chromaRange [[flat]]; uint eyeAlpha [[flat]]; };\n"
 "\n"
 // One place, so a rung of the probe ladder cannot disagree with the real pass
 // about which eye it is looking at — which is the failure this whole file keeps
@@ -348,6 +366,7 @@ static const char kl_msl_reproject[] =
 "    o.chromaOn = u.chromaOn;\n"
 "    o.chromaKey = float3(u.chromaKey);\n"
 "    o.chromaRange = float2(u.chromaMin, u.chromaMax);\n"
+"    o.eyeAlpha = u.eyeAlpha;\n"
 "    o.colorFade = float4(u.colorFade).rgb;\n"
 "    o.colorOffset = float4(u.colorOffset).rgb;\n"
 "    // The amplification index IS the texture slot: the caller binds the views'\n"
@@ -389,7 +408,23 @@ static const char kl_msl_reproject[] =
 "                               texture2d_array<float> tex1 [[texture(1)]],\n"
 "                               sampler samp [[sampler(0)]])\n"
 "{\n"
-"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+// Opaque unless the guest put a passthrough layer under this picture: then its
+// alpha says where the room is, and what leaves here is premultiplied colour
+// with that alpha, which a mixed space blends over the room by itself.
+"    float4 c;\n"
+"    if (in.eyeAlpha == 0u)\n"
+"        c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+"    else if (in.src == 0u)\n"
+"        c = kl_eye_sample_alpha(tex, samp, in.uv, in.slice, in.srgb, in.eyeAlpha);\n"
+"    else\n"
+"        c = kl_eye_sample_alpha(tex1, samp, in.uv, in.slice, in.srgb, in.eyeAlpha);\n"
+// Nothing of the game's at all: write neither colour nor depth, which is the
+// state a mixed space is known to show the room in (a frame with no eye picture
+// has always shown it that way). Partly transparent pixels go on as alpha.
+// What a discarded pixel keeps is the pass's clear colour, so the caller has
+// to clear to transparent while this is in force (KleptonCompositor does).
+"    if (in.eyeAlpha != 0u && c.a < 0.004 && max(c.r, max(c.g, c.b)) < 0.004)\n"
+"        discard_fragment();\n"
 // The guest's own fade (ovrp_SetColorScaleAndOffset), before the matte: a
 // picture faded to black is black, not whatever the key colour makes of it.
 "    c.rgb = c.rgb * (float3(1.0) - in.colorFade) + in.colorOffset;\n"
@@ -433,6 +468,7 @@ static const char kl_msl_reproject[] =
 "    o.chromaOn = ua[amp].chromaOn;\n"
 "    o.chromaKey = float3(ua[amp].chromaKey);\n"
 "    o.chromaRange = float2(ua[amp].chromaMin, ua[amp].chromaMax);\n"
+"    o.eyeAlpha = 0u;\n"
 "    o.colorFade = float3(0.0);\n"
 "    o.colorOffset = float3(0.0);\n"
 "    o.src = uint(amp);\n"
@@ -822,6 +858,7 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
         u.color_fade[i]   = 1.0f - s_eye_scale[i];
         u.color_offset[i] = s_eye_offset[i];
     }
+    u.eye_alpha = (uint32_t)s_eye_alpha;
 
     if (rendered && rendered->serial) {
         const float *t = rendered->tangents[(unsigned)eye > 1 ? 0 : eye];

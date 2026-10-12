@@ -240,6 +240,12 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # choice once (targets.py "foveation_reset"),
                         # KLFoveationReset in Info.plist.
                         + f"\t\t\t\tKL_FOVEATION_RESET = {int(KLT['foveation_reset'])};\n"
+                        # ...what edge smoothing for a Vulkan guest starts at
+                        # (targets.py "vk_msaa", KLVkMsaaDefault) and how
+                        # finely the picture is put on the display ("output",
+                        # KLOutputDefault).
+                        + f"\t\t\t\tKL_VK_MSAA_DEFAULT = {int(KLT['vk_msaa'])};\n"
+                        + f"\t\t\t\tKL_OUTPUT_DEFAULT = {KLT['output']};\n"
                         # ...and which front the app shows: the boot report
                         # this project was developed against, or the start
                         # screen an installed game presents (KleptonApp.swift,

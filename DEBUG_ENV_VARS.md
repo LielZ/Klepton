@@ -89,6 +89,24 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   game cannot keep up), and the compositor draws black behind every frame that
   has no eye picture, so the room does not show. `KL_FULL=1` opens the full
   space instead; `KL_MIXED_BLACK=0` leaves the room visible in the mixed one.
+  The full space is also the start window's "Frame rate: up to 120" setting
+  (`KleptonRendering.maxRate`, default up to 100), offered to every game but
+  the mixed-reality ones (TRIANGLE STRATEGY, Demeo); `KL_FULL` overrides it.
+- `KL_OVRP_PASSTHROUGH=0|1` — (`kl_ovrp.c`, "Insight Passthrough") tell an
+  OVRPlugin guest that passthrough exists: capability flags, init, its state,
+  the layer style and the surface meshes all succeed. Nothing is drawn for the
+  passthrough layer; while one is in the guest's submit list the eye picture is
+  no longer forced opaque — its alpha says where the room shows — and the black
+  of `KL_MIXED_BLACK` is left out. Default 1 for TRIANGLE STRATEGY
+  (`x5340130476095884`), 0 for everyone else, who are told "unsupported" as
+  before. Log lines start `[ovrp] passthrough:`.
+- `KL_OVRP_PT_ALPHA=opaque|coverage|inverse` — what the eye picture's alpha
+  means while a passthrough layer is submitted: `coverage` 1 = the game's
+  picture, `inverse` 0 = the game's picture, `opaque` ignore it. Unset, it is
+  `inverse` when the eye submit carries flag 0x10 (InverseAlpha, as remembered
+  from the public header) and `coverage` otherwise; the log line names the
+  flags it read. If the game's picture is missing and the room shows where the
+  game should be, the other one is right.
 - `KL_GL_MSAA_MV_SAMPLES=2|4` — override the sample count the guest asked for
   (Beat Saber asks for 4) and the app's setting.
 - `KL_ANGLE_MSMV_MEMORYLESS=0` — read by ANGLE itself (`TextureMtl.mm`): keep the
@@ -1627,6 +1645,13 @@ puts the camera on the ground with its hands underneath it.
   truth. A guest's multisampled eye targets are real memory here, so this is
   what a larger eye is paid for with. Default 2 for `x5812519008825194`
   (with `KL_OVRP_EYE_MAX` 3840), else 0.
+- `KL_VK_FORCE_SAMPLES=4` — every multisampled image, render-pass attachment
+  and pipeline a Vulkan guest makes with fewer samples is made with 4. For a
+  guest whose own anti-aliasing setting cannot be reached (Marvel's Deadpool VR
+  renders 2x from a setting in an encrypted pak). Costs fill time and memory;
+  pipelines compiled for the old count are compiled again. Default: the start
+  window's "Edge smoothing" setting, which is off unless chosen and is offered
+  to a game that was seen multisampling with fewer than four.
 - `KL_OVRP_EYE_MAX=<px>` — cap on the longer axis of that size, default 3072
   (4000 for `doom3quest`, 3840 for `x5812519008825194`),
   0 to disable. Vision Pro's logical per-eye resolution is far larger than a

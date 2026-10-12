@@ -158,7 +158,22 @@ typedef struct {
     // filled in — all zeroes — are the picture as it is and not a black one.
     float         color_fade[4];
     float         color_offset[4];
+    // What the eye picture's own alpha means (KL_EYE_ALPHA_*). 0, which is
+    // what every guest had until one asked for passthrough, is "nothing": the
+    // picture is opaque, as kl_eye_sample says it must be. The other two are
+    // for a guest that submits a passthrough layer under its eye layer and
+    // leaves the room's place in the picture transparent (kl_ovrp.c).
+    uint32_t      eye_alpha;
 } kl_reproject_uniforms;
+// The eye picture's alpha, for every kl_reproject_build from now on. Colour is
+// taken as premultiplied in both readings, which is how a headset composites an
+// eye layer over the layers under it.
+enum {
+    KL_EYE_ALPHA_OPAQUE   = 0,   // ignore it — the picture covers everything
+    KL_EYE_ALPHA_COVERAGE = 1,   // 1 = the game's picture, 0 = the room
+    KL_EYE_ALPHA_INVERSE  = 2,   // 0 = the game's picture, 1 = the room
+};
+void kl_reproject_set_eye_alpha(int mode);
 // The values every kl_reproject_build puts there from now on. Scale 1, offset
 // 0 is the picture unchanged.
 void kl_reproject_set_eye_color(const float scale[4], const float offset[4]);

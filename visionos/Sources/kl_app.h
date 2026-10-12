@@ -116,6 +116,10 @@ int  kl_app_guest_state(void);
 // of its own to take it. 1 means a request went out and the guest should be
 // given a moment — it ends the process itself when it is done.
 int  kl_app_guest_request_quit(void);
+// ...and before that, for a game that is being watched for a stop with every
+// thread waiting: who waits on what, written to the log. A player ends such a
+// run by leaving it, so this is the only moment that sees it.
+void kl_app_exit_report(void);
 // ...and whether it has: its main has returned.
 int  kl_app_guest_quit_done(void);
 

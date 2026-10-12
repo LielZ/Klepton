@@ -59,18 +59,27 @@
 // deadlock (2026-08-06 capture hang). So mutexes are keyed by guest
 // *address* instead: a copied or recycled address is the same mutex, a
 // different address is a different mutex, and guest storage is never read.
-// Keyed by guest ADDRESS, and slots are only reclaimed on an explicit
-// pthread_mutex_destroy — which many guests never call (freeing the containing
-// object is legal on Linux, where a pthread_mutex_t needs no destroy). So the
-// table fills monotonically with the working set of distinct mutex addresses.
-// TWD2's UE4 load creates ~32k mutexes without destroying any and overflowed the
-// old 32768 table: mtx_entry_for's unbounded probe then spun FOREVER on the first
-// insert into a full table (the "abort past it" below was never implemented), which
-// looked like a hang with FAsyncLoading pinned 99% in mtx_entry_for. 8x the size so
-// a large UE4 load fits, and mtx_entry_for now bounds its probe (see there).
-#define MTX_MAP_SIZE 262144         // power of two; mtx_entry_for degrades (not hangs) if full
-typedef struct {
-    _Atomic(uintptr_t)   key;       // guest address; 0 = empty
+// Keyed by guest ADDRESS: a bucket per hash, and in each bucket a chain of
+// entries that is only ever added to at its head. An entry is never unlinked,
+// so nothing a lookup walks can change under it; pthread_mutex_destroy marks
+// its entry free (key 0) and the next mutex whose address falls into that
+// bucket takes it over. What the table holds is therefore bounded by how many
+// mutexes a guest has alive at once per bucket, not by how many addresses it
+// has ever had one at — which matters, because an Unreal game makes and
+// destroys them by the thousand a minute (Marvel's Deadpool VR: 47,000 distinct
+// addresses 75 seconds into a session, 66,000 after three minutes).
+//
+// It was one array probed linearly before, first of 2^15 entries — TWD2's load
+// makes ~32k mutexes and the unbounded probe then spun for ever on a full
+// table — then of 2^18. See klb_pthread_mutex_destroy for what removing an
+// entry from THAT cost.
+#define MTX_BUCKET_BITS 17
+#define MTX_BUCKETS (1u << MTX_BUCKET_BITS)
+// The condition-variable and rwlock tables, which share the hash below.
+#define AUX_MAP_BITS 18
+#define AUX_MAP_SIZE (1u << AUX_MAP_BITS)
+typedef struct mtx_entry {
+    _Atomic(uintptr_t)   key;       // guest address; 0 = free for the next mutex of this bucket
     // Atomic, and published AFTER the key with release ordering — see
     // mtx_entry_for. A plain pointer here was a publication race and it was
     // reached: the claiming thread stored the key, and any other thread that
@@ -85,11 +94,21 @@ typedef struct {
     // without sleeping, which the guest reads as a spurious wake and retries
     // forever. Counting is the only way to see that from here.
     _Atomic(int)         depth;
+    // The next entry of this bucket. Written once, before the entry is
+    // published as the bucket's head, and never again.
+    struct mtx_entry    *next;
 } mtx_entry;
-static mtx_entry g_mtx_map[MTX_MAP_SIZE];
+static _Atomic(mtx_entry *) g_mtx_bucket[MTX_BUCKETS];
+// One writer at a time per bucket — see mtx_entry_for.
+static _Atomic(unsigned char) g_mtx_bucket_busy[MTX_BUCKETS];
 
-static unsigned mtx_hash(uintptr_t a) {
-    return (unsigned)(((a >> 4) * 0x9E3779B97F4A7C15ULL) >> 49);
+// The bucket (or, in the probed tables below, the home slot) of an address in a
+// table of 2^bits: the TOP bits of the product, as many as the table has. This
+// shifted by a fixed 49 while the tables grew from 2^15 to 2^18 entries, so
+// every address had its home in the first eighth and the rest was reached only
+// by probing along one long run.
+static unsigned mtx_hash(uintptr_t a, unsigned bits) {
+    return (unsigned)(((a >> 4) * 0x9E3779B97F4A7C15ULL) >> (64 - bits));
 }
 
 static pthread_mutex_t *mtx_make(void) {
@@ -140,7 +159,7 @@ typedef struct {
     _Atomic(void *)          waiter_ra;   // guest call site of the last waiter here
     _Atomic(void *)          waiter_ra2;  // one frame deeper: the caller of that
 } cnd_entry;
-static cnd_entry g_cnd_map[MTX_MAP_SIZE];
+static cnd_entry g_cnd_map[AUX_MAP_SIZE];
 
 static uint64_t cnd_now_ns(void) {
     struct timespec ts;
@@ -159,7 +178,7 @@ static pthread_cond_t *cnd_make(void) {
 static cnd_entry *cnd_entry_for(void *g) {
     uintptr_t want = (uintptr_t)g;
     pthread_cond_t *fresh = NULL;
-    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
+    for (unsigned i = mtx_hash(want, AUX_MAP_BITS); ; i = (i + 1) & (AUX_MAP_SIZE - 1)) {
         uintptr_t k = atomic_load(&g_cnd_map[i].key);
         if (k == want) {
             if (fresh) { pthread_cond_destroy(fresh); free(fresh); }
@@ -197,74 +216,92 @@ static pthread_mutex_t *mtx_host(mtx_entry *e) {
     return m;
 }
 
-// Find-or-create the host mutex for guest address g. Linear probe.
+// Find-or-create the entry for guest address g.
 //
-// The mutex is constructed BEFORE the key is claimed. This is the same ordering
-// bug klb_sem_init already carries a comment about — fill the slot, then
-// publish the index, never the other way round — and here it presented as
+// Finding takes no lock: a walk down the bucket's chain. Creating is the rare
+// path — the first use of an address — and has one writer per bucket at a
+// time, because two things must not happen there: two threads that first-lock
+// one brand-new mutex at once (a thread pool coming up does exactly that) must
+// end up with ONE entry, and a freed entry must be taken over by one mutex.
+//
+// The host mutex is built BEFORE the entry is published. This is the same
+// ordering bug klb_sem_init already carries a comment about — fill the slot,
+// then publish it, never the other way round — and here it presented as
 // libphonon's worker pool dying in pthread_mutex_lock(NULL) three frames into
 // guest code, which reads as the guest's own null-mutex bug and is not.
-// Several threads first-locking one brand-new mutex at once is exactly what a
-// thread pool coming up does, which is why it was intermittent and why it
-// picked the guest with the most thread pools.
-// A single shared fallback used only when the whole table is full — better a few
-// guest mutexes serialising on one recursive host mutex than an infinite probe
-// spin. With MTX_MAP_SIZE at 262144 this should never be reached in practice; it
-// exists so a pathological guest degrades instead of hanging (which is exactly
-// what TWD2 did at the old 32768).
-static mtx_entry g_mtx_overflow;
-static mtx_entry *mtx_overflow(void) {
-    if (!atomic_load(&g_mtx_overflow.m)) {
-        pthread_mutex_t *m = mtx_make();
-        pthread_mutex_t *expect = NULL;
-        if (!atomic_compare_exchange_strong(&g_mtx_overflow.m, &expect, m) && m) {
-            pthread_mutex_destroy(m); free(m);
-        }
+//
+// The writer's turn is a flag that is waited for only so long. A guest that
+// stops the world by signalling its threads (see kl_env.c) can park one of
+// them while it holds the flag, and whoever then needs the same bucket must
+// not wait for a thread that only it can resume: after the wait it goes on
+// without the flag and adds a new entry instead of taking over a free one.
+static _Atomic unsigned g_mtx_entries;      // entries ever made; freed ones are taken over, not counted again
+static int mtx_bucket_take(unsigned b) {
+    for (int i = 0; i < 4000; i++) {
+        if (!atomic_exchange(&g_mtx_bucket_busy[b], 1)) return 1;
+        if (i > 64) sched_yield();
     }
-    static _Atomic int said;
-    if (atomic_fetch_add(&said, 1) == 0)
-        fprintf(stderr, "  [klb] mutex table FULL (%d slots) — sharing one fallback "
-                        "mutex; sync correctness degraded (raise MTX_MAP_SIZE)\n",
-                MTX_MAP_SIZE);
-    return &g_mtx_overflow;
+    return 0;
 }
-static mtx_entry *mtx_entry_for(void *g) {
-    uintptr_t want = (uintptr_t)g;
-    pthread_mutex_t *fresh = NULL;
-    unsigned probes = 0;
-    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
-        uintptr_t k = atomic_load(&g_mtx_map[i].key);
-        if (k == want) {
-            if (fresh) { pthread_mutex_destroy(fresh); free(fresh); }
-            return &g_mtx_map[i];
-        }
-        if (k) {
-            // Bound the probe: a full table (every slot occupied by a DIFFERENT
-            // key) would otherwise loop forever. One full sweep proves it full.
-            if (++probes >= MTX_MAP_SIZE) {
-                if (fresh) { pthread_mutex_destroy(fresh); free(fresh); }
-                return mtx_overflow();
-            }
-            continue;
-        }
-        // empty: build the mutex first, so claiming the key publishes a
-        // complete entry. Kept across a lost race rather than rebuilt.
-        if (!fresh) fresh = mtx_make();
-        uintptr_t expect = 0;
-        if (!atomic_compare_exchange_strong(&g_mtx_map[i].key, &expect, want))
-            { i--; continue; }          // lost the race; re-read this slot
-        atomic_store(&g_mtx_map[i].m, fresh);
-        return &g_mtx_map[i];
-    }
-}
-
 static mtx_entry *mtx_find(void *g) {
     uintptr_t want = (uintptr_t)g;
-    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
-        uintptr_t k = atomic_load(&g_mtx_map[i].key);
-        if (k == want) return &g_mtx_map[i];
-        if (!k) return NULL;
+    for (mtx_entry *e = atomic_load(&g_mtx_bucket[mtx_hash(want, MTX_BUCKET_BITS)]); e; e = e->next)
+        if (atomic_load(&e->key) == want) return e;
+    return NULL;
+}
+static mtx_entry *mtx_entry_for(void *g) {
+    mtx_entry *e = mtx_find(g);
+    if (e) return e;
+    uintptr_t want = (uintptr_t)g;
+    unsigned b = mtx_hash(want, MTX_BUCKET_BITS);
+    // Built outside the writer's turn: malloc has locks of its own.
+    mtx_entry *made = calloc(1, sizeof *made);
+    pthread_mutex_t *fresh = mtx_make();
+    int mine = mtx_bucket_take(b);
+    mtx_entry *freed = NULL;
+    for (e = atomic_load(&g_mtx_bucket[b]); e; e = e->next) {
+        uintptr_t k = atomic_load(&e->key);
+        if (k == want) break;                           // another thread was first
+        if (!k && !freed) freed = e;
     }
+    if (!e && mine && freed) {
+        // Take over a destroyed mutex's entry. Its host mutex stays: destroy
+        // left it unlocked (klb_pthread_mutex_destroy), and nothing waits on it.
+        atomic_store(&freed->owner, NULL);
+        atomic_store(&freed->locksite, NULL);
+        atomic_store(&freed->depth, 0);
+        atomic_store(&freed->key, want);
+        e = freed;
+    }
+    if (!e && made && fresh) {
+        atomic_store(&made->m, fresh);
+        atomic_store(&made->key, want);
+        mtx_entry *head = atomic_load(&g_mtx_bucket[b]);
+        do { made->next = head; }
+        while (!atomic_compare_exchange_weak(&g_mtx_bucket[b], &head, made));
+        atomic_fetch_add(&g_mtx_entries, 1);
+        e = made; made = NULL; fresh = NULL;
+    }
+    if (mine) atomic_store(&g_mtx_bucket_busy[b], 0);
+    free(made);
+    if (fresh) { pthread_mutex_destroy(fresh); free(fresh); }
+    if (!e) {
+        // Out of memory for an entry: one mutex shared by whoever gets here is
+        // better than a NULL the callers do not expect.
+        static mtx_entry last_resort;
+        if (!atomic_load(&last_resort.m)) {
+            pthread_mutex_t *m = mtx_make(), *expect = NULL;
+            if (!atomic_compare_exchange_strong(&last_resort.m, &expect, m) && m) {
+                pthread_mutex_destroy(m); free(m);
+            }
+        }
+        static _Atomic int said;
+        if (atomic_fetch_add(&said, 1) == 0)
+            fprintf(stderr, "  [klb] no memory for a mutex entry — sharing one fallback "
+                            "mutex; sync correctness degraded\n");
+        e = &last_resort;
+    }
+    return e;
 }
 
 // ---------- rwlocks: address-keyed, for the mutex map's reason ----------
@@ -290,7 +327,7 @@ typedef struct {
     _Atomic(uintptr_t)          key;
     _Atomic(pthread_rwlock_t *) l;
 } rwl_entry;
-static rwl_entry g_rwl_map[MTX_MAP_SIZE];
+static rwl_entry g_rwl_map[AUX_MAP_SIZE];
 static rwl_entry g_rwl_overflow;
 
 static pthread_rwlock_t *rwl_make(void) {
@@ -302,7 +339,7 @@ static rwl_entry *rwl_entry_for(void *g) {
     uintptr_t want = (uintptr_t)g;
     pthread_rwlock_t *fresh = NULL;
     unsigned probes = 0;
-    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
+    for (unsigned i = mtx_hash(want, AUX_MAP_BITS); ; i = (i + 1) & (AUX_MAP_SIZE - 1)) {
         uintptr_t k = atomic_load(&g_rwl_map[i].key);
         if (k == want) {
             if (fresh) { pthread_rwlock_destroy(fresh); free(fresh); }
@@ -310,15 +347,15 @@ static rwl_entry *rwl_entry_for(void *g) {
         }
         if (k) {
             // A full table degrades to one shared lock rather than probing forever.
-            if (++probes >= MTX_MAP_SIZE) {
+            if (++probes >= AUX_MAP_SIZE) {
                 pthread_rwlock_t *expect_l = NULL;
                 if (!fresh) fresh = rwl_make();
                 if (!atomic_compare_exchange_strong(&g_rwl_overflow.l, &expect_l, fresh) && fresh)
                     { pthread_rwlock_destroy(fresh); free(fresh); }
                 static _Atomic int said;
                 if (atomic_fetch_add(&said, 1) == 0)
-                    fprintf(stderr, "  [klb] rwlock table FULL (%d slots) — sharing one fallback "
-                                    "lock; sync correctness degraded\n", MTX_MAP_SIZE);
+                    fprintf(stderr, "  [klb] rwlock table FULL (%u slots) — sharing one fallback "
+                                    "lock; sync correctness degraded\n", AUX_MAP_SIZE);
                 return &g_rwl_overflow;
             }
             continue;
@@ -475,7 +512,7 @@ static void *cnd_watchdog(void *arg) {
         nanosleep(&s, NULL);
         uint64_t now = cnd_now_ns();
         int shown = 0, total_waiters = 0;
-        for (unsigned i = 0; i < MTX_MAP_SIZE; i++) {
+        for (unsigned i = 0; i < AUX_MAP_SIZE; i++) {
             int w = atomic_load(&g_cnd_map[i].waiters);
             if (w <= 0) continue;
             total_waiters += w;
@@ -538,12 +575,28 @@ static void *cnd_watchdog(void *arg) {
     }
     return NULL;
 }
+// Whether this run keeps the account of who waits on what (KL_TRACE_CONDDUMP):
+// the watchdog above while it runs, and kl_pthread_exit_report when the player
+// gives up on it. On without being asked for three development targets that
+// stopped with every thread waiting. For an installed game it is a switch in
+// the start window (Advanced > Diagnostics, KleptonDiagnostics), off unless a
+// player turns it on for the game that stops on them — Marvel's Deadpool VR
+// was listed here by name for a few days of 2026-10, which gave every player
+// of it the account in their log (see klb_pthread_mutex_destroy for the stop
+// it was after).
+int kl_pthread_stuck_diag(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        int dflt = t && (strcmp(t, "wrath2") == 0 || strcmp(t, "wanderer") == 0 ||
+                         strcmp(t, "twd2") == 0);
+        on = kl_env_on("KL_TRACE_CONDDUMP", dflt);
+    }
+    return on;
+}
 static void cnd_watchdog_launch(void) {
-    extern const char *kl_driver_target_name(void);
-    const char *t = kl_driver_target_name();
-    int dflt = t && (strcmp(t, "wrath2") == 0 || strcmp(t, "wanderer") == 0 ||
-                     strcmp(t, "twd2") == 0);
-    if (!kl_env_on("KL_TRACE_CONDDUMP", dflt)) return;
+    if (!kl_pthread_stuck_diag()) return;
     pthread_t th;
     if (pthread_create(&th, NULL, cnd_watchdog, NULL) == 0) pthread_detach(th);
 }
@@ -618,7 +671,7 @@ int klb_pthread_mutex_init(void *m, const void *a) {
     atomic_store(&e->owner, NULL);
     atomic_store(&e->locksite, NULL);
     atomic_store(&e->depth, 0);
-    mtx_log("init", m, (uint32_t)(e - g_mtx_map));
+    mtx_log("init", m, mtx_hash((uintptr_t)m, MTX_BUCKET_BITS));
     return 0;
 }
 int klb_pthread_mutex_lock(void *m) {
@@ -660,10 +713,37 @@ int klb_pthread_mutex_trylock(void *m) {
     }
     return r;
 }
+// Destroy frees the entry for the next mutex of its bucket; it does not take
+// it out of anything.
+//
+// In the probed table this used to clear a slot, and that cuts every probe
+// chain running through the slot: a mutex stored behind it is no longer found,
+// the next call for it — the unlock of a holder, or the unlock after a cond
+// wait — makes a second entry in the gap and unlocks that one, and the first
+// host mutex stays locked for good with its key still in the table. Nothing
+// goes wrong until the gap is filled by some other mutex; then a new mutex at
+// that address is the stranded one, held by a thread that released it long
+// ago, and whoever locks it next waits for ever with every other thread idle.
+// Unreal destroys a critical section with every object that carries one, so a
+// level change is where it happens. Marvel's Deadpool VR stopped in a loading
+// screen that way at a different point of the game each time, and went through
+// on the next try (2026-10-12; tests/t_mtxtable.c is the sequence).
+//
+// The host mutex goes with the entry to whoever takes it over, unless it is
+// still held: a guest may destroy a mutex it never unlocked, and the next one
+// must not start out locked.
 int klb_pthread_mutex_destroy(void *p) {
     mtx_log("destroy", p, 0);
     mtx_entry *e = mtx_find(p);
-    if (e) atomic_store(&e->key, 0);    // host leaks; it may be held
+    if (!e) return 0;
+    if (atomic_load(&e->depth) > 0) {
+        pthread_mutex_t *fresh = mtx_make();
+        if (fresh) atomic_store(&e->m, fresh);   // the held one leaks
+    }
+    atomic_store(&e->owner, NULL);
+    atomic_store(&e->locksite, NULL);
+    atomic_store(&e->depth, 0);
+    atomic_store(&e->key, 0);
     return 0;
 }
 
@@ -713,6 +793,8 @@ static void dump_thread_stack(FILE *out, void *pt) {
 
 static void kl_tsd_report(FILE *out);    // defined with the key table below
 
+unsigned kl_pthread_mutex_entries(void) { return atomic_load(&g_mtx_entries); }
+
 void kl_pthread_report(FILE *out) {
     // The TSD ceiling, first, because a guest that hit it is already broken in
     // a way nothing else in this dump names: pthread_key_create hands back
@@ -720,18 +802,23 @@ void kl_pthread_report(FILE *out) {
     // frames later on a NULL from getspecific. Asgard's Wrath 2 died exactly
     // that way (FPhysXCPUDispatcher::submitTask, key -1, SIGSEGV at 0x84).
     kl_tsd_report(out);
-    fprintf(out, "-- mutex owners (kl_pthread address map) --\n");
+    fprintf(out, "-- mutex owners (kl_pthread address map, %u entries in %u buckets) --\n",
+            kl_pthread_mutex_entries(), MTX_BUCKETS);
     unsigned shown = 0;
-    for (uint32_t i = 0; i < MTX_MAP_SIZE; i++) {
-        void *owner = atomic_load(&g_mtx_map[i].owner);
+    for (uint32_t i = 0; i < MTX_BUCKETS; i++)
+    for (mtx_entry *e = atomic_load(&g_mtx_bucket[i]); e; e = e->next) {
+        void *owner = atomic_load(&e->owner);
         if (!owner) continue;
+        int alive = thread_is_alive(owner);
         const char *nm = thread_name_of(owner);
         fprintf(out, "  guest %p: held by tid %p%s%s%s (locked from %p)\n",
-                (void *)atomic_load(&g_mtx_map[i].key), owner,
+                (void *)atomic_load(&e->key), owner,
                 nm ? " [" : "", nm ? nm : "", nm ? "]" : "",
-                thread_is_alive(owner) ? "" : "  ** EXITED **",
-                atomic_load(&g_mtx_map[i].locksite));
-        dump_thread_stack(out, owner);
+                alive ? "" : "  ** EXITED **",
+                atomic_load(&e->locksite));
+        // A thread that has exited has no stack to read, and its pthread_t is
+        // memory that may have been handed to something else since.
+        if (alive) dump_thread_stack(out, owner);
         shown++;
     }
     if (!shown) fprintf(out, "  (no tracked holders)\n");
@@ -771,6 +858,17 @@ void kl_pthread_report(FILE *out) {
         if (img) fprintf(out, "%s+0x%zx\n", img, off); else fprintf(out, "%p\n", ra);
         dump_thread_stack(out, tid);
     }
+}
+
+// The same account, written once as the app is about to leave — for the runs
+// kl_pthread_stuck_diag names. A game that has stopped in a loading screen is
+// ended by the player, not by a fault, so no report was ever written for it:
+// the log of such a run ended with the compositor's last healthy frame.
+void kl_pthread_exit_report(FILE *out) {
+    if (!out || !kl_pthread_stuck_diag()) return;
+    fprintf(out, "\n=== threads as the app leaves (KL_TRACE_CONDDUMP) ===\n");
+    kl_pthread_report(out);
+    fflush(out);
 }
 // bionic pthread_mutexattr_t is a plain int holding the type.
 int klb_pthread_mutexattr_init(int *a)            { *a = 0; return 0; }

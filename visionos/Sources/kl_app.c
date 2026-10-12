@@ -1117,6 +1117,9 @@ int kl_app_guest_quit_done(void) {
     extern int kl_sdl2_main_returned(void);
     return g_target && g_target->kind == KL_GUEST_SDL2 ? kl_sdl2_main_returned() : 0;
 }
+// What every guest thread was doing as the app leaves, into the log — only for
+// the targets whose runs keep that account (kl_pthread_stuck_diag).
+void kl_app_exit_report(void) { kl_pthread_exit_report(stderr); }
 int kl_app_guest_request_quit(void) {
     extern int kl_sdl2_send_quit(void);
     if (!g_target || g_target->kind != KL_GUEST_SDL2) return 0;

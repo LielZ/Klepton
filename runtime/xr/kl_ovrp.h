@@ -557,6 +557,10 @@ int  kl_ovrp_eye_layer_live(void);
 // Black behind the quads of a frame that has no eye picture (kl_ovrp.c).
 void kl_ovrp_set_eyeless_black(int on);
 int  kl_ovrp_eyeless_black(void);
+// 1 while the guest's frames carry a passthrough layer (kl_ovrp.c, "Insight
+// Passthrough"): the room is meant to show wherever the frame has no picture,
+// so no black goes behind it — neither the one above nor the mixed space's.
+int  kl_ovrp_passthrough_live(void);
 
 // How many swapchain stages we tell the guest it has (KL_OVRP_STAGES). The
 // answer to ovrp_GetEyeTextureStageCount, so it bounds every (eye, stage) key

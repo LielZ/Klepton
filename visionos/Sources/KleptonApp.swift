@@ -71,7 +71,14 @@ enum Immersive {
     // (kl_app_target_wants_full) and the rest .mixed with the room showing.
     // KL_FULL=1 is the full space again, for any target; KL_MIXED_BLACK=0 shows
     // the room in a mixed one, which is what judging how a scene sits wants.
-    static var mixed: Bool { !klEnvOn("KL_FULL", default: false) }
+    //
+    // The full space is also a SETTING since ("Frame rate: max. 120" in the
+    // start window, KleptonRendering.maxRate), off unless chosen and not
+    // offered to a mixed-reality game. KL_FULL in the environment still decides
+    // either way.
+    static var mixed: Bool {
+        !klEnvOn("KL_FULL", default: KleptonRendering.shared.wantsFullSpace)
+    }
     static var mixedBlack: Bool { mixed && klEnvOn("KL_MIXED_BLACK", default: true) }
     /// ...as it stood when the game was started: the compositor reads this from
     /// its own thread, and the choice is made once per run anyway.
@@ -141,6 +148,8 @@ enum Lifecycle {
             return
         }
         NSLog("[app] backgrounded — exiting (KL_EXIT_ON_BACKGROUND)")
+        kl_app_exit_report()
+        KleptonRendering.shared.rememberRun()
         // Flush before exit rather than relying on it. The guest's log is a
         // file in the container (kl_app.c redirects stdout/stderr there) and it
         // is the only account of the run that survives; `exit` does flush
@@ -404,6 +413,24 @@ struct PlayerSettingsView: View {
                                 ? klT(" From Beat Saber 1.45 on.", " Ab Beat Saber 1.45.") : ""))
                             .font(.callout).foregroundStyle(.secondary)
                     }
+                    // The same setting for a game that smooths its edges by
+                    // itself, with fewer samples (a Vulkan game; see
+                    // KleptonRendering.vkMsaa for when it is known).
+                    if rendering.offersVkMsaa {
+                        HStack {
+                            Text(klT("Edge smoothing", "Kantenglättung"))
+                            Picker(klT("Edge smoothing", "Kantenglättung"), selection: $rendering.vkMsaa) {
+                                Text(klT("As the game (\(KleptonRendering.vkGuestSamples)x)",
+                                         "Wie das Spiel (\(KleptonRendering.vkGuestSamples)x)")).tag(0)
+                                Text("4x").tag(4)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                        }
+                        Text(klT("Smooths jagged edges more than the game does by itself (MSAA). It costs some graphics time and memory, and the first start after a change compiles the game's shaders again, which stutters for a while. If the picture shows faults, set it back.",
+                                 "Glättet gezackte Kanten stärker, als das Spiel es von sich aus tut (MSAA). Kostet etwas Grafikzeit und Speicher, und beim ersten Start nach einer Änderung werden die Shader des Spiels neu übersetzt, was eine Weile ruckelt. Zeigt das Bild Fehler, wieder zurückstellen."))
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
                     HStack {
                         Text(klT("Resolution", "Auflösung"))
                         Slider(value: $rendering.renderScale, in: KleptonRendering.minRenderScale...1.0, step: 0.05)
@@ -416,6 +443,24 @@ struct PlayerSettingsView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            }
+            // For every game that opens an immersive space, Alyx included —
+            // except a mixed-reality one, whose room needs the mixed space.
+            if Immersive.wanted, !KleptonRendering.targetIsMixedReality {
+                GroupBox(klT("Frame rate", "Bildrate")) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Picker(klT("Frame rate", "Bildrate"), selection: $rendering.maxRate) {
+                            Text(klT("Up to 100", "Bis 100")).tag(100)
+                            Text(klT("Up to 120", "Bis 120")).tag(120)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        Text(klT("Up to 100 is the default. Up to 120 is smoother where the game manages it and the Vision Pro's display can do it. When a game cannot keep up, the Vision Pro halves the rate for a while: to 50 from 100, to 60 from 120.",
+                                 "Bis 100 ist der Standard. Bis 120 ist flüssiger, wo das Spiel es schafft und das Display der Vision Pro es kann. Kommt ein Spiel nicht mit, halbiert die Vision Pro die Rate eine Weile: von 100 auf 50, von 120 auf 60."))
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             // Alyx hides the player's arms whatever this says (see
             // KleptonChroma.upperLimbVisibility), so the switch would be a lie there.
@@ -466,6 +511,7 @@ struct PlayerSettingsView: View {
 
 struct BootView: View {
     @State private var log = ""
+    @AppStorage(KleptonDiagnostics.waitersKey) private var diagWaiters = false
     @State private var status = "idle"
     @State private var running = false
     @State private var finished = false
@@ -790,6 +836,11 @@ struct BootView: View {
                             }
                             DisclosureGroup(klT("Diagnostics", "Diagnose")) {
                                 VStack(alignment: .leading, spacing: 10) {
+                                    Toggle(klT("Record what the game waits for", "Aufzeichnen, worauf das Spiel wartet"),
+                                           isOn: $diagWaiters)
+                                    Text(klT("For a game that stops in a loading screen. Every few seconds the log notes which parts of the game are waiting for what, and a report of all of them is written when you leave the game. Leave the game while it is stuck and pass the log on before you start it again. Takes effect the next time the app starts.",
+                                             "Für ein Spiel, das in einem Ladebildschirm stehen bleibt. Alle paar Sekunden steht im Protokoll, welche Teile des Spiels worauf warten, und beim Verlassen wird ein Bericht über alle geschrieben. Das Spiel verlassen, während es hängt, und das Protokoll weitergeben, bevor es neu gestartet wird. Wirkt beim nächsten Start der App."))
+                                        .font(.caption).foregroundStyle(.secondary)
                                     Text(status).font(.footnote).foregroundStyle(.secondary)
                                     if !log.isEmpty {
                                         ShareLink(item: log) {
@@ -990,6 +1041,8 @@ struct BootView: View {
         // Before configure, which is where the runtime starts reading its
         // environment.
         klAlyxApply()
+        KleptonRendering.shared.applyEnvironment()
+        KleptonDiagnostics.applyEnvironment()
         // On the main run loop: the thread below is inside kl_app_boot for as
         // long as there is anything to show, and a timer of its own would not
         // fire until it came back.

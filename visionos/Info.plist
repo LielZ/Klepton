@@ -31,6 +31,10 @@
 	<string>$(KL_FOVEATION_DEFAULT)</string>
 	<key>KLFoveationReset</key>
 	<string>$(KL_FOVEATION_RESET)</string>
+	<key>KLVkMsaaDefault</key>
+	<string>$(KL_VK_MSAA_DEFAULT)</string>
+	<key>KLOutputDefault</key>
+	<string>$(KL_OUTPUT_DEFAULT)</string>
 	<key>KLStartScreen</key>
 	<string>$(KL_START_SCREEN)</string>
 	<key>KLMetaApkID</key>

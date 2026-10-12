@@ -2299,8 +2299,18 @@ final class KleptonCompositor {
         // colour that changes on a known period can: if it cycles, our
         // content is being composited and the question moves to what we
         // draw; if it is a steady anything, it is not ours at all.
+        // ...and to nothing at all while the guest is in its own mixed reality
+        // (kl_ovrp_passthrough_live): the eye pass then discards every pixel
+        // that holds nothing of the game's, and what a discarded pixel keeps
+        // is this clear. The system shows the room by itself only where a
+        // whole block of the drawable has no depth; inside a block that also
+        // holds a piece of the game it composites the colour, and opaque
+        // black there was a black fringe out to the block's edge all around
+        // the game's world ("am Rand der 3D Welt gibt es überall schwarze
+        // Ränder", 2026-10-12).
         pass.colorAttachments[0].clearColor  = probe == 1
-            ? Self.cyclingClear() : MTLClearColorMake(0, 0, 0, 1)
+            ? Self.cyclingClear()
+            : MTLClearColorMake(0, 0, 0, kl_ovrp_passthrough_live() != 0 ? 0 : 1)
         if firstMap.textureIndex < drawable.depthTextures.count {
             pass.depthAttachment.texture     = drawable.depthTextures[firstMap.textureIndex]
             pass.depthAttachment.loadAction  = .clear
@@ -2886,7 +2896,10 @@ final class KleptonCompositor {
         // position carries the quad's real distance, so what lands in the
         // buffer is where the panel actually is.
         if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
-        if writeDepth, kl_ovrp_eyeless_black() != 0 || (backdrop && mixedBlack) {
+        // ...unless the guest is in its own mixed reality (a passthrough layer in
+        // its frames, kl_ovrp_passthrough_live): there the room is the backdrop.
+        if writeDepth, kl_ovrp_passthrough_live() == 0,
+           kl_ovrp_eyeless_black() != 0 || (backdrop && mixedBlack) {
             encodeBlackBackdrop(enc, pipe: pipe, viewIndices: viewIndices, drawable: drawable,
                                 originFromHead: originFromHead)
         }

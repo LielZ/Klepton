@@ -73,6 +73,14 @@ int   kl_vulkan_available(void);
 // chose GLES would answer false here, correctly.
 int kl_vulkan_guest_active(void);
 
+// Edge smoothing for a Vulkan guest (KL_VK_FORCE_SAMPLES in kl_vulkan.c). The
+// first is how many samples the guest itself asked for on its eye-sized
+// multisampled targets in this run, 0 if it made none; the second is the
+// start window's setting — 4 to raise them to four, 0 to leave them — and has
+// to be given before the guest makes its first Vulkan call.
+int  kl_vulkan_guest_samples(void);
+void kl_vulkan_set_force_samples_default(int samples);
+
 // The 8-byte LUID of the GPU the guest's Vulkan instance sees, for ovrp_GetDisplay
 // AdapterId2 to hand back so Unity's OculusXR device match picks the right (only)
 // VkPhysicalDevice instead of a NULL one. Fills out[8] and returns 1 when a Vulkan

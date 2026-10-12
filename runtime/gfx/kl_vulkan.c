@@ -3999,6 +3999,46 @@ static int klvk_astc_sub_has(VkImage img) {
     pthread_mutex_unlock(&g_astc_sub_lock);
     return found;
 }
+// KL_VK_FORCE_SAMPLES=4: every multisampled thing the guest makes with fewer
+// samples is made with this many — its images, the attachments of its render
+// passes and its pipelines, which are the three places a sample count is
+// stated and have to agree. A guest picks its count from its own settings (an
+// Unreal title: r.MobileMSAA in a device profile inside its paks), and where
+// those cannot be reached this is how the picture gets smoother edges anyway.
+// Single-sampled things are never touched, so what is resolved into, sampled
+// and presented stays as it was. Marvel's Deadpool VR renders 2x; its settings
+// are in an encrypted pak, and an Engine.ini beside its saved game asking for
+// 4x changed nothing (2026-10-12). Unset or 0: off. Only 4 is taken — it is
+// the most this GPU offers.
+//
+// The setting in the start window is its default (kl_vulkan_set_force_samples_default),
+// offered there for a game seen to multisample with fewer — which is what
+// kl_vulkan_guest_samples is for: the count the guest itself asked for on its
+// large targets, before anything here raised it.
+static int g_force_samples_default;
+void kl_vulkan_set_force_samples_default(int samples) {
+    g_force_samples_default = samples == 4 ? 4 : 0;
+}
+//
+// Never past KL_VK_MAX_SAMPLES: a game that is told the device offers two is
+// told so because four did not fit (AC Nexus), and it is not offered the
+// setting either — kl_vulkan_guest_samples answers 0 for it.
+static uint32_t klvk_sample_mask(void);
+static int g_guest_samples;
+int kl_vulkan_guest_samples(void) {
+    return klvk_sample_mask() == ~0u ? __atomic_load_n(&g_guest_samples, __ATOMIC_RELAXED) : 0;
+}
+static VkSampleCountFlagBits klvk_raise_samples(VkSampleCountFlagBits s) {
+    static int v = -1;
+    if (v < 0) {
+        v = kl_env_int("KL_VK_FORCE_SAMPLES", g_force_samples_default);
+        if (v != 4 || klvk_sample_mask() != ~0u) v = 0;
+        if (v) VKI("KL_VK_FORCE_SAMPLES=%d: the guest's multisampled images, render passes "
+                   "and pipelines are made with %d samples\n", v, v);
+    }
+    return v && (unsigned)s > 1 && (unsigned)s < (unsigned)v ? (VkSampleCountFlagBits)v : s;
+}
+
 static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkImage *out) {
     KFE(KFE_IMG_NEW);
@@ -4073,6 +4113,15 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
             VKI("[test] ASTC fmt->RGBA8 substitute (%ux%u) — ASTC bytes will land as "
                 "garbled colour; world colourful => gray was ASTC decode\n",
                 ci->extent.width, ci->extent.height); }
+    }
+    // The guest's own count on an eye-sized target, for the start window.
+    if (ci && (unsigned)ci->samples > 1 && ci->extent.width >= 1024 && ci->extent.height >= 1024 &&
+        (int)ci->samples > __atomic_load_n(&g_guest_samples, __ATOMIC_RELAXED))
+        __atomic_store_n(&g_guest_samples, (int)ci->samples, __ATOMIC_RELAXED);
+    if (ci && klvk_raise_samples(ci->samples) != ci->samples) {
+        if (ci != &mod) mod = *ci;
+        mod.samples = klvk_raise_samples(mod.samples);
+        ci = &mod;
     }
     VkResult r = real(dev, ci, alloc, out);
     // MoltenVK rejects some formats outright (Wanderer: VK_FORMAT_ASTC_8x8_UNORM/
@@ -4776,6 +4825,36 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         VKI("CreateGraphicsPipelines: rasterizationSamples 0 read as 1 on %d "
             "pipeline(s) — Metal rejects the zero that Linux drivers accept\n", zero_samples); }
 
+    // KL_VK_FORCE_SAMPLES (see klvk_raise_samples). A sample mask comes with
+    // the count: one written for two samples leaves the added ones switched
+    // off, which is four samples of memory for two of coverage — so its
+    // pattern is repeated over them (all-on stays all-on).
+    VkSampleMask *masks = NULL;
+    for (uint32_t i = 0; ci && i < n; i++) {
+        const VkPipelineMultisampleStateCreateInfo *m =
+            mod && mod[i].pMultisampleState ? mod[i].pMultisampleState : ci[i].pMultisampleState;
+        if (!m) continue;
+        VkSampleCountFlagBits want = klvk_raise_samples(m->rasterizationSamples);
+        if (want == m->rasterizationSamples) continue;
+        if (!mod) {
+            mod = malloc((size_t)n * sizeof *mod);
+            if (!mod) break;
+            memcpy(mod, ci, (size_t)n * sizeof *mod);
+        }
+        if (!mss && !(mss = malloc((size_t)n * sizeof *mss))) break;
+        if (m != &mss[i]) mss[i] = *m;
+        if (mss[i].pSampleMask) {
+            if (!masks && !(masks = malloc((size_t)n * sizeof *masks))) break;
+            unsigned had = (unsigned)mss[i].rasterizationSamples;
+            VkSampleMask bits = mss[i].pSampleMask[0] & ((1u << had) - 1), wide = 0;
+            for (unsigned at = 0; at < (unsigned)want; at += had) wide |= bits << at;
+            masks[i] = wide;
+            mss[i].pSampleMask = &masks[i];
+        }
+        mss[i].rasterizationSamples = want;
+        mod[i].pMultisampleState = &mss[i];
+    }
+
     // KL_VK_PIPE_TRACE (default ON for wrath2): one UE4 warmup pipeline wedges
     // MoltenVK's Metal compiler forever (MVKMetalCompiler::compile never returns),
     // and the existing warmup counter only logs on EXIT, so the hung pipeline is
@@ -4812,7 +4891,7 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines0(VkDevice dev,
         if (!left) r = VK_SUCCESS;
     }
     if (pipe_trace) { VKI("pipe-trace: DONE through #%llu (r=%d)\n", g_pipe_enter, (int)r); fflush(stderr); }
-    free(mod); free(ias); free(mss);
+    free(mod); free(ias); free(mss); free(masks);
     if (fixed) { static int said; if (said < 8) { said++;
         VKI("CreateGraphicsPipelines: forced primitiveRestartEnable=TRUE on %d "
             "strip pipeline(s) MoltenVK would otherwise reject (invisible "
@@ -5736,6 +5815,19 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
         VkRenderPass *out) {
     static PFN_vkCreateRenderPass real;
     if (!real && real_gdpa) real = (PFN_vkCreateRenderPass)real_gdpa(dev, "vkCreateRenderPass");
+    // KL_VK_FORCE_SAMPLES, on a copy (see klvk_raise_samples).
+    VkAttachmentDescription *raised = NULL;
+    VkRenderPassCreateInfo rci;
+    for (uint32_t i = 0; ci && i < ci->attachmentCount; i++) {
+        if (klvk_raise_samples(ci->pAttachments[i].samples) == ci->pAttachments[i].samples) continue;
+        if (!raised) {
+            raised = malloc(ci->attachmentCount * sizeof *raised);
+            if (!raised) break;
+            memcpy(raised, ci->pAttachments, ci->attachmentCount * sizeof *raised);
+        }
+        raised[i].samples = klvk_raise_samples(raised[i].samples);
+    }
+    if (raised) { rci = *ci; rci.pAttachments = raised; ci = &rci; }
     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
     if (ci && out && r == VK_SUCCESS && klvk_profile())
         for (uint32_t i = 0; i < ci->attachmentCount; i++)
@@ -5763,6 +5855,7 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
                     k, d->pInputAttachments[k].attachment, (int)d->pInputAttachments[k].layout);
         }
     }
+    free(raised);
     return r;
 }
 static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev,
@@ -5826,6 +5919,17 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev,
                         probe_att, msaa_forced);
             } else { free(atts); atts = NULL; }
         }
+    }
+    // KL_VK_FORCE_SAMPLES, on the same copy (see klvk_raise_samples).
+    for (uint32_t i = 0; ci && i < ci->attachmentCount; i++) {
+        if (klvk_raise_samples(ci->pAttachments[i].samples) == ci->pAttachments[i].samples) continue;
+        if (!atts) {
+            atts = malloc(ci->attachmentCount * sizeof *atts);
+            if (!atts) break;
+            memcpy(atts, ci->pAttachments, ci->attachmentCount * sizeof *atts);
+            ci2 = *ci; ci2.pAttachments = atts; ci = &ci2;
+        }
+        atts[i].samples = klvk_raise_samples(atts[i].samples);
     }
     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
     if (ci && out && r == VK_SUCCESS && klvk_profile())

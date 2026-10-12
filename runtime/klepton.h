@@ -231,6 +231,14 @@ void kl_shim_set_guest_gl(kl_image *img);
 // mutex and from where it was locked. Called from t_boot's fault handler so
 // a hang names the contested mutex's owner, not just its waiters.
 void kl_pthread_report(FILE *out);
+// How many entries the mutex table has ever made (a destroyed mutex's entry is
+// taken over, not made again) — what says whether the table is holding a
+// guest's working set or every address it ever used.
+unsigned kl_pthread_mutex_entries(void);
+// kl_pthread_report as the app leaves, for the targets whose runs keep that
+// account (kl_pthread_stuck_diag); nothing for any other.
+int  kl_pthread_stuck_diag(void);
+void kl_pthread_exit_report(FILE *out);
 
 // XR_KHR_android_thread_settings (kl_pthread.c): raise a guest-flagged
 // scheduling-critical thread to USER_INTERACTIVE QoS so a streaming guest's

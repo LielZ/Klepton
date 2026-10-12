@@ -1072,6 +1072,11 @@ STORE_DEFAULTS = {
     # Its Unity decodes with no surface and uploads the bytes itself, like
     # Arkham Shadow's, which is the path that is served.
     "x5812519008825194": {"video": True},
+    # Marvel's Deadpool VR. Edge smoothing at 4x: the game renders 2x, its
+    # settings are out of reach in an encrypted pak, and on device (Vision Pro
+    # M5, 2026-10-12) 4x cost no frame time that could be told from the spread
+    # between runs, and about 0.2 GB at 5 GB.
+    "x3240283705987790": {"vk_msaa": 4},
     # Eye of the Temple. Foveated rendering off by default: in this game the
     # fixed sharp patch is very plainly visible and buys hardly any frame time
     # (the author on a headset, 2026-10-12), so the picture wins.
@@ -1250,6 +1255,22 @@ def resolve(name):
     # its default changes and the players it already has should get the new
     # one. 0: a stored choice is never touched.
     t.setdefault("foveation_reset", 0)
+    # Edge smoothing for a Vulkan guest that multisamples by itself with fewer
+    # samples (KL_VK_FORCE_SAMPLES): 0 leaves the game's own count, 4 raises it.
+    # 0 unless a game is named below, and it is named once it has been played
+    # that way: a multisampled target is real memory here, and a game near the
+    # process limit is ended at its first load by the difference (AC Nexus at
+    # 4x was, which is why it is told the device offers two).
+    t.setdefault("vk_msaa", 0)
+    # How finely the compositor puts the finished picture on the display
+    # (KL_CP_QUALITY): "light" 0.40, "standard" 0.52, "full" 1.0. Light for
+    # everything whose picture is capped below what the display asks for even
+    # then (4633 px across at 0.40, against caps of 4000 and less) — for those
+    # it only makes the compositor's own pass cheaper. The games that render at
+    # the display's size get a smaller picture with it, so they stay at full,
+    # and so does Steam Link, whose picture is as large as the computer sends it.
+    t.setdefault("output", "full" if name in ("beatsaber", "beatsaber140", "doom3quest")
+                                     or name.startswith("steamlink") else "light")
     # How a plain gamepad's four face buttons are laid over Touch A/B/X/Y where
     # the default (cross=a, circle=b, square=x, triangle=y) puts an action under
     # the wrong thumb for this game. "" keeps the default.

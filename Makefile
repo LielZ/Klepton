@@ -463,6 +463,16 @@ build/t_ctr: tests/t_ctr.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 ctr: build/t_ctr
 	./build/t_ctr
 
+# The guest-mutex table under create/destroy churn (kl_pthread.c). The failure
+# it guards is a game that stops in a loading screen with every thread waiting,
+# on a headset, now and then; here it is a sequence of six calls.
+build/t_mtxtable: tests/t_mtxtable.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_mtxtable.c $(RUNTIME) $(LDLIBS)
+
+mtxtable: build/t_mtxtable
+	./build/t_mtxtable
+
 # The Linux ABI's veneers (thread pointer and svc), EXECUTED, on the same terms.
 build/t_lx: tests/t_lx.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 	@mkdir -p build
@@ -634,7 +644,7 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_mtxtable build/t_bcast build/t_fault build/t_glcaps
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
@@ -648,6 +658,8 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@head -1 build/softinput.log && tail -1 build/softinput.log
 	@./build/t_ctr > build/ctr.log 2>&1 || { cat build/ctr.log; exit 1; }
 	@head -2 build/ctr.log && tail -1 build/ctr.log
+	@./build/t_mtxtable > build/mtxtable.log 2>&1 || { cat build/mtxtable.log; exit 1; }
+	@head -1 build/mtxtable.log && tail -1 build/mtxtable.log
 	@./build/t_bcast > build/bcast.log 2>&1 || { cat build/bcast.log; exit 1; }
 	@head -1 build/bcast.log && tail -1 build/bcast.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }

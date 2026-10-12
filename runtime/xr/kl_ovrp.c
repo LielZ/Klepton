@@ -254,9 +254,9 @@ static uint64_t klovrp_no(const char *name) {
 }
 
 // Returns ovrpResult: -1004 UNSUPPORTED. For whole subsystems that genuinely do
-// not exist on this host (Insight Passthrough has no compositor path wired yet),
-// this is the honest answer and it prunes the entire follow-on subtree — the
-// guest sees init fail and never calls CreatePassthroughLayer et al.
+// not exist on this host (body and face tracking, parametric haptics), this is
+// the honest answer and it prunes the entire follow-on subtree — the guest sees
+// the first call fail and never makes the ones that would follow it.
 static uint64_t klovrp_unsupported(const char *name) {
     ovrp_hit(name);
     return OVRP_FAIL_UNSUPPORTED;
@@ -1364,6 +1364,12 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
         // resolution could be higher"). A light scene; the larger target is
         // the anti-aliasing it has.
         if (t && strcmp(t, "x6963344583787383") == 0) cap_dflt = 4000;
+        // TRIANGLE STRATEGY: a tabletop world looked at from close by, where
+        // 3072 read as too coarse ("Die Auflösung könnte höher sein",
+        // 2026-10-12, in its mixed-reality mode). At 3072x2464 with its own 4x
+        // multisampling the compositor kept 100 Hz with its pass queued 0.2 ms
+        // behind the game's, so there is room.
+        if (t && strcmp(t, "x5340130476095884") == 0) cap_dflt = 4000;
         // Beat Saber from 1.45 on (kl_guest_beatsaber_openxr) is the same case
         // in Unity: its camera target is a 4x multisampled multiview array,
         // which is attached single-sampled here (klgl_want_msrtt in kl_egl.c),
@@ -3166,6 +3172,9 @@ static void klovrp_census_submits(const void *layer_submits, int count);
 // ...and the overlay list a compositor draws on top of the eye picture.
 static void klovrp_record_overlays(const void *layer_submits, int count);
 static void klovrp_mirror_array_eyes(const void *layer_submits, int count);
+// ...and whether the list holds a passthrough layer — the guest's own mixed
+// reality, further down beside the eye-layer switch.
+static void klovrp_pt_submits(const void *layer_submits, int count);
 static void klovrp_mirror_enq_gl(void);
 static void klovrp_enq_age(void);
 
@@ -3511,6 +3520,7 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
         kl_ovrp_set_eyeless_black(named < 0);
     }
     klovrp_submit_eye_color(layer_submits, layer_submit_count);
+    klovrp_pt_submits(layer_submits, layer_submit_count);
 
     // BONELAB / the Vulkan path: this call IS the guest's assertion that it has
     // SUBMITTED the eye textures' drawing, so it is where they can be read back
@@ -5869,6 +5879,13 @@ static const char *klovrp_shape_name(int shape) {
     return (unsigned)shape < sizeof N / sizeof *N ? N[shape] : "?";
 }
 
+// ovrpShape: ReconstructionPassthrough (the whole view) and
+// SurfaceProjectedPassthrough (onto a mesh the guest hands over). The second
+// is treated as the first: where the eye picture is transparent the room
+// shows, whether or not the guest's mesh covers that spot — see "Insight
+// Passthrough" further down.
+static int klovrp_shape_is_passthrough(int shape) { return shape == 6 || shape == 7; }
+
 // The whole submit list, which nothing here has ever printed.
 //
 // Every other reader of this array walks past anything that is not the eye
@@ -6077,6 +6094,9 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
             }
         }
         if (!l || l->is_eye) continue;
+        // A passthrough layer has no picture of its own to composite — the
+        // room is the system's (klovrp_pt_submits).
+        if (klovrp_shape_is_passthrough(l->desc.shape)) continue;
         kl_ovrp_overlay *o = &tmp[n++];
         memset(o, 0, sizeof *o);
         o->layer_id = effective_id;
@@ -6274,6 +6294,197 @@ int kl_ovrp_eye_layer_live(void) { return g_eye_layer_live; }
 static int g_eyeless_black;
 void kl_ovrp_set_eyeless_black(int on) { g_eyeless_black = !!on; }
 int  kl_ovrp_eyeless_black(void) { return g_eyeless_black && !g_eye_layer_live; }
+
+// ---------------------------------------------------------------------------
+// Insight Passthrough — the guest's own mixed reality
+// ---------------------------------------------------------------------------
+// A Quest game asks for passthrough (ovrp_InitializeInsightPassthrough), sets
+// up a layer of a passthrough shape and submits it UNDER its eye layer; the
+// headset then shows the cameras' picture wherever the eye picture is
+// transparent. Nothing of that picture has to be made here: every game runs in
+// a mixed space, and the room is what the system shows wherever the composite
+// is transparent. So the passthrough layer itself is never drawn. While the
+// guest submits one,
+//   - the eye pass stops forcing the eye picture opaque and reads its alpha
+//     (kl_reproject_set_eye_alpha), and
+//   - the compositor leaves out the black it otherwise puts behind a frame
+//     that has no picture (kl_ovrp_passthrough_live, KleptonCompositor).
+// Without a passthrough layer in the list everything is as it was.
+//
+// Until this, every guest was told there is no passthrough (UNSUPPORTED, an
+// empty capability mask), and a game stayed in its ordinary mode. That is
+// still the answer wherever this is off.
+//   KL_OVRP_PASSTHROUGH=0|1 — default 1 for TRIANGLE STRATEGY
+//       (x5340130476095884), whose mixed-reality mode this was written for
+//       (2026-10-12), else 0: no other game has been seen with a "yes".
+//   KL_OVRP_PT_ALPHA=opaque|coverage|inverse — what the eye picture's alpha
+//       means while a passthrough layer is submitted. Default: read from the
+//       eye submit's flags — ovrpLayerSubmitFlag_InverseAlpha, which Unreal's
+//       Oculus plugin sets on Android when layers lie under the eye layer —
+//       and coverage without it.
+static int klovrp_pt_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_OVRP_PASSTHROUGH", t && !strcmp(t, "x5340130476095884"));
+        if (on)
+            fprintf(stderr, "  [ovrp] passthrough: offered to the guest — the room shows "
+                            "through the eye picture while it submits a passthrough layer\n");
+    }
+    return on;
+}
+
+// As far as the public header is remembered, and consistent with the 0x8
+// (NoDepth) every Unreal panel in the corpus submits: HeadLocked 1<<0,
+// ReverseZ 1<<2, NoDepth 1<<3, InverseAlpha 1<<4.
+#define KLOVRP_SUBMIT_INVERSE_ALPHA 0x10
+
+static int g_pt_init;                 // between Initialize- and ShutdownInsightPassthrough
+// EndFrames since a passthrough layer was last in the list. A few frames of
+// grace, so a list that leaves it out once does not flash black.
+#define KLOVRP_PT_GRACE_FRAMES 6
+static volatile unsigned g_pt_frames_since = 1000000u;
+int kl_ovrp_passthrough_live(void) { return g_pt_frames_since < KLOVRP_PT_GRACE_FRAMES; }
+
+static void klovrp_pt_submits(const void *layer_submits, int count) {
+    extern void kl_reproject_set_eye_alpha(int mode);
+    if (!klovrp_pt_on()) return;
+    const ovrp_layer_submit *const *list = layer_submits;
+    int pt = -1, eye = -1, shape = 0, eye_flags = 0, eye_fmt = -1;
+    for (int i = 0; list && i < count; i++) {
+        const ovrp_layer_submit *s = list[i];
+        if (!s) continue;
+        struct klovrp_layer *l = klovrp_layer(s->layer_id);
+        if (!l) continue;
+        if (l->is_eye) {
+            if (eye < 0) { eye = i; eye_flags = s->submit_flags; eye_fmt = l->desc.format; }
+        } else if (pt < 0 && klovrp_shape_is_passthrough(l->desc.shape)) {
+            pt = i; shape = l->desc.shape;
+        }
+    }
+    int was_live = kl_ovrp_passthrough_live();
+    if (pt >= 0) g_pt_frames_since = 0;
+    else if (g_pt_frames_since < 1000000u) g_pt_frames_since++;
+    int live = kl_ovrp_passthrough_live();
+
+    // 0 opaque, 1 coverage, 2 inverse — KL_EYE_ALPHA_* in kl_reproject.h.
+    static int forced = -2, mode, said_mode = -1;
+    if (forced == -2) {
+        const char *e = kl_env_str("KL_OVRP_PT_ALPHA", NULL);
+        forced = !e || !*e ? -1
+               : (!strcmp(e, "opaque") || !strcmp(e, "0")) ? 0
+               : (!strcmp(e, "inverse") || !strcmp(e, "2")) ? 2 : 1;
+    }
+    if (!live) {
+        mode = 0;
+    } else if (pt >= 0 && eye >= 0) {
+        // An eye format with no alpha channel samples as 1 everywhere, which
+        // read inversely would be a picture that is not there at all.
+        int no_alpha = eye_fmt == 3 || eye_fmt == 6 || eye_fmt == 7;
+        mode = no_alpha ? 0
+             : forced >= 0 ? forced
+             : (eye_flags & KLOVRP_SUBMIT_INVERSE_ALPHA) ? 2 : 1;
+        if (mode != said_mode) {
+            said_mode = mode;
+            static const char *const M[] = {
+                "left opaque", "read as coverage (1 = the game's picture)",
+                "read inversely (0 = the game's picture)" };
+            fprintf(stderr, "  [ovrp] passthrough: a %s layer is submitted %s the eye layer "
+                            "(%d and %d of %d) — the eye picture's alpha is %s; eye submit "
+                            "flags %#x, format %d%s%s\n",
+                    klovrp_shape_name(shape), pt < eye ? "under" : "OVER", pt + 1, eye + 1,
+                    count, M[mode], (unsigned)eye_flags, eye_fmt,
+                    no_alpha ? " (no alpha channel)" : "",
+                    forced >= 0 ? " (KL_OVRP_PT_ALPHA)" : "");
+        }
+    }
+    kl_reproject_set_eye_alpha(mode);
+    if (live != was_live) {
+        if (!live) said_mode = -1;
+        fprintf(stderr, "  [ovrp] passthrough: %s\n",
+                live ? "the guest's frames carry a passthrough layer — no black behind "
+                       "them, the room instead"
+                     : "no passthrough layer for a few frames — the eye picture is "
+                       "opaque again, black behind frames without one");
+    }
+}
+
+// The calls around it. Each is the old answer while passthrough is off.
+static uint64_t klovrp_InitializeInsightPassthrough(void) {
+    ovrp_hit("ovrp_InitializeInsightPassthrough");
+    if (!klovrp_pt_on()) return OVRP_FAIL_UNSUPPORTED;
+    if (!g_pt_init) fprintf(stderr, "  [ovrp] passthrough: initialised by the guest\n");
+    g_pt_init = 1;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_ShutdownInsightPassthrough(void) {
+    ovrp_hit("ovrp_ShutdownInsightPassthrough");
+    if (g_pt_init) fprintf(stderr, "  [ovrp] passthrough: shut down by the guest\n");
+    g_pt_init = 0;
+    return OVRP_SUCCESS;
+}
+// ovrpBool.
+static uint64_t klovrp_GetInsightPassthroughInitialized(void) {
+    ovrp_hit("ovrp_GetInsightPassthroughInitialized");
+    return klovrp_pt_on() && g_pt_init;
+}
+// ovrpResult, and the result IS the state: success once initialised.
+static uint64_t klovrp_GetInsightPassthroughInitializationState(void) {
+    ovrp_hit("ovrp_GetInsightPassthroughInitializationState");
+    if (!klovrp_pt_on()) return OVRP_FAIL_UNSUPPORTED;
+    return g_pt_init ? OVRP_SUCCESS : OVRP_FAIL_NOT_INITIALIZED;
+}
+// (int layerId, ovrpInsightPassthroughStyle style) — the style is larger than
+// two registers, so it arrives as a pointer to the caller's copy. Not read:
+// opacity, edge colour and colour map are properties of a camera picture that
+// is not drawn here.
+static uint64_t klovrp_SetInsightPassthroughStyle(int layer_id, const void *style) {
+    ovrp_hit("ovrp_SetInsightPassthroughStyle");
+    (void)layer_id; (void)style;
+    return klovrp_pt_on() ? OVRP_SUCCESS : OVRP_FAIL_UNSUPPORTED;
+}
+// Surface-projected passthrough: the guest's mesh, and its placements. Handles
+// are handed out and nothing is kept — see klovrp_shape_is_passthrough.
+//   ovrp_CreateInsightTriangleMesh(int layerId, float *vertices, int vertexCount,
+//                                  int *triangles, int triangleCount, uint64 *mesh)
+//   ovrp_AddInsightPassthroughSurfaceGeometry(int layerId, uint64 mesh,
+//                                  ovrpMatrix4f T (by reference), uint64 *instance)
+static uint64_t g_pt_next_handle = 1;
+static uint64_t klovrp_CreateInsightTriangleMesh(int layer_id, const float *vertices,
+                                                 int vertex_count, const int *triangles,
+                                                 int triangle_count, uint64_t *mesh) {
+    ovrp_hit("ovrp_CreateInsightTriangleMesh");
+    (void)layer_id; (void)vertices; (void)vertex_count; (void)triangles; (void)triangle_count;
+    if (!klovrp_pt_on()) return OVRP_FAIL_UNSUPPORTED;
+    if (!mesh) return OVRP_FAIL_INVALID_PARAM;
+    *mesh = g_pt_next_handle++;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_AddInsightPassthroughSurfaceGeometry(int layer_id, uint64_t mesh,
+                                                            const void *transform,
+                                                            uint64_t *instance) {
+    ovrp_hit("ovrp_AddInsightPassthroughSurfaceGeometry");
+    (void)layer_id; (void)mesh; (void)transform;
+    if (!klovrp_pt_on()) return OVRP_FAIL_UNSUPPORTED;
+    if (!instance) return OVRP_FAIL_INVALID_PARAM;
+    *instance = g_pt_next_handle++;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_pt_handle_call(const char *name) {
+    ovrp_hit(name);
+    return klovrp_pt_on() ? OVRP_SUCCESS : OVRP_FAIL_UNSUPPORTED;
+}
+static uint64_t klovrp_DestroyInsightTriangleMesh(uint64_t mesh) {
+    (void)mesh; return klovrp_pt_handle_call("ovrp_DestroyInsightTriangleMesh");
+}
+static uint64_t klovrp_DestroyInsightPassthroughGeometryInstance(uint64_t instance) {
+    (void)instance; return klovrp_pt_handle_call("ovrp_DestroyInsightPassthroughGeometryInstance");
+}
+static uint64_t klovrp_UpdateInsightPassthroughGeometryTransform(uint64_t instance,
+                                                                 const void *transform) {
+    (void)instance; (void)transform;
+    return klovrp_pt_handle_call("ovrp_UpdateInsightPassthroughGeometryTransform");
+}
 
 int kl_ovrp_overlay_count(void) {
     pthread_mutex_lock(&g_frames.mu);
@@ -8013,12 +8224,14 @@ KLOVRP_TRACKING_ABSENT(GetFaceTrackingEnabled)
 // Passthrough capabilities: a bitmask behind an out-param (ovrpPassthroughCapabilityFlags*)
 // and an ovrpResult return. Witchblood asks right after ovrp_InitializeInsightPassthrough
 // was refused, on its first composited frame, and with no entry point it stopped there
-// (2026-10-10). No passthrough here (see g_ovrp_result_unsupported), so the mask is
+// (2026-10-10). No passthrough for it (klovrp_pt_on), so the mask is
 // empty — not even the Passthrough bit — and the call itself succeeds, so a guest
 // that falls back on an UNSUPPORTED result has no second question to ask.
+// Where passthrough is offered: Passthrough (1<<0) and Color (1<<1) — the room
+// in a mixed space is in colour.
 static uint64_t klovrp_GetPassthroughCapabilityFlags(int *out) {
     ovrp_hit("ovrp_GetPassthroughCapabilityFlags");
-    if (out) *out = 0;
+    if (out) *out = klovrp_pt_on() ? 0x3 : 0;
     return OVRP_SUCCESS;
 }
 
@@ -8379,6 +8592,21 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetFaceTrackingEnabled", (void *)klovrp_GetFaceTrackingEnabled},
     {"ovrp_GetMixedRealityInitialized", (void *)klovrp_GetMixedRealityInitialized},
     {"ovrp_GetPassthroughCapabilityFlags", (void *)klovrp_GetPassthroughCapabilityFlags},
+    // Insight Passthrough — see klovrp_pt_on.
+    {"ovrp_InitializeInsightPassthrough", (void *)klovrp_InitializeInsightPassthrough},
+    {"ovrp_ShutdownInsightPassthrough", (void *)klovrp_ShutdownInsightPassthrough},
+    {"ovrp_GetInsightPassthroughInitialized", (void *)klovrp_GetInsightPassthroughInitialized},
+    {"ovrp_GetInsightPassthroughInitializationState",
+     (void *)klovrp_GetInsightPassthroughInitializationState},
+    {"ovrp_SetInsightPassthroughStyle", (void *)klovrp_SetInsightPassthroughStyle},
+    {"ovrp_CreateInsightTriangleMesh", (void *)klovrp_CreateInsightTriangleMesh},
+    {"ovrp_DestroyInsightTriangleMesh", (void *)klovrp_DestroyInsightTriangleMesh},
+    {"ovrp_AddInsightPassthroughSurfaceGeometry",
+     (void *)klovrp_AddInsightPassthroughSurfaceGeometry},
+    {"ovrp_DestroyInsightPassthroughGeometryInstance",
+     (void *)klovrp_DestroyInsightPassthroughGeometryInstance},
+    {"ovrp_UpdateInsightPassthroughGeometryTransform",
+     (void *)klovrp_UpdateInsightPassthroughGeometryTransform},
 };
 
     // Entry points answered by one of the shared handlers above. Each is reached
@@ -8392,8 +8620,6 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
 // the moment an entry point has an *out-parameter* — those must know where the
 // pointer is and what shape it points at, so they get real implementations.
 static const char *const g_ovrp_result_ok[] = {
-    // Tearing down a passthrough that never initialised trivially succeeds.
-    "ovrp_ShutdownInsightPassthrough",
 // Unity's native plugin interface. All void.
     "UnitySetGraphicsDevice", "UnitySetEventQueue", "UnityShaderCompilerExtEvent",
     "UnityRenderingExtEvent",
@@ -8671,8 +8897,6 @@ static const char *const g_ovrp_bool_yes[] = {
 };
 
 static const char *const g_ovrp_bool_no[] = {
-    // Passthrough never initialised (see g_ovrp_result_unsupported).
-    "ovrp_GetInsightPassthroughInitialized",
     // Unity asks OVRPlugin which rendering-extension hooks it wants (before/after
     // rendering events, etc.). Our replacement has no render-thread bookkeeping,
     // so "no" is the truthful answer — Unity then never issues the events.
@@ -8713,22 +8937,9 @@ static const char *const g_ovrp_bool_no[] = {
 };
 
 static const char *const g_ovrp_result_unsupported[] = {
-    // Insight Passthrough: Meta's camera-composited MR. Vision Pro's passthrough
-    // is the real environment of a mixed immersive space, but Klepton has no seam
-    // that turns the guest's ovrpInsightPassthroughLayer into a transparent
-    // compositor background yet — so init HONESTLY fails and the guest keeps its
-    // non-passthrough (opaque skybox) path instead of building MR layers we
-    // cannot fill. Flip this to success and wire the compositor if a target
-    // turns out to REQUIRE passthrough.
-    "ovrp_InitializeInsightPassthrough",
-    // ...and its progress, which a guest polls after asking for it. The call
-    // takes no argument and its result IS the state; UNSUPPORTED reads as
-    // failed, which agrees with the refused init.
-    "ovrp_GetInsightPassthroughInitializationState",
-    // TRIANGLE STRATEGY still sets a layer style after init is refused.
-    // This ovrpResult entry uses the same named UNSUPPORTED handler; neither
-    // its layer ID nor its input style is read and no passthrough is fabricated.
-    "ovrp_SetInsightPassthroughStyle",
+    // (Insight Passthrough was here — init, its state and the layer style. They
+    // have answers of their own now, which are still UNSUPPORTED for every
+    // guest passthrough is not offered to: klovrp_pt_on.)
     // Parametric haptics: a newer OVRPlugin's amplitude/frequency curves, next to
     // the buffered and PCM paths answered further up. Marvel's Deadpool VR asks
     // for the controller's parametric properties while it sets haptics up, and
