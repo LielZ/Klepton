@@ -352,6 +352,11 @@ int kl_glfb_rate_map_layers(void);
 // Will a guest whose eyes are copied out of an array swapchain be foveated this
 // run (see klfb_mirror_vrr)? Answerable before the guest boots.
 int kl_glfb_mirror_foveation_wanted(void);
+// A multiview attachment with multisampling (KL_GL_MSAA_MV), made through
+// ANGLE's own entry point; 0 when it was not made and the caller attaches
+// plain multiview instead.
+int kl_glfb_multiview_ms(uint32_t target, uint32_t attachment, uint32_t texture, int32_t level,
+                         int32_t samples, int32_t base_view, int32_t num_views);
 // The physical size of the map just given to kl_glfb_set_eye_rate_map (the
 // larger of its layers'), so a foveated eye is copied as what was written.
 void kl_glfb_set_eye_rate_physical(int pw, int ph);
@@ -561,6 +566,10 @@ int kl_glfb_foveation_wanted(int *zones, float *edge);
 // called. The visionOS app calls it with its stored setting before the guest
 // boots; an explicit `KL_VRR` still overrides either way.
 void kl_glfb_set_foveation_default(int on);
+// The app's "Edge smoothing" setting for a multisampled multiview guest
+// (kl_glfb_multiview_ms): 0 off, 2 or 4 samples, anything else the guest's own
+// count. Before the guest boots.
+void kl_glfb_set_msaa_default(int samples);
 
 // The rate layer's per-zone quality along one axis: 1.0 at the centre falling
 // linearly to `edge` at the border, `n` entries. Both axes get the same curve,

@@ -3763,9 +3763,21 @@ static void klfb_rate_rule_for_fbo(uint32_t fb);
 // are the eye swapchain's, and the only framebuffers the rate map is meant for.
 static void (*g_real_FramebufferTextureMultiviewOVR)(uint32_t, uint32_t, uint32_t, int32_t,
                                                       int32_t, int32_t);
+static int klfb_msaa_plain_samples(void);
 static void klfb_FramebufferTextureMultiviewOVR(uint32_t target, uint32_t attachment,
                                                 uint32_t texture, int32_t level,
                                                 int32_t base_view, int32_t num_views) {
+    // A guest that attaches its eyes as PLAIN multiview and is given edge
+    // smoothing by the setting (Doom 3 — see kl_glfb_multiview_ms): colour and
+    // depth-stencil both come through here, so both get the same sample count.
+    if (texture && num_views > 1 &&
+        (attachment == 0x8CE0 /* COLOR_ATTACHMENT0 */ || attachment == 0x8D00 /* DEPTH */ ||
+         attachment == 0x8D20 /* STENCIL */ || attachment == 0x821A /* DEPTH_STENCIL */)) {
+        int ms = klfb_msaa_plain_samples();
+        if (ms > 1 &&
+            kl_glfb_multiview_ms(target, attachment, texture, level, ms, base_view, num_views))
+            return;
+    }
     if (attachment == 0x8CE0 /* COLOR_ATTACHMENT0 */ && g_draw_fb < KLFB_RESYNC_FBOS &&
         target != 0x8CA8 /* READ_FRAMEBUFFER */) {
         g_fbo_multiview[g_draw_fb] =
@@ -3775,6 +3787,96 @@ static void klfb_FramebufferTextureMultiviewOVR(uint32_t target, uint32_t attach
     if (g_real_FramebufferTextureMultiviewOVR)
         g_real_FramebufferTextureMultiviewOVR(target, attachment, texture, level, base_view,
                                               num_views);
+}
+// The multisampled form of the same attachment, for a guest that asks for it
+// (GL_OVR_multiview_multisampled_render_to_texture): the two views are drawn
+// into a multisampled array and resolved into the texture's slices when the pass
+// ends. That needs an ANGLE whose Metal backend has the layered multisampled
+// pass (angle-patches/klepton.patch from this change on); an older one refuses
+// the call, which the first attachment finds out and remembers.
+//
+// Off unless asked for: the attachment stays plain multiview, as it always was.
+// In the app it is a SETTING (KleptonRendering, "Edge smoothing": off, 2x, 4x;
+// off unless a person turns it on — the owner's call after playing it: at the
+// display's full resolution 4x dropped a song to 60 Hz halfway through, so it
+// is an option for a lower resolution, not a default), handed over before the
+// guest boots: 2 or 4 is the sample count, anything else is off.
+// KL_GL_MSAA_MV=0|1 overrides the setting (1 without one: the guest's own
+// count), KL_GL_MSAA_MV_SAMPLES the sample count (2 or 4).
+// Returns 1 when the attachment was made here.
+static int g_msaa_default = -1;
+void kl_glfb_set_msaa_default(int samples) {
+    g_msaa_default = samples == 0 || samples == 2 || samples == 4 ? samples : -1;
+}
+// Which guests the setting is for, and how they attach their eyes:
+//   1  asks for the multisampled attachment itself — Beat Saber from 1.45 on and
+//      Maestro (both ask for 4 samples; read in their logs on the headset);
+//   2  attaches plain multiview and is upgraded (klfb_FramebufferTextureMultiviewOVR)
+//      — Doom 3, which takes the multisampled call only where it resolves, and it
+//      does not resolve for it here.
+static int klfb_msaa_guest(void) {
+    extern int kl_guest_beatsaber_openxr(void);
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    if (kl_guest_beatsaber_openxr()) return 1;
+    if (t && strcmp(t, "x6963344583787383") == 0) return 1;
+    if (t && strcmp(t, "doom3quest") == 0) return 2;
+    return 0;
+}
+static int g_msaa_on = -1, g_msaa_forced, g_msaa_kind;
+static void (*g_msaa_real)(uint32_t, uint32_t, uint32_t, int32_t, int32_t, int32_t, int32_t);
+static void klfb_msaa_init(void) {
+    if (g_msaa_on >= 0) return;
+    g_msaa_kind   = klfb_msaa_guest();
+    g_msaa_on     = kl_env_on("KL_GL_MSAA_MV", g_msaa_kind && g_msaa_default > 0);
+    g_msaa_forced = kl_env_int("KL_GL_MSAA_MV_SAMPLES", g_msaa_default > 0 ? g_msaa_default : 0);
+    if (g_msaa_on) g_msaa_real = asym("glFramebufferTextureMultisampleMultiviewOVR");
+    // Said once, whichever way it goes: a log then answers "was the picture
+    // multisampled in this run" without the picture.
+    const char *env = getenv("KL_GL_MSAA_MV");
+    fprintf(stderr, "  [glfb] edge smoothing: %s — setting %d (2 or 4 samples, else off), "
+                    "KL_GL_MSAA_MV %s, ANGLE entry point %s, guest kind %d\n",
+            !g_msaa_on ? "off" : g_msaa_real ? "on" : "off, this ANGLE has no entry point for it",
+            g_msaa_default, env ? env : "not set",
+            g_msaa_real ? "found" : g_msaa_on ? "missing" : "not asked", g_msaa_kind);
+}
+// The sample count a plain multiview attachment is upgraded to, 0 for none.
+static int klfb_msaa_plain_samples(void) {
+    klfb_msaa_init();
+    if (!g_msaa_on || !g_msaa_real || g_msaa_kind != 2) return 0;
+    return g_msaa_forced > 0 ? g_msaa_forced : 4;
+}
+int kl_glfb_multiview_ms(uint32_t target, uint32_t attachment, uint32_t texture, int32_t level,
+                         int32_t samples, int32_t base_view, int32_t num_views) {
+    static int dead, said;
+    klfb_msaa_init();
+    const int on = g_msaa_on, forced = g_msaa_forced;
+    void (*real)(uint32_t, uint32_t, uint32_t, int32_t, int32_t, int32_t, int32_t) = g_msaa_real;
+    if (!on || !real || dead || !texture || samples <= 1) return 0;
+    if (forced > 0) samples = forced;
+    if (samples <= 1) return 0;
+    if (attachment == 0x8CE0 /* COLOR_ATTACHMENT0 */ && g_draw_fb < KLFB_RESYNC_FBOS &&
+        target != 0x8CA8 /* READ_FRAMEBUFFER */) {
+        g_fbo_multiview[g_draw_fb] =
+            num_views > 1 ? (uint8_t)(num_views > 255 ? 255 : num_views) : 0;
+        klfb_rate_rule_for_fbo(g_draw_fb);
+    }
+    if (!said && a_glGetError) while (a_glGetError()) {}
+    real(target, attachment, texture, level, samples, base_view, num_views);
+    if (!said) {
+        // Asked once, on the first attachment: is this an ANGLE that takes it?
+        uint32_t err = a_glGetError ? a_glGetError() : 0;
+        said = 1;
+        if (err) {
+            dead = 1;
+            fprintf(stderr, "  [glfb] multisampled multiview: this ANGLE refuses it (0x%x) — "
+                            "attached as plain multiview\n", err);
+            return 0;
+        }
+        fprintf(stderr, "  [glfb] multisampled multiview: %d samples, %d views, attachment "
+                        "0x%x (KL_GL_MSAA_MV)\n", samples, num_views, attachment);
+    }
+    return 1;
 }
 static void klfb_BindFramebuffer(uint32_t target, uint32_t fb) {
     if (klfb_trace_fbo())

@@ -2339,7 +2339,8 @@ final class KleptonCompositor {
             // top (once it can allocate its layers). Draw them over the skybox so
             // the menu shows through instead of only the loading environment.
             _ = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
-                               originFromHead: originFromHead, writeDepth: true)
+                               originFromHead: originFromHead, writeDepth: true,
+                               backdrop: false)
             enc.endEncoding()
             return viewIndices.count
         }
@@ -2865,13 +2866,14 @@ final class KleptonCompositor {
                                 viewIndices: [Int],
                                 drawable: LayerRenderer.Drawable,
                                 originFromHead: simd_float4x4,
-                                writeDepth: Bool) -> Int {
+                                writeDepth: Bool,
+                                backdrop: Bool = true) -> Int {
         guard overlaysEnabled, let pipe = overlayPipeline else { return 0 }
         // .greater against that same clear, and the shader's own projected
         // position carries the quad's real distance, so what lands in the
         // buffer is where the panel actually is.
         if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
-        if writeDepth, kl_ovrp_eyeless_black() != 0 {
+        if writeDepth, kl_ovrp_eyeless_black() != 0 || (backdrop && mixedBlack) {
             encodeBlackBackdrop(enc, pipe: pipe, viewIndices: viewIndices, drawable: drawable,
                                 originFromHead: originFromHead)
         }
@@ -3010,6 +3012,18 @@ final class KleptonCompositor {
     // panel a guest places (its own are tens to a few hundred metres away) and
     // wide enough to fill the view, through the panels' own pipeline so that it
     // writes depth like they do.
+    //
+    // The same black in every mixed space (Immersive.mixedBlack — which is every
+    // game since they all open one): each frame without an eye picture gets it,
+    // whoever the guest is. Beat Saber 1.45 submits nothing for 17 to 50 frames
+    // at each change between menu and level, and the room showed through them.
+    // Not behind the loading panorama (encodeOverlays' `backdrop`), which is its
+    // own backdrop. Read once, at the first such frame.
+    private lazy var mixedBlack: Bool = {
+        let on = Immersive.mixedBlackAtBoot
+        if on { NSLog("[cp] mixed space: black wherever the guest shows no picture") }
+        return on
+    }()
     private var blackTexture: MTLTexture?
     private func encodeBlackBackdrop(_ enc: MTLRenderCommandEncoder,
                                      pipe: MTLRenderPipelineState,

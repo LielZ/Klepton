@@ -493,6 +493,10 @@ static void klgl_FramebufferTextureMultisampleMultiviewOVR(uint32_t target, uint
                                                            int32_t num_views) {
     static void (*plain)(uint32_t, uint32_t, uint32_t, int32_t, int32_t, int32_t);
     if (!plain) plain = kl_egl_sym("glFramebufferTextureMultiviewOVR");
+    // With KL_GL_MSAA_MV and an ANGLE that has the layered multisampled pass,
+    // the attachment is the real thing.
+    if (kl_glfb_multiview_ms(target, attachment, texture, level, samples, base_view, num_views))
+        return;
     static int said;
     if (!said++)
         fprintf(stderr, "  [gl] glFramebufferTextureMultisampleMultiviewOVR(samples=%d) is "

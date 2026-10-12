@@ -1301,7 +1301,7 @@ static int g_eye_h = (int)KL_OVRP_EYE_H;
 // defaulting to the target's own (targets.py "render_scale").
 static float g_render_scale_default = 1.0f;
 void kl_ovrp_set_render_scale_default(float s) {
-    if (s >= 0.4f && s <= 1.0f) g_render_scale_default = s;
+    if (s >= 0.2f && s <= 1.0f) g_render_scale_default = s;
 }
 
 void kl_ovrp_set_eye_texture_size(int w, int h) {
@@ -1404,7 +1404,7 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
     // twice, which is judder on every head turn. Kept even so the viewport
     // halves cleanly.
     float rs = kl_env_float("KL_OVRP_RENDER_SCALE", g_render_scale_default);
-    if (!(rs >= 0.4f && rs <= 1.0f)) rs = 1.0f;
+    if (!(rs >= 0.2f && rs <= 1.0f)) rs = 1.0f;   // the same floor as the setter's
     if (rs < 1.0f) {
         w = ((int)((float)w * rs + 0.5f) + 1) & ~1;
         h = ((int)((float)h * rs + 0.5f) + 1) & ~1;

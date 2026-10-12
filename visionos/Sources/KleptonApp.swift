@@ -57,17 +57,25 @@ enum Immersive {
         klEnvOn("KL_IMMERSIVE", default: kl_app_target_is_steamlink() == 0)
     }
 
-    // .mixed by default now that the picture works. The guest renders an opaque
-    // world so passthrough shows through nowhere it matters, and being able to
-    // see the room is worth a great deal while the thing being judged is how the
-    // scene SITS — scale, distance and IPD are all much easier to call against
-    // real surroundings than against a black void. KL_FULL=1 restores .full,
-    // which is what shipping a VR title eventually wants.
-    // The native OpenXR VR kind (GTA Vice City) is an in-world title and defaults
-    // to FULLY immersive — .mixed leaves its menu a window floating in passthrough.
-    // Every other target keeps .mixed as the development default. KL_FULL in the
-    // environment overrides either way (KL_FULL=0 forces .mixed back).
-    static var mixed: Bool { !klEnvOn("KL_FULL", default: kl_app_target_wants_full() != 0) }
+    // Every game opens a MIXED space, and black is drawn wherever it shows no
+    // picture (mixedBlack, KleptonCompositor) — the owner's call, 2026-10-12,
+    // for all games: "lieber mit 100 FPS und schwarzem Hintergrund arbeiten als
+    // mit den 120". A fully immersive space runs this headset's panel at up to
+    // 120 Hz, and visionOS halves that to 60 for the rest of a level once the
+    // game cannot keep up (seen with Beat Saber at full resolution, although the
+    // compositor itself missed no deadline); a mixed one runs at up to 100 and
+    // stays there. What the full space gave besides — black instead of the room
+    // behind loading screens and between levels — the black backdrop gives.
+    //
+    // Before this the targets that are in-world titles opened .full
+    // (kl_app_target_wants_full) and the rest .mixed with the room showing.
+    // KL_FULL=1 is the full space again, for any target; KL_MIXED_BLACK=0 shows
+    // the room in a mixed one, which is what judging how a scene sits wants.
+    static var mixed: Bool { !klEnvOn("KL_FULL", default: false) }
+    static var mixedBlack: Bool { mixed && klEnvOn("KL_MIXED_BLACK", default: true) }
+    /// ...as it stood when the game was started: the compositor reads this from
+    /// its own thread, and the choice is made once per run anyway.
+    nonisolated(unsafe) static var mixedBlackAtBoot = false
 
     // How many times the CompositorLayer closure has been entered. SwiftUI may
     // re-evaluate a scene, and a second layer would mean the render loop the log
@@ -379,9 +387,26 @@ struct PlayerSettingsView: View {
                     Text(klT("Keeps the middle of the picture sharp and draws the edges more coarsely. Games run more smoothly with it.",
                              "Hält die Bildmitte scharf und zeichnet die Ränder gröber. Spiele laufen damit flüssiger."))
                         .font(.callout).foregroundStyle(.secondary)
+                    if KleptonRendering.targetHasMSAA {
+                        HStack {
+                            Text(klT("Edge smoothing", "Kantenglättung"))
+                            Picker(klT("Edge smoothing", "Kantenglättung"), selection: $rendering.msaa) {
+                                Text(klT("Off", "Aus")).tag(0)
+                                Text("2x").tag(2)
+                                Text("4x").tag(4)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                        }
+                        Text(klT("Smooths jagged edges (MSAA). It costs frame rate: at full resolution the game can drop to 60 Hz with it, so lower the resolution along with it.",
+                                 "Glättet gezackte Kanten (MSAA). Kostet Bildrate: Bei voller Auflösung kann das Spiel damit auf 60 Hz fallen, also die Auflösung dazu verringern.")
+                             + (KleptonRendering.targetIsBeatSaber
+                                ? klT(" From Beat Saber 1.45 on.", " Ab Beat Saber 1.45.") : ""))
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
                     HStack {
                         Text(klT("Resolution", "Auflösung"))
-                        Slider(value: $rendering.renderScale, in: 0.5...1.0, step: 0.05)
+                        Slider(value: $rendering.renderScale, in: KleptonRendering.minRenderScale...1.0, step: 0.05)
                         Text(String(format: "%.0f%%", rendering.renderScale * 100))
                             .monospacedDigit().frame(width: 60, alignment: .trailing)
                     }
@@ -624,19 +649,32 @@ struct BootView: View {
     }()
 
     private var startFront: some View {
-        startFrontContent
-            // Small and out of the way: nobody starts a game to read this, but
-            // it is the one place on the headset that says which version is on it.
-            .overlay(alignment: .bottomTrailing) {
-                if let stamp = Self.versionStamp {
-                    Text(stamp)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 14)
-                        .accessibilityLabel(klT("Installed version \(stamp)", "Installierte Fassung \(stamp)"))
+        // Measured against the WINDOW, not against the content: the hero picture
+        // fills the window by overflowing it (scaledToFill), which makes the
+        // content wider than what is visible, and a corner of that is outside
+        // the window. On the owner's headset the line ended at "Toolchain", the
+        // number cut off, even after it had been moved in from the corner.
+        GeometryReader { window in
+            startFrontContent
+                .frame(width: window.size.width, height: window.size.height)
+                .clipped()
+                // Small and out of the way: nobody starts a game to read this, but
+                // it is the one place on the headset that says which version is on it.
+                .overlay(alignment: .bottomTrailing) {
+                    if let stamp = Self.versionStamp {
+                        Text(stamp)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .fixedSize()
+                            // In from the corner by more than its radius: a visionOS
+                            // window's corners are rounded (about 46 pt).
+                            .padding(.trailing, 48)
+                            .padding(.bottom, 20)
+                            .accessibilityLabel(klT("Installed version \(stamp)", "Installierte Fassung \(stamp)"))
+                    }
                 }
-            }
+        }
     }
 
     private var startFrontContent: some View {
@@ -1002,6 +1040,7 @@ struct BootView: View {
             // it on the main actor before the space opens; the scene observes it.
             DispatchQueue.main.async {
                 KleptonChroma.shared.immersionFull = !Immersive.mixed
+                Immersive.mixedBlackAtBoot = Immersive.mixedBlack
             }
 
             let logPath = String(cString: kl_app_log_path())

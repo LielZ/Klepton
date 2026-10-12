@@ -202,12 +202,39 @@ final class KleptonRendering: ObservableObject {
         didSet { UserDefaults.standard.set(foveation, forKey: Self.key) }
     }
 
+    /// Edge smoothing for a guest that draws its eyes into a multisampled
+    /// multiview target (kl_glfb_multiview_ms): 0 is off, 2 and 4 are the
+    /// sample counts. Beat Saber from 1.45 on is the one such guest; the two
+    /// rows it comes under are named here because the version is only known
+    /// once the game's files are read, after this page has been shown.
+    private static let msaaKey = "klepton.msaa"
+    static let targetHasMSAA: Bool = {
+        let t = String(cString: kl_app_target_name_or_default())
+        // Beat Saber (from 1.45 on), Doom 3 and Maestro: the guests
+        // kl_glfb.c's klfb_msaa_guest names.
+        return t == "beatsaber140" || t == "beatsaber" || t == "doom3quest"
+            || t == "x6963344583787383"
+    }()
+    static let targetIsBeatSaber: Bool = {
+        let t = String(cString: kl_app_target_name_or_default())
+        return t == "beatsaber140" || t == "beatsaber"
+    }()
+    @Published var msaa: Int {
+        didSet { UserDefaults.standard.set(msaa, forKey: Self.msaaKey) }
+    }
+
     /// Fraction of the eye-texture size the guest is told, 0.5...1.0. See
     /// kl_ovrp_set_render_scale_default for why this and not foveation is the
     /// lever for a Vulkan guest.
     @Published var renderScale: Double {
         didSet { UserDefaults.standard.set(renderScale, forKey: Self.scaleKey) }
     }
+
+    /// How far down "Resolution" goes. Half for everything but Beat Saber from
+    /// 1.45 on: with foveated rendering that game starts from the display's own
+    /// size (5740 instead of 4000 across), where half is still a fine picture,
+    /// and with edge smoothing a coarser one is worth trying.
+    static var minRenderScale: Double { targetIsBeatSaber ? 0.25 : 0.5 }
 
     /// The target's own default (targets.py "render_scale", baked into
     /// Info.plist as KLRenderScaleDefault). 1.0 for a bundle without the key.
@@ -237,6 +264,9 @@ final class KleptonRendering: ObservableObject {
         // says otherwise.
         foveation = (UserDefaults.standard.object(forKey: Self.key) as? Bool)
             ?? Self.targetFoveation
+        // Never chosen is off (see kl_glfb_multiview_ms for why).
+        msaa = (UserDefaults.standard.object(forKey: Self.msaaKey) as? Int)
+            .flatMap { [0, 2, 4].contains($0) ? $0 : nil } ?? 0
         // object(forKey:), so that "never chosen" is the target's default
         // rather than off.
         video = (UserDefaults.standard.object(forKey: Self.videoKey) as? Bool)
@@ -244,7 +274,7 @@ final class KleptonRendering: ObservableObject {
         // object(forKey:) rather than double(forKey:): 0 is "never set" there,
         // and never set has to mean the target's default, not the minimum.
         let stored = UserDefaults.standard.object(forKey: Self.scaleKey) as? Double
-        renderScale = stored.map { min(max($0, 0.5), 1.0) } ?? Self.targetRenderScale
+        renderScale = stored.map { min(max($0, Self.minRenderScale), 1.0) } ?? Self.targetRenderScale
     }
 
     /// Hand the stored choice to the runtime. Before kl_app_boot, so every
@@ -254,6 +284,12 @@ final class KleptonRendering: ObservableObject {
         let env = ProcessInfo.processInfo.environment["KL_VRR"]
         NSLog("[cp] foveated rendering: setting \(foveation ? "on" : "off")"
               + (env.map { " — overridden by KL_VRR=\($0)" } ?? ""))
+        if Self.targetHasMSAA {
+            kl_glfb_set_msaa_default(Int32(msaa))
+            let envAA = ProcessInfo.processInfo.environment["KL_GL_MSAA_MV"]
+            NSLog("[cp] edge smoothing: setting " + (msaa == 0 ? "off" : "\(msaa)x")
+                  + (envAA.map { " — overridden by KL_GL_MSAA_MV=\($0)" } ?? ""))
+        }
         kl_ovrp_set_render_scale_default(Float(renderScale))
         kl_mediandk_set_video_default(video ? 1 : -1)
         NSLog("[cp] in-game video: \(video ? "on" : "runtime default") (target default \(Self.targetVideo ? "on" : "off"))")
@@ -275,6 +311,12 @@ struct RenderingView: View {
                  + "renders the whole picture at full rate. Takes effect the "
                  + "next time the app starts.")
                 .font(.caption).foregroundStyle(.secondary)
+            if KleptonRendering.targetHasMSAA {
+                Picker("Edge smoothing (MSAA)", selection: $rendering.msaa) {
+                    Text("Off").tag(0); Text("2x").tag(2); Text("4x").tag(4)
+                }
+                .pickerStyle(.segmented)
+            }
             Toggle("In-game videos", isOn: $rendering.video)
             Text("Tutorial and cutscene clips in Vulkan games. On by default "
                  + "where it has been confirmed to work; turn it off if a game "
@@ -283,7 +325,7 @@ struct RenderingView: View {
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Text("Render resolution")
-                Slider(value: $rendering.renderScale, in: 0.5...1.0, step: 0.05)
+                Slider(value: $rendering.renderScale, in: KleptonRendering.minRenderScale...1.0, step: 0.05)
                 Text(String(format: "%.0f%%", rendering.renderScale * 100))
                     .monospacedDigit().frame(width: 52, alignment: .trailing)
             }

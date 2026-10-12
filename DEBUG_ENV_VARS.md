@@ -66,6 +66,37 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   files for such a title, on disk because the store delivered them; a file
   that is not there is not listed. Default on for `x3484270071659289` and
   Maestro (`x6963344583787383`).
+- `KL_GL_MSAA_MV=0|1` — (`runtime/gfx/kl_glfb.c`, `kl_glfb_multiview_ms`) make
+  a guest's multisampled multiview attachment
+  (`glFramebufferTextureMultisampleMultiviewOVR`) the real thing: both views are
+  drawn into a multisampled array and resolved into the eye texture's slices
+  when the pass ends. Needs the ANGLE of `angle-patches/klepton.patch` from this
+  change on (the Metal backend's layered multisampled pass); an older ANGLE
+  refuses the call, which the first attachment notices, says once and falls back
+  to plain multiview. Default off: the attachment is single-sampled as before.
+  In the app the start window's "Edge smoothing" setting (off, 2x, 4x;
+  `kl_glfb_set_msaa_default`; shown for Beat Saber's two rows, off unless
+  chosen) decides where this switch is not set. On the owner's headset 4x at
+  the display's full resolution (foveated) dropped a song to 60 Hz halfway.
+  The setting is offered to three guests (`klfb_msaa_guest`): Beat Saber from
+  1.45 on and Maestro, which ask for the multisampled attachment themselves, and
+  Doom 3, whose plain multiview attachments (colour and depth-stencil) are
+  upgraded to it.
+- `KL_FULL=1` / `KL_MIXED_BLACK=0` — (`KleptonApp.swift`, `Immersive`) every
+  game opens a mixed immersive space (the panel runs at up to 100 Hz there and
+  stays; a full space runs at up to 120 and visionOS halves that to 60 once the
+  game cannot keep up), and the compositor draws black behind every frame that
+  has no eye picture, so the room does not show. `KL_FULL=1` opens the full
+  space instead; `KL_MIXED_BLACK=0` leaves the room visible in the mixed one.
+- `KL_GL_MSAA_MV_SAMPLES=2|4` — override the sample count the guest asked for
+  (Beat Saber asks for 4) and the app's setting.
+- `KL_ANGLE_MSMV_MEMORYLESS=0` — read by ANGLE itself (`TextureMtl.mm`): keep the
+  samples of a multisampled multiview target in memory instead of memoryless.
+  Memoryless is the default; a pass reopened over its own earlier content then
+  gets it back by one draw per view. Kept samples cost four times the eye
+  textures (gigabytes at headset sizes) and exist for comparison. ANGLE counts
+  the reopenings in the log: `[angle] layered multisampled pass: opened N
+  times, M of them over kept content`.
 - `KL_GL_MSRTT=0|1` — (`runtime/gfx/kl_egl.c`) show the guest
   `GL_OVR_multiview`, `GL_OVR_multiview_multisampled_render_to_texture` and
   `GL_EXT_multisampled_render_to_texture` together, and attach its multisampled
