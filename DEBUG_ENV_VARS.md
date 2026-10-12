@@ -863,6 +863,30 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   number is indistinguishable from sending nothing. Same argument as
   `OVRP_HEADSET_OCULUS_QUEST_2` — read the value out of the guest rather than
   out of a header we do not have.
+- `KL_PROBE_FIND=<part>[,<part>...]` — once, from frame 600: every managed
+  method whose name contains one of the parts, as
+  `Namespace.Class::Method(types) [static]`. A part that starts with `@` is
+  matched against `Namespace.Class` instead (`@Mighty.Tester.` lists a whole
+  namespace). How a guest's own functions are found when all there is of them
+  is names in global-metadata.dat. Independent of `KL_PROBE_INPUT`.
+- `KL_PROBE_CALL=<Namespace.Class>::<Method>` — call one of the guest's own
+  parameterless methods once, at frame `KL_PROBE_CALL_FROM` (default 3000). A
+  static one as it is; an instance one on the class's `Instance`, else on the
+  object `FindObjectOfType` finds, else (`KL_PROBE_CALL_CREATE=1`) on a new
+  GameObject given the component. Walkabout Mini Golf carries its developers'
+  test driver: `Mighty.Tester.MightyTestManager::StartFullPerformanceSequence`
+  loads the courses one after another without anybody playing.
+  `KL_PROBE_TIMESCALE=<x>` sets `UnityEngine.Time.timeScale` from the same
+  frame on (again every 120 frames), for a sequence that waits in game seconds.
+- `KL_PROBE_KEEP=<Namespace.Class>::<field>=<part>[|<part>...]` — just before
+  `KL_PROBE_CALL`: the field (on the class's `Instance`) is a List of Unity
+  objects; keep those whose name contains one of the parts and drop the rest.
+  `KL_PROBE_KEEP_FIELD=<string field>` matches that field of each element too
+  (as a whole). No parts: only print the list. Walkabout's test manager walks
+  `coursesToTest`; `...::coursesToTest=Vegas` makes it two courses instead of 86.
+- `KL_PROBE_STRINGS=<Namespace.Class>::<field>` — a List of strings on the
+  class's `Instance`, printed as it grows (a test driver's own results).
+- `KL_PROBE_FIND` with an `@Class` part lists that class's fields as well.
 - `KL_PROBE_XR=1` — print `XRSettings`: the loaded device name, `enabled`, the
   **stereo rendering mode**, the eye texture size and the render viewport scale.
   Every one of those is a number WE answered (through ovrp), and this is the far
@@ -1174,7 +1198,8 @@ puts the camera on the ground with its hands underneath it.
 - `Documents/klepton-shader-test.txt` (a file on the device, not a variable;
   `visionos/Sources/kl_app.c`) — one word. `cold`: Metal's own cache in the
   app's container is set aside as `com.apple.metal.kept` and every start runs
-  with an empty one, to look at what a game shows while it compiles everything.
+  with an empty one, to look at what a game shows while it compiles everything
+  (the replay of recorded pipelines, `KL_VK_FOZ_REPLAY`, is off for such a start).
   `restore`: the kept cache is put back. Put there with
   `devicectl device copy to`; the boot log's head says what was done.
 - `KL_VK_CACHE_WAIT_MS=<ms>` — (`runtime/gfx/kl_vulkan.c`) how long

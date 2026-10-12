@@ -652,6 +652,290 @@ static void mprobe_resolve_offsets(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// KL_PROBE_FIND=<part>[,<part>...]: every managed method whose NAME contains one
+// of the parts, with the class that declares it — the first step toward calling
+// something in a guest whose code is only names in global-metadata.dat. One
+// pass over every image, printed once: `Namespace.Class::Method(types) static`.
+static void mprobe_find_methods(void) {
+    const char *spec = kl_env_str("KL_PROBE_FIND", NULL);
+    if (!spec || !*spec) return;
+    kl_image *img = kl_find_image("libil2cpp.so");
+    if (!img) return;
+    typedef const MethodInfo *(*get_methods_fn)(Il2CppClass *, void **);
+    typedef size_t (*class_count_fn)(const Il2CppImage *);
+    typedef Il2CppClass *(*get_class_fn)(const Il2CppImage *, size_t);
+    typedef const char *(*m_name_fn)(const MethodInfo *);
+    typedef const char *(*k_ns_fn)(Il2CppClass *);
+    typedef uint32_t (*m_argc_fn)(const MethodInfo *);
+    typedef void *(*m_param_fn)(const MethodInfo *, uint32_t);
+    typedef char *(*t_name_fn)(void *);
+    typedef uint32_t (*m_flags_fn)(const MethodInfo *, uint32_t *);
+    get_methods_fn get_methods = (get_methods_fn)kl_sym(img, "il2cpp_class_get_methods");
+    class_count_fn class_count = (class_count_fn)kl_sym(img, "il2cpp_image_get_class_count");
+    get_class_fn   get_class   = (get_class_fn)kl_sym(img, "il2cpp_image_get_class");
+    m_name_fn      m_name      = (m_name_fn)kl_sym(img, "il2cpp_method_get_name");
+    k_ns_fn        k_ns        = (k_ns_fn)kl_sym(img, "il2cpp_class_get_namespace");
+    m_argc_fn      m_argc      = (m_argc_fn)kl_sym(img, "il2cpp_method_get_param_count");
+    m_param_fn     m_param     = (m_param_fn)kl_sym(img, "il2cpp_method_get_param");
+    t_name_fn      t_name      = (t_name_fn)kl_sym(img, "il2cpp_type_get_name");
+    m_flags_fn     m_flags     = (m_flags_fn)kl_sym(img, "il2cpp_method_get_flags");
+    typedef void *(*get_fields_fn)(Il2CppClass *, void **);
+    typedef const char *(*f_name_fn)(void *);
+    typedef void *(*f_type_fn)(void *);
+    typedef size_t (*f_off_fn)(void *);
+    typedef int (*f_flags_fn)(void *);
+    get_fields_fn get_fields = (get_fields_fn)kl_sym(img, "il2cpp_class_get_fields");
+    f_name_fn     f_name     = (f_name_fn)kl_sym(img, "il2cpp_field_get_name");
+    f_type_fn     f_type     = (f_type_fn)kl_sym(img, "il2cpp_field_get_type");
+    f_off_fn      f_off      = (f_off_fn)kl_sym(img, "il2cpp_field_get_offset");
+    f_flags_fn    f_flags    = (f_flags_fn)kl_sym(img, "il2cpp_field_get_flags");
+    if (!get_methods || !class_count || !get_class || !m_name) {
+        fprintf(stderr, "  [mprobe] find: enumeration exports missing\n");
+        return;
+    }
+    char parts[512];
+    snprintf(parts, sizeof parts, "%s", spec);
+    const char *want[16]; int nw = 0;
+    for (char *t = strtok(parts, ","); t && nw < 16; t = strtok(NULL, ",")) want[nw++] = t;
+    size_t na = 0;
+    const Il2CppAssembly **as = il.domain_get_assemblies(il.domain_get(), &na);
+    unsigned found = 0;
+    for (size_t a = 0; a < na; a++) {
+        const Il2CppImage *im = il.assembly_get_image(as[a]);
+        if (!im) continue;
+        size_t nc = class_count(im);
+        for (size_t c = 0; c < nc; c++) {
+            Il2CppClass *k = get_class(im, c);
+            if (!k) continue;
+            // ...and for a class asked for with '@', its fields too: what a method
+            // works on is as much of the picture as what it is called.
+            if (get_fields && f_name) {
+                char cfull[300];
+                { const char *n0 = k_ns ? k_ns(k) : ""; snprintf(cfull, sizeof cfull, "%s.%s", n0 ? n0 : "", il.class_get_name(k)); }
+                int chit = 0;
+                for (int w = 0; w < nw && !chit; w++) chit = want[w][0] == '@' && strstr(cfull, want[w] + 1) != NULL;
+                void *fit = NULL, *fld;
+                while (chit && (fld = get_fields(k, &fit)) != NULL) {
+                    char *tn = (f_type && t_name) ? t_name(f_type(fld)) : NULL;
+                    fprintf(stderr, "  [mprobe] find: %s  field %s : %s  (offset %zu%s)\n", cfull, f_name(fld), tn ? tn : "?",
+                            f_off ? f_off(fld) : 0, (f_flags && (f_flags(fld) & 0x10)) ? ", static" : "");
+                }
+            }
+            void *iter = NULL;
+            const MethodInfo *m;
+            while ((m = get_methods(k, &iter)) != NULL) {
+                const char *name = m_name(m);
+                int hit = 0;
+                // A part that starts with '@' is matched against the class
+                // ("@Mighty.Tester." lists everything a namespace declares).
+                char full[300];
+                { const char *n0 = k_ns ? k_ns(k) : ""; snprintf(full, sizeof full, "%s.%s", n0 ? n0 : "", il.class_get_name(k)); }
+                for (int w = 0; name && w < nw && !hit; w++)
+                    hit = want[w][0] == '@' ? strstr(full, want[w] + 1) != NULL : strstr(name, want[w]) != NULL;
+                if (!hit) continue;
+                char sig[400] = ""; size_t o = 0;
+                uint32_t argc = m_argc ? m_argc(m) : 0;
+                for (uint32_t i = 0; i < argc && m_param && t_name && o + 2 < sizeof sig; i++) {
+                    char *tn = t_name(m_param(m, i));
+                    o += (size_t)snprintf(sig + o, sizeof sig - o, "%s%s", i ? ", " : "", tn ? tn : "?");
+                    if (o >= sizeof sig) o = sizeof sig - 1;
+                }
+                uint32_t fl = m_flags ? m_flags(m, NULL) : 0;
+                const char *ns = k_ns ? k_ns(k) : "";
+                fprintf(stderr, "  [mprobe] find: %s%s%s::%s(%s)%s\n", ns ? ns : "", ns && *ns ? "." : "",
+                        il.class_get_name(k), name, sig, (fl & 0x10) ? " static" : "");
+                found++;
+            }
+        }
+    }
+    fprintf(stderr, "  [mprobe] find: %u method(s) in %zu assemblies\n", found, na);
+}
+
+// ---------------------------------------------------------------------------
+// KL_PROBE_CALL=<Namespace.Class>::<Method> — call one of the guest's own
+// parameterless methods, once, at frame KL_PROBE_CALL_FROM (default 3000).
+//
+// For a guest that carries its own test driver: Walkabout Mini Golf ships its
+// developers' (Mighty.Tester.MightyTestManager, with sequences that load and
+// walk every course), and starting one is how every course's pipelines are
+// seen without a person playing them. A static method is called as it is; for
+// an instance method the object is the class's `Instance` (get_Instance), else
+// the first one FindObjectOfType finds, else — with KL_PROBE_CALL_CREATE=1 — a
+// new GameObject that is given the component.
+static void mprobe_call(unsigned frame) {
+    const char *spec = kl_env_str("KL_PROBE_CALL", NULL);
+    if (!spec || !*spec) return;
+    char buf[300];
+    snprintf(buf, sizeof buf, "%s", spec);
+    char *sep = strstr(buf, "::");
+    if (!sep) { fprintf(stderr, "  [mprobe] call: '%s' is not Class::Method\n", spec); return; }
+    *sep = 0;
+    const char *meth = sep + 2;
+    char *dot = strrchr(buf, '.');
+    const char *ns = "", *cls = buf;
+    if (dot) { *dot = 0; ns = buf; cls = dot + 1; }
+    Il2CppClass *k = find_class(ns, cls);
+    if (!k) { fprintf(stderr, "  [mprobe f%u] call: no class %s.%s\n", frame, ns, cls); return; }
+    const MethodInfo *m = il.class_get_method_from_name(k, meth, 0);
+    if (!m) { fprintf(stderr, "  [mprobe f%u] call: %s has no %s()\n", frame, cls, meth); return; }
+    kl_image *img = kl_find_image("libil2cpp.so");
+    typedef uint32_t (*m_flags_fn)(const MethodInfo *, uint32_t *);
+    m_flags_fn m_flags = img ? (m_flags_fn)kl_sym(img, "il2cpp_method_get_flags") : NULL;
+    int is_static = m_flags && (m_flags(m, NULL) & 0x10);
+    Il2CppObject *self = NULL;
+    const char *how = "static";
+    if (!is_static) {
+        const MethodInfo *gi = il.class_get_method_from_name(k, "get_Instance", 0);
+        if (gi) { self = invoke(gi, NULL, "get_Instance"); how = "its Instance"; }
+        Il2CppObject *type = il.type_get_object(il.class_get_type(k));
+        if (!self && type) {
+            const MethodInfo *fo = find_method("UnityEngine", "Object", "FindObjectOfType", 1);
+            void *args[1] = { type };
+            self = fo ? invoke(fo, args, "Object.FindObjectOfType") : NULL;
+            how = "the one FindObjectOfType found";
+        }
+        if (!self && type && kl_env_on("KL_PROBE_CALL_CREATE", 0)) {
+            // new GameObject(name).AddComponent(type)
+            Il2CppClass *go_k = find_class("UnityEngine", "GameObject");
+            typedef Il2CppObject *(*object_new_fn)(Il2CppClass *);
+            object_new_fn object_new = img ? (object_new_fn)kl_sym(img, "il2cpp_object_new") : NULL;
+            const MethodInfo *ctor = go_k ? il.class_get_method_from_name(go_k, ".ctor", 1) : NULL;
+            const MethodInfo *add  = go_k ? il.class_get_method_from_name(go_k, "AddComponent", 1) : NULL;
+            if (object_new && ctor && add) {
+                Il2CppObject *go = object_new(go_k);
+                void *a1[1] = { il.string_new("KleptonProbe") };
+                invoke_on(go, ctor, a1, "GameObject..ctor");
+                void *a2[1] = { type };
+                self = invoke_on(go, add, a2, "GameObject.AddComponent");
+                how = "a component on a new GameObject";
+            }
+        }
+        if (!self) {
+            fprintf(stderr, "  [mprobe f%u] call: no %s object to call %s() on%s\n", frame, cls, meth,
+                    kl_env_on("KL_PROBE_CALL_CREATE", 0) ? "" : " (KL_PROBE_CALL_CREATE=1 makes one)");
+            return;
+        }
+    }
+    fprintf(stderr, "  [mprobe f%u] call: %s.%s::%s() on %s\n", frame, ns, cls, meth, how);
+    invoke_on(self, m, NULL, meth);
+    fprintf(stderr, "  [mprobe f%u] call: %s() returned\n", frame, meth);
+}
+
+// ---------------------------------------------------------------------------
+// Two more for a guest that carries its own test driver, both on a field of the
+// object KL_PROBE_CALL would call (the class's Instance):
+//
+// KL_PROBE_KEEP=<Namespace.Class>::<field>=<part>[|<part>...] — the field is a
+// List of Unity objects; keep the ones whose name contains one of the parts
+// (case does not matter) and drop the rest, once, just before KL_PROBE_CALL.
+// Walkabout's test manager walks the courses in `coursesToTest`; with this it
+// walks the chosen ones. An empty part list only prints the names.
+//
+// KL_PROBE_STRINGS=<Namespace.Class>::<field> — the field is a List of strings
+// (a test driver's results); new entries are printed as they appear.
+//
+// A List<T> is { header, T[] _items, int _size, int _version }: _items at 16,
+// _size at 24, and an array's elements at 32 — the layout KL_PROBE_ENUM and the
+// rest of this file already rely on.
+static Il2CppObject *mprobe_instance_field(const char *spec, char *rest, size_t rest_cap, const char **why) {
+    char buf[300];
+    snprintf(buf, sizeof buf, "%s", spec);
+    char *eq = strchr(buf, '=');
+    if (rest) snprintf(rest, rest_cap, "%s", eq ? eq + 1 : "");
+    if (eq) *eq = 0;
+    char *sep = strstr(buf, "::");
+    if (!sep) { *why = "not Class::field"; return NULL; }
+    *sep = 0;
+    const char *field = sep + 2;
+    char *dot = strrchr(buf, '.');
+    const char *ns = "", *cls = buf;
+    if (dot) { *dot = 0; ns = buf; cls = dot + 1; }
+    Il2CppClass *k = find_class(ns, cls);
+    if (!k) { *why = "no such class"; return NULL; }
+    const MethodInfo *gi = il.class_get_method_from_name(k, "get_Instance", 0);
+    Il2CppObject *self = gi ? invoke(gi, NULL, "get_Instance") : NULL;
+    if (!self) { *why = "the class has no Instance (yet)"; return NULL; }
+    kl_image *img = kl_find_image("libil2cpp.so");
+    typedef void *(*field_from_name_fn)(Il2CppClass *, const char *);
+    typedef size_t (*f_off_fn)(void *);
+    field_from_name_fn ffn = img ? (field_from_name_fn)kl_sym(img, "il2cpp_class_get_field_from_name") : NULL;
+    f_off_fn f_off = img ? (f_off_fn)kl_sym(img, "il2cpp_field_get_offset") : NULL;
+    void *f = ffn ? ffn(k, field) : NULL;
+    if (!f || !f_off) { *why = "no such field"; return NULL; }
+    Il2CppObject *list = *(Il2CppObject **)((uint8_t *)self + f_off(f));
+    if (!list) *why = "the field is null";
+    return list;
+}
+
+static void mprobe_keep(unsigned frame) {
+    const char *spec = kl_env_str("KL_PROBE_KEEP", NULL);
+    if (!spec || !*spec) return;
+    char parts[400];
+    const char *why = "";
+    Il2CppObject *list = mprobe_instance_field(spec, parts, sizeof parts, &why);
+    if (!list) { fprintf(stderr, "  [mprobe f%u] keep %s: %s\n", frame, spec, why); return; }
+    Il2CppObject *items = *(Il2CppObject **)((uint8_t *)list + 16);
+    int32_t *size = (int32_t *)((uint8_t *)list + 24);
+    const MethodInfo *get_name = find_method("UnityEngine", "Object", "get_name", 0);
+    if (!items || !get_name || *size < 0 || (uint32_t)*size > il.array_length(items)) {
+        fprintf(stderr, "  [mprobe f%u] keep %s: not a list of Unity objects\n", frame, spec);
+        return;
+    }
+    const char *want[64]; int nw = 0;
+    for (char *t = strtok(parts, "|"); t && nw < 64; t = strtok(NULL, "|")) want[nw++] = t;
+    // KL_PROBE_KEEP_FIELD=<name>: a string field of the elements that is matched
+    // as well, and then as a whole — Walkabout's courses carry the name of their
+    // scene (SceneName), which is what its files are called after.
+    const char *also = kl_env_str("KL_PROBE_KEEP_FIELD", NULL);
+    kl_image *img = kl_find_image("libil2cpp.so");
+    typedef void *(*field_from_name_fn)(Il2CppClass *, const char *);
+    typedef size_t (*f_off_fn)(void *);
+    field_from_name_fn ffn = img ? (field_from_name_fn)kl_sym(img, "il2cpp_class_get_field_from_name") : NULL;
+    f_off_fn f_off = img ? (f_off_fn)kl_sym(img, "il2cpp_field_get_offset") : NULL;
+    Il2CppObject **el = (Il2CppObject **)((uint8_t *)items + ARR_DATA);
+    int kept = 0, n = *size;
+    for (int i = 0; i < n; i++) {
+        char name[160] = "(null)", extra[160] = "";
+        if (el[i]) str_ascii(invoke_on(el[i], get_name, NULL, "Object.get_name"), name, sizeof name);
+        if (el[i] && also && *also && ffn && f_off) {
+            void *f = ffn(il.object_get_class(el[i]), also);
+            Il2CppObject *v = f ? *(Il2CppObject **)((uint8_t *)el[i] + f_off(f)) : NULL;
+            if (v) str_ascii(v, extra, sizeof extra);
+        }
+        int hit = nw == 0;
+        for (int w = 0; w < nw && !hit; w++)
+            hit = strcasestr(name, want[w]) != NULL || (extra[0] && strcasecmp(extra, want[w]) == 0);
+        fprintf(stderr, "  [mprobe f%u] keep: %2d %-34s %-34s %s\n", frame, i, name, extra, nw == 0 ? "" : hit ? "kept" : "dropped");
+        if (hit) el[kept++] = el[i];
+    }
+    if (nw) {
+        for (int i = kept; i < n; i++) el[i] = NULL;
+        *size = kept;
+        (*(int32_t *)((uint8_t *)list + 28))++;          // _version: an enumeration in flight notices
+        fprintf(stderr, "  [mprobe f%u] keep %s: %d of %d left\n", frame, spec, kept, n);
+    }
+}
+
+static void mprobe_strings(unsigned frame) {
+    const char *spec = kl_env_str("KL_PROBE_STRINGS", NULL);
+    if (!spec || !*spec) return;
+    static int seen;
+    const char *why = "";
+    Il2CppObject *list = mprobe_instance_field(spec, NULL, 0, &why);
+    if (!list) return;
+    Il2CppObject *items = *(Il2CppObject **)((uint8_t *)list + 16);
+    int32_t n = *(int32_t *)((uint8_t *)list + 24);
+    if (!items || n < 0 || (uint32_t)n > il.array_length(items)) return;
+    if (n < seen) seen = 0;                               // the list was cleared
+    Il2CppObject **el = (Il2CppObject **)((uint8_t *)items + ARR_DATA);
+    for (; seen < n; seen++) {
+        char text[700];
+        str_ascii(el[seen], text, sizeof text);
+        fprintf(stderr, "  [mprobe f%u] %s[%d]: %s\n", frame, spec, seen, text);
+    }
+}
+
 // ---- AC Nexus VR: the frame length the guest spins itself out to -------------
 //
 // Not a probe: the one place the runtime writes a managed value, kept here
@@ -736,6 +1020,40 @@ void kl_mprobe_tick(unsigned frame) {
     if (!rs_done && frame >= 600 && kl_env_str("KL_PROBE_RESOLVE", NULL) && mprobe_init()) {
         rs_done = 1;
         mprobe_resolve_offsets();
+    }
+    // KL_PROBE_TIMESCALE=<x>: UnityEngine.Time.timeScale, set again every 120
+    // frames from KL_PROBE_CALL_FROM on (a guest sets its own at pauses and
+    // scene changes). A guest's own test sequence waits in game seconds; at 10
+    // a course that takes it ten minutes is done in one.
+    {
+        static float ts = -1.0f;
+        static unsigned ts_from;
+        static const MethodInfo *m_ts;
+        if (ts < 0.0f) {
+            const char *e = kl_env_str("KL_PROBE_TIMESCALE", NULL);
+            ts = e && *e ? (float)atof(e) : 0.0f;
+            ts_from = kl_env_uint("KL_PROBE_CALL_FROM", 3000u);
+        }
+        if (ts > 0.0f && frame >= ts_from && frame % 120 == 0 && mprobe_init()) {
+            if (!m_ts) {
+                m_ts = find_method("UnityEngine", "Time", "set_timeScale", 1);
+                if (m_ts) fprintf(stderr, "  [mprobe f%u] Time.timeScale = %.1f from here on\n", frame, (double)ts);
+                else ts = 0.0f;
+            }
+            if (m_ts) { void *args[1] = { &ts }; invoke(m_ts, args, "Time.set_timeScale"); }
+        }
+    }
+    static int call_done;
+    static unsigned call_from;
+    if (!call_done && kl_env_str("KL_PROBE_CALL", NULL)) {
+        if (!call_from) call_from = kl_env_uint("KL_PROBE_CALL_FROM", 3000u);
+        if (frame >= call_from && mprobe_init()) { call_done = 1; mprobe_keep(frame); mprobe_call(frame); }
+    }
+    if (frame % 300 == 0 && kl_env_str("KL_PROBE_STRINGS", NULL) && mprobe_init()) mprobe_strings(frame);
+    static int find_done;
+    if (!find_done && frame >= 600 && kl_env_str("KL_PROBE_FIND", NULL) && mprobe_init()) {
+        find_done = 1;
+        mprobe_find_methods();
     }
     // Also independent, and for the same reason: the disagreement it looks for
     // is settled long before KL_PROBE_FROM's default, and reading XRSettings

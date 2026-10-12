@@ -1,0 +1,10 @@
+{
+ "package": "com.MightyCoconut.WalkaboutMiniGolf",
+ "call": "Mighty.Tester.MightyTestManager::StartFullPerformanceSequence",
+ "call_from_frame": 14000,
+ "timescale": 10,
+ "alarm_seconds": 14400,
+ "keep": "Mighty.Tester.MightyTestManager::coursesToTest",
+ "keep_field": "SceneName",
+ "results": "Mighty.Tester.MightyTestManager::testResults"
+}

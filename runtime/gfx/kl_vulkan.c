@@ -697,6 +697,16 @@ static const struct { VkStructureType t; size_t size; } k_feature_structs[] = {
 #ifdef VK_VERSION_1_4
     F(PHYSICAL_DEVICE_VULKAN_1_4_FEATURES, VkPhysicalDeviceVulkan14Features),
 #endif
+    // Unity 6 asks for these two (Walkabout Mini Golf 6.8, Vision Pro M5,
+    // 2026-10-12). Without them in the table the description named two
+    // structs without their contents, and the pre-start compile refused the
+    // whole description ("a feature struct this build cannot rebuild").
+#ifdef VK_KHR_present_wait
+    F(PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR, VkPhysicalDevicePresentWaitFeaturesKHR),
+#endif
+#ifdef VK_KHR_present_id
+    F(PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, VkPhysicalDevicePresentIdFeaturesKHR),
+#endif
 #undef F
 };
 

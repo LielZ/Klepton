@@ -523,6 +523,16 @@ build/t_foz: tests/t_foz.c $(RUNTIME) $(RUNTIME_HDRS) $(FZ_DEPS)
 	@clang -g -O2 -arch arm64 -c $(FZ_DIR)/miniz/miniz.c -o build/fzhost/fz_miniz.o
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ tests/t_foz.c $(RUNTIME) build/fzhost/*.o $(LDLIBS) -lc++
 
+# m_boot with the recorder in it — to collect a guest's pipelines on this Mac
+# (KL_VK_FOZ_DIR + a guest that can be walked through its content without a
+# person: KL_PROBE_CALL). The objects are t_foz's.
+build/m_boot_fz: build/m_boot build/t_foz
+	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
+	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
+	  runtime/gfx/kl_view_mtl.m build/fzhost/*.o \
+	  $(LDLIBS) -lc++ -framework Metal -framework QuartzCore -framework Foundation \
+	  $(shell pkg-config --libs sdl3)
+
 # The whole sysroot, ad-hoc signed — Apple silicon maps no unsigned code even on
 # the host. A few hundred libraries; tools/lx_translate.sh runs them in parallel.
 .PHONY: lx-rt lx-boot

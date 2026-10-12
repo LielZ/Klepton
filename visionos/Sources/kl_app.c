@@ -181,6 +181,10 @@ void kl_app_shader_cache_test(void) {
         }
     }
     closedir(d);
+    // A cold start is meant to be cold where it is looked at: the replay of
+    // the pipelines a device recorded (KL_VK_FOZ_REPLAY, Walkabout) would have
+    // compiled them all again before the first frame. Recording goes on.
+    if (cold) setenv("KL_VK_FOZ_REPLAY", "0", 1);
     snprintf(g_shader_test_note, sizeof g_shader_test_note,
              cold ? "klepton-shader-test.txt says cold — Metal's cache set aside or emptied (%d), this start compiles everything"
                   : "klepton-shader-test.txt says restore — the kept Metal cache is back (%d)", n);
