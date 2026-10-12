@@ -545,6 +545,79 @@ struct GameLanguageView: View {
     }
 }
 
+// The name the game is told its player has.
+//
+// A Quest game takes the player's name from the Meta account and offers no way
+// to change it — it is not the game's to change. Here the account is the
+// offline user of kl_ovrplat.c, whose name was "kleptonplayer" for everybody.
+// Demeo shows it as the player's name, and its owner asked for a way to set it
+// (2026-10-13). Read once, at boot (KL_PLAT_USER_NAME).
+//
+// For a game that keeps an account of its own under the user's id (Demeo), the
+// id is made here as well: one random number per installation instead of the
+// same number for every player (KL_PLAT_USER_ID, kl_ovrplat_user_id_per_install).
+final class KleptonPlayer: ObservableObject {
+    static let shared = KleptonPlayer()
+    private static let nameKey = "klepton.playerName"
+    private static let idKey = "klepton.playerId"
+
+    /// Only where a name goes anywhere: the games that get the offline user.
+    static let offered: Bool = kl_ovrplat_offline_user_for(kl_app_target_name_or_default()) != 0
+    static let ownId: Bool = kl_ovrplat_user_id_per_install(kl_app_target_name_or_default()) != 0
+
+    @Published var name: String {
+        didSet { UserDefaults.standard.set(name, forKey: Self.nameKey) }
+    }
+
+    private init() {
+        name = UserDefaults.standard.string(forKey: Self.nameKey) ?? ""
+    }
+
+    /// Before kl_app_boot. A value on a launch line wins.
+    func apply() {
+        guard Self.offered else { return }
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !n.isEmpty { setenv("KL_PLAT_USER_NAME", n, 0) }
+        if Self.ownId {
+            var id = UInt64(UserDefaults.standard.string(forKey: Self.idKey) ?? "") ?? 0
+            if id == 0 {
+                id = UInt64.random(in: 1_000_000_000_001_000...8_999_999_999_999_999)
+                UserDefaults.standard.set(String(id), forKey: Self.idKey)
+            }
+            setenv("KL_PLAT_USER_ID", String(id), 0)
+        }
+        NSLog("[app] player name: " + (n.isEmpty ? "not set (the runtime's own)" : "\"\(n)\"")
+              + (Self.ownId ? "; the player id is this installation's own" : ""))
+    }
+}
+
+struct PlayerNameView: View {
+    @ObservedObject private var player = KleptonPlayer.shared
+
+    var body: some View {
+        if KleptonPlayer.offered {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(klT("Player name", "Spielername"))
+                    TextField("kleptonplayer", text: $player.name)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .frame(maxWidth: 320)
+                }
+                Text(klT("The name the game is told you have. Games that show a player name use it; "
+                         + "where a game wants a name without spaces, letters, digits, '.', '_' "
+                         + "and '-' are kept. Takes effect the next time the app starts.",
+                         "Der Name, der dem Spiel für dich gemeldet wird. Spiele, die einen "
+                         + "Spielernamen anzeigen, nutzen ihn; wo ein Spiel einen Namen ohne "
+                         + "Leerzeichen erwartet, bleiben Buchstaben, Ziffern, '.', '_' und '-'. "
+                         + "Gilt ab dem nächsten Start der App."))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
 // Caches of LINKED GL programs that a game keeps in its own files.
 //
 // Unreal on GLES stores the driver's program binaries

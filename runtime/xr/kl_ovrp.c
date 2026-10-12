@@ -68,6 +68,29 @@ static uint64_t klovrp_called(const char *name) {
             fprintf(stderr, "  [ovrp] call (permissive, returning 0): %s\n", name);
         return 0;
     }
+    // KL_OVRP_UNANSWERED=unsupported — an entry point with no answer here says
+    // UNSUPPORTED (-1004, out-parameters untouched) instead of ending the game,
+    // named once in the log. For a guest that is told a plugin version far above
+    // the 1.60.0 the answers in this file were collected against: Demeo, told its
+    // own 1.109.0 for the sake of passthrough, can reach some two hundred entry
+    // points nothing here has seen called (spaces, scene, virtual keyboard,
+    // render models, camera devices, colocation). All of those return ovrpResult,
+    // for which "unsupported" is what a headset without the feature says. The
+    // old value-returning entry points (ovrp_GetNodePose and the like) are not
+    // reached at such a version — the guest's C# prefers their successors — and
+    // if one is, the line below names it.
+    //   default "unsupported" for x3634830803298285, else "abort"
+    static int soft = -1;
+    if (soft < 0) {
+        const char *t = kl_driver_target_name();
+        const char *e = kl_env_str("KL_OVRP_UNANSWERED", NULL);
+        soft = e && *e ? !strcmp(e, "unsupported") : (t && !strcmp(t, "x3634830803298285"));
+    }
+    if (soft) {
+        if (s >= 0 && g_ovrp[s].calls == 1)
+            fprintf(stderr, "  [ovrp] no answer for %s — said UNSUPPORTED (KL_OVRP_UNANSWERED)\n", name);
+        return (uint64_t)-1004;    // OVRP_FAIL_UNSUPPORTED, defined further down
+    }
     // Named WITH ITS CALLER. Every other entry point in this file is reached
     // from libunity or libOculusXRPlugin, and the one time that was not true it
     // cost a session: 1.40's libhaptics_sdk resolves two of these itself, on its
@@ -370,9 +393,15 @@ static int klovrp_adapter_is_phys(void) {
         // LUID answer, same one-device walk, same fall to GLES2 — whose shaders
         // it does not ship ("shader compiler platform 5"), so every material
         // drew as Unity's pink error shader.
+        // Demeo (x3634830803298285, Unity 6000.0.60) is the fourth, and has no
+        // GLES to fall to: one device walked, its properties read, then "Unable
+        // to initialize the Unity Engine Graphics API" and UnityPlayer.kill()
+        // (on device 2026-10-12; with the handle it creates its device on the
+        // Mac host and reaches its privacy notice).
         on = kl_env_on("KL_OVRP_ADAPTER_PHYS",
                        t && (strcmp(t, "walkabout") == 0 || strcmp(t, "batman") == 0 ||
-                             strcmp(t, "x5269080709783454") == 0));
+                             strcmp(t, "x5269080709783454") == 0 ||
+                             strcmp(t, "x3634830803298285") == 0));
     }
     return on;
 }
@@ -601,6 +630,11 @@ static const char *klovrp_version_str(void) {
         if (e && *e)                                        v = e;
         else if (t && strcmp(t, "x2111191602278229") == 0)  v = "1.117.0";
         else if (kl_guest_beatsaber_openxr())               v = "1.106.0";
+        // Demeo ships 1.109.0 and has a mixed-reality mode. Its C# reaches the
+        // passthrough entry points only from 1.63 on (init), 1.71 (supported),
+        // 1.78/1.85 (capabilities); told 1.60.0 it never asks. With its own
+        // number it asks for much else as well — see klovrp_soft_unanswered.
+        else if (t && strcmp(t, "x3634830803298285") == 0)  v = "1.109.0";
         else                                                v = KLOVRP_VERSION_DEFAULT;
     }
     return v;
@@ -1370,6 +1404,14 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
         // multisampling the compositor kept 100 Hz with its pass queued 0.2 ms
         // behind the game's, so there is room.
         if (t && strcmp(t, "x5340130476095884") == 0) cap_dflt = 4000;
+        // Demeo, the same kind of picture — a board on a table, looked at from
+        // an arm's length — and the same wish ("Kann man die Auflösung noch nach
+        // oben setzen?", 2026-10-13). At 3072 its plugin's widened eye was
+        // 3936x2465, 1136 pixels a unit of tangent where the display's light
+        // output shows 1696; 4000 makes that about 1480. Paid for with the 2x
+        // multisampling it is held at (KL_VK_MAX_SAMPLES): at 3072 and 2x the app
+        // stood at 4.4 to 4.7 of its 8.2 GB.
+        if (t && strcmp(t, "x3634830803298285") == 0) cap_dflt = 4000;
         // Beat Saber from 1.45 on (kl_guest_beatsaber_openxr) is the same case
         // in Unity: its camera target is a 4x multisampled multiview array,
         // which is attached single-sampled here (klgl_want_msrtt in kl_egl.c),
@@ -1573,7 +1615,12 @@ static int klovrp_unify_default(void) {
     // own cone and a fifth of the picture's width is no longer drawn for
     // nothing. KL_OVRP_UNIFY_FRUSTUM=1 with the game's mode left on is the old
     // arrangement, should it be wanted for comparison.
-    static const char *on[] = { "intotheradius", "walkabout" };
+    // Demeo (x3634830803298285, Unity 6, the same OculusXR generation) is
+    // Walkabout's case to the pixel — `SetupLayer -> EYE, 3936x2465`, `render
+    // viewport: eye0 0,0 3936x2465 eye1 0,0 3936x2465`, "Symmetric Projection
+    // - True" in its own log — and its owner on device, 2026-10-12: the two
+    // eyes show no picture that can be laid over one another.
+    static const char *on[] = { "intotheradius", "walkabout", "x3634830803298285" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
@@ -6316,7 +6363,12 @@ int  kl_ovrp_eyeless_black(void) { return g_eyeless_black && !g_eye_layer_live; 
 // still the answer wherever this is off.
 //   KL_OVRP_PASSTHROUGH=0|1 — default 1 for TRIANGLE STRATEGY
 //       (x5340130476095884), whose mixed-reality mode this was written for
-//       (2026-10-12), else 0: no other game has been seen with a "yes".
+//       (2026-10-12), and for Demeo (x3634830803298285), else 0: no other
+//       game has been seen with a "yes".
+//
+// A Unity guest (OVROverlay / OVRPassthroughLayer) does not put the layer in
+// ovrp_EndFrame4's list: it sets it up through ovrp_EnqueueSetupLayer2 and
+// files it every frame through ovrp_EnqueueSubmitLayer2. Both ways count.
 //   KL_OVRP_PT_ALPHA=opaque|coverage|inverse — what the eye picture's alpha
 //       means while a passthrough layer is submitted. Default: read from the
 //       eye submit's flags — ovrpLayerSubmitFlag_InverseAlpha, which Unreal's
@@ -6326,7 +6378,8 @@ static int klovrp_pt_on(void) {
     static int on = -1;
     if (on < 0) {
         const char *t = kl_driver_target_name();
-        on = kl_env_on("KL_OVRP_PASSTHROUGH", t && !strcmp(t, "x5340130476095884"));
+        on = kl_env_on("KL_OVRP_PASSTHROUGH", t && (!strcmp(t, "x5340130476095884") ||
+                                                    !strcmp(t, "x3634830803298285")));
         if (on)
             fprintf(stderr, "  [ovrp] passthrough: offered to the guest — the room shows "
                             "through the eye picture while it submits a passthrough layer\n");
@@ -6345,6 +6398,12 @@ static int g_pt_init;                 // between Initialize- and ShutdownInsight
 #define KLOVRP_PT_GRACE_FRAMES 6
 static volatile unsigned g_pt_frames_since = 1000000u;
 int kl_ovrp_passthrough_live(void) { return g_pt_frames_since < KLOVRP_PT_GRACE_FRAMES; }
+// EndFrames since a passthrough layer last came through ovrp_EnqueueSubmitLayer2,
+// and its shape. Filed on the guest's main thread, read on the one that ends
+// frames; a frame's difference between the two is inside the grace above.
+static volatile unsigned g_pt_enq_since = 1000000u;
+static volatile int g_pt_enq_shape;
+static void klovrp_pt_enqueued(int shape) { g_pt_enq_shape = shape; g_pt_enq_since = 0; }
 
 static void klovrp_pt_submits(const void *layer_submits, int count) {
     extern void kl_reproject_set_eye_alpha(int mode);
@@ -6362,8 +6421,14 @@ static void klovrp_pt_submits(const void *layer_submits, int count) {
             pt = i; shape = l->desc.shape;
         }
     }
+    // ...or filed by itself, the way Unity does it. Not in the list, so it has
+    // no place there: said to be under the eye layer, which is what an
+    // OVRPassthroughLayer is unless its owner chose otherwise.
+    int enqueued = 0;
+    if (g_pt_enq_since < 1000000u) g_pt_enq_since++;
+    if (pt < 0 && g_pt_enq_since <= 3) { enqueued = 1; shape = g_pt_enq_shape; }
     int was_live = kl_ovrp_passthrough_live();
-    if (pt >= 0) g_pt_frames_since = 0;
+    if (pt >= 0 || enqueued) g_pt_frames_since = 0;
     else if (g_pt_frames_since < 1000000u) g_pt_frames_since++;
     int live = kl_ovrp_passthrough_live();
 
@@ -6377,7 +6442,7 @@ static void klovrp_pt_submits(const void *layer_submits, int count) {
     }
     if (!live) {
         mode = 0;
-    } else if (pt >= 0 && eye >= 0) {
+    } else if ((pt >= 0 || enqueued) && eye >= 0) {
         // An eye format with no alpha channel samples as 1 everywhere, which
         // read inversely would be a picture that is not there at all.
         int no_alpha = eye_fmt == 3 || eye_fmt == 6 || eye_fmt == 7;
@@ -6389,11 +6454,13 @@ static void klovrp_pt_submits(const void *layer_submits, int count) {
             static const char *const M[] = {
                 "left opaque", "read as coverage (1 = the game's picture)",
                 "read inversely (0 = the game's picture)" };
-            fprintf(stderr, "  [ovrp] passthrough: a %s layer is submitted %s the eye layer "
-                            "(%d and %d of %d) — the eye picture's alpha is %s; eye submit "
-                            "flags %#x, format %d%s%s\n",
-                    klovrp_shape_name(shape), pt < eye ? "under" : "OVER", pt + 1, eye + 1,
-                    count, M[mode], (unsigned)eye_flags, eye_fmt,
+            char where[64];
+            if (enqueued) snprintf(where, sizeof where, "filed through ovrp_EnqueueSubmitLayer2");
+            else snprintf(where, sizeof where, "submitted %s the eye layer (%d and %d of %d)",
+                          pt < eye ? "under" : "OVER", pt + 1, eye + 1, count);
+            fprintf(stderr, "  [ovrp] passthrough: a %s layer is %s — the eye picture's "
+                            "alpha is %s; eye submit flags %#x, format %d%s%s\n",
+                    klovrp_shape_name(shape), where, M[mode], (unsigned)eye_flags, eye_fmt,
                     no_alpha ? " (no alpha channel)" : "",
                     forced >= 0 ? " (KL_OVRP_PT_ALPHA)" : "");
         }
@@ -6484,6 +6551,69 @@ static uint64_t klovrp_UpdateInsightPassthroughGeometryTransform(uint64_t instan
                                                                  const void *transform) {
     (void)instance; (void)transform;
     return klovrp_pt_handle_call("ovrp_UpdateInsightPassthroughGeometryTransform");
+}
+// The newer questions around it, which a Unity guest asks once it is told a
+// plugin version that has them (1.71, 1.84, 1.85, 1.87).
+//   ovrp_IsInsightPassthroughSupported(ovrpBool *supported)
+static uint64_t klovrp_IsInsightPassthroughSupported(int *out) {
+    ovrp_hit("ovrp_IsInsightPassthroughSupported");
+    if (out) *out = klovrp_pt_on() ? OVRP_TRUE : 0;
+    return OVRP_SUCCESS;
+}
+// ovrpInsightPassthroughCapabilities { Fields, Flags, MaxColorLutResolution } —
+// the caller sets Fields to what it wants filled. Flags as in
+// klovrp_GetPassthroughCapabilityFlags; no colour look-up tables (0), since
+// there is no camera picture here to put through one.
+static uint64_t klovrp_GetPassthroughCapabilities(int32_t *caps) {
+    ovrp_hit("ovrp_GetPassthroughCapabilities");
+    if (!caps) return OVRP_FAIL_INVALID_PARAM;
+    caps[1] = klovrp_pt_on() ? 0x3 : 0;
+    caps[2] = 0;
+    return OVRP_SUCCESS;
+}
+// ovrpPassthroughPreferences { Flags } — bit 0 is "the user's home is in
+// passthrough, start in it". Not claimed.
+static uint64_t klovrp_GetPassthroughPreferences(int32_t *prefs) {
+    ovrp_hit("ovrp_GetPassthroughPreferences");
+    if (prefs) prefs[0] = 0;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_SetInsightPassthroughStyle2(int layer_id, const void *style) {
+    ovrp_hit("ovrp_SetInsightPassthroughStyle2");
+    (void)layer_id; (void)style;
+    return klovrp_pt_on() ? OVRP_SUCCESS : OVRP_FAIL_UNSUPPORTED;
+}
+// The guardian in a mixed-reality scene: ovrpBoundaryVisibility is
+// NotSuppressed = 1, Suppressed = 2. There is no boundary drawn here at all,
+// so it is suppressed, and asking for either is granted.
+static uint64_t klovrp_GetBoundaryVisibility(int *out) {
+    ovrp_hit("ovrp_GetBoundaryVisibility");
+    if (out) *out = 2;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_RequestBoundaryVisibility(int visibility) {
+    ovrp_hit("ovrp_RequestBoundaryVisibility");
+    (void)visibility;
+    return OVRP_SUCCESS;
+}
+// ovrpBool out-parameters that are "no" on this headset, with the call itself
+// succeeding: local dimming (a Quest Pro panel), hands and controllers at once.
+static uint64_t klovrp_GetLocalDimmingSupported(int *out) {
+    ovrp_hit("ovrp_GetLocalDimmingSupported");
+    if (out) *out = 0;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_IsMultimodalHandsControllersSupported(int *out) {
+    ovrp_hit("ovrp_IsMultimodalHandsControllersSupported");
+    if (out) *out = 0;
+    return OVRP_SUCCESS;
+}
+// ...and the eye layer's alpha being premultiplied, which is how it is read
+// while a passthrough layer is submitted (kl_reproject.c): yes.
+static uint64_t klovrp_GetEyeFovPremultipliedAlphaMode(int *out) {
+    ovrp_hit("ovrp_GetEyeFovPremultipliedAlphaMode");
+    if (out) *out = OVRP_TRUE;
+    return OVRP_SUCCESS;
 }
 
 int kl_ovrp_overlay_count(void) {
@@ -7261,6 +7391,12 @@ static uint64_t klovrp_EnqueueSubmitLayer2(uint32_t flags, void *texL, void *tex
     (void)frame_index;
     if (flags & KLOVRP_SUBMIT_HIDDEN) return OVRP_SUCCESS;
     struct klovrp_layer *l = klovrp_layer(layer_id);
+    // A passthrough layer has no picture to hand on; that it is being filed is
+    // the whole of it (klovrp_pt_submits).
+    if (l && !l->is_eye && klovrp_shape_is_passthrough(l->desc.shape)) {
+        klovrp_pt_enqueued(l->desc.shape);
+        return OVRP_SUCCESS;
+    }
     if (l && !l->is_eye && g_enq_n < KLOVRP_MAX_LAYERS) {
         kl_ovrp_overlay *o = &g_enq[g_enq_n++];
         memset(o, 0, sizeof *o);
@@ -8607,6 +8743,16 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
      (void *)klovrp_DestroyInsightPassthroughGeometryInstance},
     {"ovrp_UpdateInsightPassthroughGeometryTransform",
      (void *)klovrp_UpdateInsightPassthroughGeometryTransform},
+    {"ovrp_IsInsightPassthroughSupported", (void *)klovrp_IsInsightPassthroughSupported},
+    {"ovrp_GetPassthroughCapabilities", (void *)klovrp_GetPassthroughCapabilities},
+    {"ovrp_GetPassthroughPreferences", (void *)klovrp_GetPassthroughPreferences},
+    {"ovrp_SetInsightPassthroughStyle2", (void *)klovrp_SetInsightPassthroughStyle2},
+    {"ovrp_GetBoundaryVisibility", (void *)klovrp_GetBoundaryVisibility},
+    {"ovrp_RequestBoundaryVisibility", (void *)klovrp_RequestBoundaryVisibility},
+    {"ovrp_GetLocalDimmingSupported", (void *)klovrp_GetLocalDimmingSupported},
+    {"ovrp_IsMultimodalHandsControllersSupported",
+     (void *)klovrp_IsMultimodalHandsControllersSupported},
+    {"ovrp_GetEyeFovPremultipliedAlphaMode", (void *)klovrp_GetEyeFovPremultipliedAlphaMode},
 };
 
     // Entry points answered by one of the shared handlers above. Each is reached
@@ -8656,6 +8802,8 @@ static const char *const g_ovrp_result_ok[] = {
     "ovrp_QplMarkerPointCached", "ovrp_QplMarkerAnnotation",
     "ovrp_QplCreateMarkerHandle", "ovrp_QplDestroyMarkerHandle",
     "ovrp_QplSetConsent", "ovrp_QplMarkerAnnotationWithType",
+    // ...and the three a 1.109 guest adds (Demeo).
+    "ovrp_QplMarkerAnnotationVariant", "ovrp_QplMarkerPointData", "ovrp_QplMarkerStartForJoin",
     // Unified telemetry-consent flow (Meta's data-collection opt-in). UE5's
     // Meta XR plugin queries ovrp_GetUnifiedConsent at startup, before any
     // rendering — olar aborted here on the unimplemented trampoline (signal 6).

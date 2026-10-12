@@ -42,3 +42,8 @@
 // the guest-facing media table and wants <stdio.h> and CoreVideo context the
 // Swift side has no other use for.
 void kl_mediandk_set_video_default(int on);
+// ...and two from the Oculus Platform stand-in (kl_ovrplat.c), for the start
+// window's "Player name": is this a game that is handed the offline user, and
+// is it one whose user gets an id of this installation's own.
+int kl_ovrplat_offline_user_for(const char *target);
+int kl_ovrplat_user_id_per_install(const char *target);

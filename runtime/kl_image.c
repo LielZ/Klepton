@@ -583,9 +583,14 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
                     // NullReferenceException follows when its first menu comes
                     // up; with the library loaded there is none (Mac host,
                     // 2026-10-12).
+                    // ...and Demeo (x3634830803298285): libInteractionSdk,
+                    // refused, is a DllNotFoundException as its hand-tracking
+                    // module comes up; loaded, there is none (Mac host,
+                    // 2026-10-12).
                     on = kl_env_on("KL_ELF_TLSDESC", t && (strcmp(t, "x3635172946605196") == 0 ||
                                                            strcmp(t, "x4360608937312293") == 0 ||
-                                                           strcmp(t, "x2773034772778845") == 0));
+                                                           strcmp(t, "x2773034772778845") == 0 ||
+                                                           strcmp(t, "x3634830803298285") == 0));
                 }
                 if (!on) {
                     err("unhandled relocation type %u at %#llx (ELF TLS; KL_ELF_TLSDESC=1 serves it)",

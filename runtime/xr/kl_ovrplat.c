@@ -1912,7 +1912,7 @@ static uint64_t klplat_Achievements_GetAllProgress(void) {
 // GetLoggedInUser returns 0, so for it the synthetic offline user is not
 // optional; the knob still overrides in either direction. Beat Saber and the
 // rest keep the default-0 offline path (they tolerate no user).
-static int klplat_user_default(void) {
+static int klplat_user_listed(const char *t) {
     // Titles that ABORT when ovr_GetLoggedInUserID / GetLoggedInUser returns 0 —
     // they put up "Unable to get a valid UserID ... check you have an Entitlement"
     // and then FMessageDialog->abort on the game thread. A synthetic offline user
@@ -1965,18 +1965,89 @@ static int klplat_user_default(void) {
                                 // file is opened and no scene loaded for 2400
                                 // frames (Mac host, 2026-10-12). With the user
                                 // it goes on to load its first hall.
-                                "x2773034772778845" };
+                                "x2773034772778845",
+                                // Demeo: its lobby loads and stays black behind
+                                // "[GameStartup] Waiting for startup to
+                                // finish..." — "AccountID not set, will fetch
+                                // from provider", then this request's "Request
+                                // failed." and a sign-in that times out every
+                                // ten seconds for want of a user id (on device,
+                                // 2026-10-13). With the user: "PlayerData loaded
+                                // successfully", "Startup finished!" (Mac host).
+                                // Its user proof stays the error it is.
+                                "x3634830803298285" };
     // Beat Saber from 1.45 on (Unity 6; kl_guest_beatsaber_openxr): its start
     // asks for the user FIRST and goes no further without one — no entitlement
     // request, no scene, one draw a frame of black and silence (on device,
     // 2026-10-12). 1.40 asks the same question fourth and carries on with a 0,
     // so it is the build and not the row that decides.
-    extern int kl_guest_beatsaber_openxr(void);
-    if (kl_guest_beatsaber_openxr()) return 1;
-    const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
     return 0;
+}
+static int klplat_user_default(void) {
+    extern int kl_guest_beatsaber_openxr(void);
+    if (kl_guest_beatsaber_openxr()) return 1;
+    return klplat_user_listed(kl_driver_target_name());
+}
+// For the start window, which is shown before the driver has a target: is this
+// a game that is handed the offline user (and so one a player name means
+// something to)?
+int kl_ovrplat_offline_user_for(const char *target) {
+    return kl_env_on("KL_PLAT_USER", klplat_user_listed(target));
+}
+
+// The offline user's name and id.
+//
+// The name is the player's to choose (KL_PLAT_USER_NAME, set by the start
+// window's "Player name"): a game shows it as the account's name and offers no
+// way to change it, because on a Quest it is the Meta account's. Demeo reads
+// ovr_User_GetOculusID ("Got Oculus Account Name: kleptonplayer") and its owner
+// asked for a way to set it (2026-10-13). Unset, the names are what they were.
+// The display name is the text as typed; the Oculus ID — a handle, which on a
+// Quest has no spaces — is the same with anything but letters, digits, '.',
+// '_' and '-' taken out.
+static char g_user_display[64] = "Klepton Player", g_user_handle[64] = "kleptonplayer";
+static uint64_t g_user_id = 1000000000000042ull;   // fixed, non-zero synthetic ovrID
+static pthread_once_t g_user_once = PTHREAD_ONCE_INIT;
+static void klplat_user_init(void) {
+    const char *n = kl_env_str("KL_PLAT_USER_NAME", NULL);
+    if (n && *n) {
+        char d[sizeof g_user_display], h[sizeof g_user_handle];
+        size_t dn = 0, hn = 0;
+        for (const unsigned char *c = (const unsigned char *)n; *c && dn < 40; c++) {
+            if (*c < 0x20 || *c == 0x7f) continue;                 // control characters
+            d[dn++] = (char)*c;
+            if (hn < 40 && ((*c >= '0' && *c <= '9') || (*c >= 'A' && *c <= 'Z') ||
+                            (*c >= 'a' && *c <= 'z') || *c == '.' || *c == '_' || *c == '-'))
+                h[hn++] = (char)*c;
+        }
+        // Not in the middle of a UTF-8 sequence.
+        while (dn > 0 && ((unsigned char)d[dn - 1] & 0xC0) == 0x80) dn--;
+        if (dn > 0 && ((unsigned char)d[dn - 1] & 0x80)) dn--;
+        d[dn] = 0; h[hn] = 0;
+        if (dn) memcpy(g_user_display, d, dn + 1);
+        if (hn) memcpy(g_user_handle, h, hn + 1);
+        fprintf(stderr, "  [plat] offline user named \"%s\" (Oculus ID \"%s\") — KL_PLAT_USER_NAME\n",
+                g_user_display, g_user_handle);
+    }
+    // The id is one number for everybody unless told otherwise — and a game
+    // that keys an account of its own on it then has ONE account for every
+    // player of this runtime. Demeo does ("Fetch account ID completed, ID is:
+    // 1000000000000042", then its anonymous sign-in), so for it the start window
+    // makes a number of this installation's own and hands it over here
+    // (KL_PLAT_USER_ID; kl_ovrplat_user_id_per_install). Every other game keeps
+    // the fixed one, which their saves are filed under.
+    const char *e = kl_env_str("KL_PLAT_USER_ID", NULL);
+    uint64_t v = e && *e ? strtoull(e, NULL, 10) : 0;
+    if (v) {
+        g_user_id = v;
+        fprintf(stderr, "  [plat] offline user has this installation's own id (KL_PLAT_USER_ID)\n");
+    }
+}
+static uint64_t klplat_user_id(void) { pthread_once(&g_user_once, klplat_user_init); return g_user_id; }
+int kl_ovrplat_user_id_per_install(const char *target) {
+    return target && strcmp(target, "x3634830803298285") == 0;
 }
 static uint64_t klplat_User_GetLoggedInUser(void) {
     plat_hit("ovr_User_GetLoggedInUser");
@@ -2003,7 +2074,7 @@ static uint64_t klplat_User_GetLoggedInUser(void) {
 // (see the user-proof note above).
 static uint64_t klplat_User_Get(uint64_t user_id) {
     plat_hit("ovr_User_Get");
-    if (user_id == 1000000000000042ull &&          // == klplat_User_GetID's synthetic ovrID
+    if (user_id == klplat_user_id() &&             // == klplat_User_GetID's synthetic ovrID
         kl_env_on("KL_PLAT_USER", klplat_user_default()))
         return klplat_request("ovr_User_Get", KLPLAT_MSG_USER_GET, 0);
     return klplat_request_err("ovr_User_Get", KLPLAT_MSG_USER_GET);
@@ -2045,15 +2116,17 @@ static uint64_t klplat_User_GetOrgScopedID(uint64_t user_id) {
 // KL_PLAT_USER handed out the user above.
 static uint64_t klplat_User_GetID(const void *h) {
     plat_hit("ovr_User_GetID"); (void)h;
-    return 1000000000000042ull;          // fixed, non-zero synthetic ovrID
+    return klplat_user_id();
 }
 static const char *klplat_User_GetOculusID(const void *h) {
     plat_hit("ovr_User_GetOculusID"); (void)h;
-    return "kleptonplayer";
+    pthread_once(&g_user_once, klplat_user_init);
+    return g_user_handle;
 }
 static const char *klplat_User_GetDisplayName(const void *h) {
     plat_hit("ovr_User_GetDisplayName"); (void)h;
-    return "Klepton Player";
+    pthread_once(&g_user_once, klplat_user_init);
+    return g_user_display;
 }
 // The rest of the User model, which the SDK's C# constructor reads in one go
 // (Walkabout builds the whole object from the GetLoggedInUser completion): the
@@ -2608,7 +2681,7 @@ static uint64_t klplat_GetLoggedInUserID(void) {
         if (!saidu) { saidu = 1;
             fprintf(stderr, "  [plat] ovr_GetLoggedInUserID -> synthetic offline "
                     "user (KL_PLAT_USER=1); NOT an entitlement grant\n"); }
-        return 1000000000000042ull;   // == klplat_User_GetID's synthetic ovrID
+        return klplat_user_id();      // == klplat_User_GetID's synthetic ovrID
     }
     static int said;
     if (!said) {

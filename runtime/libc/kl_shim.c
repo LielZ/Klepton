@@ -756,7 +756,19 @@ static int kl_socket(int domain, int type, int protocol) {
                             "(interface scan uses getifaddrs, not this socket)\n", fd);
         return fd;
     }
+    // Linux lets the type carry two flags Darwin has no bits for: SOCK_NONBLOCK
+    // (04000) and SOCK_CLOEXEC (02000000). Passed on as they are, Darwin reads
+    // them as part of the type and refuses the socket ("Protocol wrong type for
+    // socket") — which is every connection of a guest whose HTTP stack opens its
+    // sockets this way. Unity 6's does (Demeo, 2026-10-13: `socket(dom=2
+    // type=2049 proto=6) -> -1` for each request, "Cannot connect to
+    // destination host" in the game, and a start that waited on its servers for
+    // ever). Taken off the type and set on the descriptor instead.
+    int lx_nonblock = type & 0x800, lx_cloexec = type & 0x80000;
+    type &= ~(0x800 | 0x80000);
     int fd = socket(domain, type, protocol);
+    if (fd >= 0 && lx_nonblock) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    if (fd >= 0 && lx_cloexec) fcntl(fd, F_SETFD, FD_CLOEXEC);
     if (fd >= 0) kl_grow_sock_buffers(fd);
     // A failed send on a non-stream socket must come back as an error, never as
     // SIGPIPE. Linux never raises SIGPIPE for datagram sockets; Darwin does
@@ -795,8 +807,9 @@ static int kl_socket(int domain, int type, int protocol) {
     }
 #endif
     if (kl_net_trace())
-        fprintf(stderr, "  [net] socket(dom=%d type=%d proto=%d) -> fd %d%s\n",
-                domain, type, protocol, fd, fd < 0 ? strerror(errno) : "");
+        fprintf(stderr, "  [net] socket(dom=%d type=%d%s%s proto=%d) -> fd %d%s\n",
+                domain, type, lx_nonblock ? "|NONBLOCK" : "", lx_cloexec ? "|CLOEXEC" : "",
+                protocol, fd, fd < 0 ? strerror(errno) : "");
     return fd;
 }
 

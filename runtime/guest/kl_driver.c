@@ -215,7 +215,16 @@ static void kl_driver_env_defaults(const kl_target *t) {
         setenv("KL_USLEEP_CAP", "250", 0);   // microseconds; the FMOD poll slept 5-33 ms/call
         setenv("KL_GUEST_QOS",  "1",   0);   // USER_INITIATED instead of default
     }
-    else if (!strcmp(t->name, "walkabout")) {
+    else if (!strcmp(t->name, "walkabout") || !strcmp(t->name, "x3634830803298285")) {
+        // Demeo (x3634830803298285) is here for the same complaint, word for
+        // word a session later ("es ruckelt alle 5-10 Sekunden einmal für ca
+        // 500 ms", 2026-10-13): its first long session compiled 240 pipelines
+        // at about 300 ms each as they were first drawn, which accounts for
+        // most of the stalls in its log — and not for all of them: its owner
+        // sees them standing still in a room as well, and some were the
+        // compositor's own presents arriving late, with the app at 7.5 to 7.7
+        // of its 8.2 GB. So the watch below is on for it too.
+        //
         // "It lags every few seconds" (a Vision Pro, 2026-10-11): the display
         // keeps its 100 Hz, and the GAME's frames arrive 100-300 ms late now
         // and then. Say what each such moment was — the stall watch names the

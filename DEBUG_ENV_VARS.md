@@ -98,8 +98,24 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   passthrough layer; while one is in the guest's submit list the eye picture is
   no longer forced opaque — its alpha says where the room shows — and the black
   of `KL_MIXED_BLACK` is left out. Default 1 for TRIANGLE STRATEGY
-  (`x5340130476095884`), 0 for everyone else, who are told "unsupported" as
-  before. Log lines start `[ovrp] passthrough:`.
+  (`x5340130476095884`) and Demeo (`x3634830803298285`), 0 for everyone else,
+  who are told "unsupported" as before. A layer filed through
+  `ovrp_EnqueueSubmitLayer2` (Unity) counts like one in `ovrp_EndFrame4`'s
+  list. Log lines start `[ovrp] passthrough:`.
+- `KL_PLAT_USER_NAME=<name>` / `KL_PLAT_USER_ID=<number>` — (`kl_ovrplat.c`)
+  the offline user's name and id (`KL_PLAT_USER`). The name is what the start
+  window's "Player name" holds: the display name as typed, the Oculus ID the
+  same with only letters, digits, `.`, `_` and `-` kept; unset, "Klepton
+  Player" / "kleptonplayer". The id is 1000000000000042 for every player unless
+  given; for a game that keys an account of its own on it (Demeo) the app makes
+  one random number per installation and passes it here.
+- `KL_OVRP_UNANSWERED=unsupported|abort` — what an OVRPlugin entry point with no
+  answer in `kl_ovrp.c` does when the guest calls it: end the run with its name
+  (`abort`, the default) or say `UNSUPPORTED` and go on, named once in the log
+  (`[ovrp] no answer for …`). Default `unsupported` for Demeo, which is told its
+  own plugin version 1.109.0 (`KL_OVRP_VERSION`) so that its C# asks for
+  passthrough at all, and can then reach some two hundred entry points nothing
+  here has seen called.
 - `KL_OVRP_PT_ALPHA=opaque|coverage|inverse` — what the eye picture's alpha
   means while a passthrough layer is submitted: `coverage` 1 = the game's
   picture, `inverse` 0 = the game's picture, `opaque` ignore it. Unset, it is

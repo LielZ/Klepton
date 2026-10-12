@@ -409,7 +409,7 @@ static klj_val klj_AudioDeviceInfo_emptyInts(void *e, void *s, const klj_val *a,
 static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *route;
-    if (!route) route = kl_jni_new_object("android/media/MediaRouter$RouteInfo");
+    if (!route) { route = kl_jni_new_object("android/media/MediaRouter$RouteInfo"); kl_jni_pin_object(route); }
     return (klj_val){.l = route};
 }
 
@@ -426,8 +426,13 @@ static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj
 
 static klj_val klj_Context_getContentResolver(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
+    // Kept across calls, so pinned (kl_jni_pin_object): unpinned it was retired
+    // at the caller's next local-frame pop, and the second caller was handed a
+    // dead pointer. Unity asks once, for its device identifier; Demeo's own C#
+    // asks again as it signs in, and stopped on "GetObjectClass on an untagged
+    // pointer" (Mac host, 2026-10-13).
     static void *resolver;
-    if (!resolver) resolver = kl_jni_new_object("android/content/ContentResolver");
+    if (!resolver) { resolver = kl_jni_new_object("android/content/ContentResolver"); kl_jni_pin_object(resolver); }
     return (klj_val){.l = resolver};
 }
 

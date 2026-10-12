@@ -823,6 +823,7 @@ struct BootView: View {
                     if isLauncher { LauncherPanel() }
                     if klIsAlyx() { AlyxPanel(started: running || finished || run.started) }
                     PlayerSettingsView()
+                    PlayerNameView()
                     GameLanguageView()
                     // Everything a player does not need to understand to play: the
                     // dials of the port itself, and the report of this run.
@@ -933,6 +934,7 @@ struct BootView: View {
             // dial: off unless turned on, and read once at boot.
             DisclosureGroup("Rendering") { RenderingView() }
                 .font(.callout)
+            PlayerNameView()
             GameLanguageView()
 
             // ...and the microphone opt-in, same window, collapsed by default.
@@ -1109,6 +1111,7 @@ struct BootView: View {
 
             KleptonRendering.shared.apply()
             KleptonLanguage.shared.apply()
+            KleptonPlayer.shared.apply()
             KleptonProgramCaches.dropIfBuildChanged()
             var result = kl_app_boot()
 

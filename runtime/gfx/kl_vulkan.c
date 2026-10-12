@@ -595,9 +595,14 @@ static int klvk_park_instances(void) {
         // parked, 6 of 6 created their device.
         // Max Mustard (x5269080709783454) takes the handle answer too (see
         // klovrp_adapter_is_phys), so it needs the probe's device kept alive.
+        // Demeo (x3634830803298285) likewise: with the handle answer alone,
+        // three host runs created their device and the fourth enumerated
+        // another VkPhysicalDevice and ended on "Unable to initialize the
+        // Unity Engine Graphics API".
         on = kl_env_on("KL_VK_PARK_INSTANCE",
                        t && (strcmp(t, "walkabout") == 0 || strcmp(t, "batman") == 0 ||
-                             strcmp(t, "x5269080709783454") == 0));
+                             strcmp(t, "x5269080709783454") == 0 ||
+                             strcmp(t, "x3634830803298285") == 0));
     }
     return on;
 }
@@ -6442,7 +6447,14 @@ static uint32_t klvk_sample_mask(void) {
     if (v < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
-        v = kl_env_int("KL_VK_MAX_SAMPLES", t && strcmp(t, "x5812519008825194") == 0 ? 2 : 0);
+        // Demeo (x3634830803298285) is the same engine with the same pairs — a
+        // 4x colour and depth target for each of its three eye stages, at the
+        // 3936x2465 its plugin widens the eye to — and the same arithmetic: the
+        // app went from 0.6 to 5.5 GB in the second its eye layer was set up
+        // and played at 7.5 to 7.7 of its 8.2 GB, 0.5 GB from being ended, with
+        // presents arriving late now and then (on device, 2026-10-13).
+        v = kl_env_int("KL_VK_MAX_SAMPLES", t && (strcmp(t, "x5812519008825194") == 0 ||
+                                                  strcmp(t, "x3634830803298285") == 0) ? 2 : 0);
     }
     return v == 1 ? 0x1u : v == 2 ? 0x3u : v == 4 ? 0x7u : ~0u;
 }
