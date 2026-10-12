@@ -210,10 +210,9 @@ final class KleptonRendering: ObservableObject {
     private static let msaaKey = "klepton.msaa"
     static let targetHasMSAA: Bool = {
         let t = String(cString: kl_app_target_name_or_default())
-        // Beat Saber (from 1.45 on), Doom 3 and Maestro: the guests
-        // kl_glfb.c's klfb_msaa_guest names.
-        return t == "beatsaber140" || t == "beatsaber" || t == "doom3quest"
-            || t == "x6963344583787383"
+        // Beat Saber (from 1.45 on) and Maestro: the guests kl_glfb.c's
+        // klfb_msaa_guest names. Doom 3 was one of them for a release.
+        return t == "beatsaber140" || t == "beatsaber" || t == "x6963344583787383"
     }()
     static let targetIsBeatSaber: Bool = {
         let t = String(cString: kl_app_target_name_or_default())
@@ -406,5 +405,61 @@ struct GameLanguageView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+// Caches of LINKED GL programs that a game keeps in its own files.
+//
+// Unreal on GLES stores the driver's program binaries
+// (android-files/ProgramBinaryCache/GLSL_ES3_1_ANDROID_<hash>) and at the next
+// start hands them back with glProgramBinary instead of compiling its shaders.
+// It names the cache after the GL strings, which here are ours and never change
+// — while what answers glProgramBinary is ANGLE, and ANGLE refuses a binary made
+// by another build of itself (its ANGLE_PROGRAM_VERSION is a hash over its own
+// sources). Unreal treats that refusal as fatal: it asks to quit and then runs
+// into its own missing programs. That is how Maestro stopped at start after
+// toolchain 344 brought the first new ANGLE build since the game was installed
+// (seen on the owner's headset, 2026-10-12: no shader compiled before the first
+// draw, GL_INVALID_OPERATION on every glUseProgram, a burst of ForceQuit).
+// Unity keeps such a cache too and compiles again when one is refused.
+//
+// So the cache does not outlive the build of the app that made it: when the
+// bundle's build (version code and toolchain) differs from the one remembered,
+// every ProgramBinaryCache folder in the game's files is removed before the
+// guest boots, and the game compiles its programs once more.
+enum KleptonProgramCaches {
+    private static let key = "klepton.programCacheBuild"
+
+    static func dropIfBuildChanged() {
+        let build = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? ""
+        let defaults = UserDefaults.standard
+        guard !build.isEmpty, defaults.string(forKey: key) != build else { return }
+        let fm = FileManager.default
+        var dropped: [String] = []
+        if let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
+            let root = docs.appendingPathComponent("android-files")
+            if let walk = fm.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey],
+                                        options: [.skipsHiddenFiles]) {
+                for case let url as URL in walk {
+                    let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                    guard isDir else { continue }
+                    if url.lastPathComponent == "ProgramBinaryCache" {
+                        walk.skipDescendants()
+                        if (try? fm.removeItem(at: url)) != nil {
+                            dropped.append(url.path.replacingOccurrences(of: root.path + "/", with: ""))
+                        }
+                    } else if walk.level >= 5 {
+                        // Unreal puts it at the top of the files or under
+                        // UE4Game/<project>/<project>/Saved; no need to walk a
+                        // game's whole content for it.
+                        walk.skipDescendants()
+                    }
+                }
+            }
+        }
+        defaults.set(build, forKey: key)
+        NSLog("[app] program caches: build \(build) is new to this copy — "
+              + (dropped.isEmpty ? "no ProgramBinaryCache found"
+                                 : "removed \(dropped.joined(separator: ", "))"))
     }
 }

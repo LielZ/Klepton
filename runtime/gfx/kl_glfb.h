@@ -349,6 +349,8 @@ void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
 // give still gets.
 // How many layers a guest rate map needs (two for a mirrored multiview guest).
 int kl_glfb_rate_map_layers(void);
+// 1 when each of those layers gets its own eye's curve, 0 for the envelope.
+int kl_glfb_rate_map_per_eye(void);
 // Will a guest whose eyes are copied out of an array swapchain be foveated this
 // run (see klfb_mirror_vrr)? Answerable before the guest boots.
 int kl_glfb_mirror_foveation_wanted(void);

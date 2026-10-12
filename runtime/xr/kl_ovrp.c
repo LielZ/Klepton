@@ -1382,6 +1382,17 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
         // dense region does not move with the eyes.
         extern int kl_glfb_mirror_foveation_wanted(void);
         if (kl_guest_beatsaber_openxr() && kl_glfb_mirror_foveation_wanted()) cap_dflt = 5740;
+        // Doom 3 likewise, a step lower: it squares and supersamples what it is
+        // told (5200 becomes 5720x5720 an eye), which at this cap is the
+        // display's own height and five sixths of its width. Its owner asked
+        // for more than the 4000 it had ("Bei Foveated rendering sollte man
+        // höher gehen können"). Both eyes are drawn through the envelope of the
+        // display's two curves (kl_glfb_rate_map_per_eye), which keeps about a
+        // third of the fragments: some 10 million an eye here against 6 at
+        // 4400x4400 — and 19 million for that size unfoveated, which is what
+        // this game was first tuned against. "Resolution" in the start window
+        // scales it down.
+        if (t && strcmp(t, "doom3quest") == 0 && kl_glfb_mirror_foveation_wanted()) cap_dflt = 5200;
     }
     int cap = kl_env_int("KL_OVRP_EYE_MAX", cap_dflt);
     if (cap > 0 && (w > cap || h > cap)) {

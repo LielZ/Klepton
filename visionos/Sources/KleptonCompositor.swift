@@ -1230,11 +1230,23 @@ final class KleptonCompositor {
         // of the width: at 6890x5526 it stores 4509x2720 an eye where the
         // display itself keeps 2624x2560. With its own curve an eye stores about
         // what its display keeps — over 40% fewer fragments for the guest — and
-        // unwarpGrid reads each eye through its own layer. KL_VRR_PER_EYE=0 is
-        // the envelope for both, as before.
+        // unwarpGrid reads each eye through its own layer.
+        //
+        // Only for a guest it was looked at with (kl_glfb_rate_map_per_eye: Beat
+        // Saber from 1.45 on, whose owner called both eyes fine). The two curves
+        // are mirror images, each eye's dense part inboard, so one spot of the
+        // scene is sharp for one eye and coarse for the other — which is what
+        // the display does to every picture, and in Doom 3 it was seen all the
+        // same: "auf dem linken auge nur links vom bild … aber dafür übers halbe
+        // bild und auf dem rechten auge nur rechts", at 4400, at 5720 and at
+        // 6759 across alike, so the size of the eye texture is not what decides
+        // it (a rule by size was tried for a build and did not help). Every
+        // other guest gets the envelope for both eyes, as until 1.1.5.
+        // KL_VRR_PER_EYE=0|1 decides regardless.
+        let perEyeWanted = klEnvOn("KL_VRR_PER_EYE", default: kl_glfb_rate_map_per_eye() != 0)
         let perEye = layers == 2 && displayEyeQualityX.count == 2
             && displayEyeQualityX[0].count == qx.count && source == "the display's own"
-            && klEnvOn("KL_VRR_PER_EYE", default: true)
+            && perEyeWanted
         func makeLayer(_ i: Int) -> MTLRasterizationRateLayerDescriptor {
             let hx = perEye ? displayEyeQualityX[i] : qx
             return hx.withUnsafeBufferPointer { hp in
@@ -1246,6 +1258,7 @@ final class KleptonCompositor {
             }
         }
         if perEye { source += ", a curve per eye" }
+        else if layers == 2, source == "the display's own" { source += ", one envelope for both eyes" }
         let desc = MTLRasterizationRateMapDescriptor()
         desc.screenSize = MTLSize(width: w, height: h, depth: 0)
         desc.label = "klepton guest foveation"

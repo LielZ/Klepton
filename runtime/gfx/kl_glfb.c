@@ -3811,17 +3811,22 @@ void kl_glfb_set_msaa_default(int samples) {
 // Which guests the setting is for, and how they attach their eyes:
 //   1  asks for the multisampled attachment itself — Beat Saber from 1.45 on and
 //      Maestro (both ask for 4 samples; read in their logs on the headset);
-//   2  attaches plain multiview and is upgraded (klfb_FramebufferTextureMultiviewOVR)
-//      — Doom 3, which takes the multisampled call only where it resolves, and it
-//      does not resolve for it here.
+//   2  attaches plain multiview and is upgraded (klfb_FramebufferTextureMultiviewOVR).
+//      Nobody by default. Doom 3 was, for one release (1.1.7): on the owner's
+//      headset its picture flickered black now and then with it and stopped
+//      doing so with the setting off, so it is out again ("erstmal für Doom AA
+//      entfernen und auf off forcen"). Why is not known — the game uses the
+//      stencil buffer and reopens its eye pass every frame, which is the part
+//      of the restore no other guest exercises. KL_GL_MSAA_PLAIN=1 with
+//      KL_GL_MSAA_MV=1 is the upgrade again, for finding out.
 static int klfb_msaa_guest(void) {
     extern int kl_guest_beatsaber_openxr(void);
     extern const char *kl_driver_target_name(void);
     const char *t = kl_driver_target_name();
     if (kl_guest_beatsaber_openxr()) return 1;
     if (t && strcmp(t, "x6963344583787383") == 0) return 1;
-    if (t && strcmp(t, "doom3quest") == 0) return 2;
-    return 0;
+    (void)t;
+    return kl_env_on("KL_GL_MSAA_PLAIN", 0) ? 2 : 0;
 }
 static int g_msaa_on = -1, g_msaa_forced, g_msaa_kind;
 static void (*g_msaa_real)(uint32_t, uint32_t, uint32_t, int32_t, int32_t, int32_t, int32_t);
@@ -4945,6 +4950,13 @@ static void klfb_resync_fbo(uint32_t fb) {
 // How many layers a guest rate map needs: a mirrored guest that renders both
 // eyes in one layered pass (OVR_multiview) needs one per slice.
 int kl_glfb_rate_map_layers(void) { return g_eye_mirroring && klfb_mirror_vrr() ? 2 : 1; }
+// ...and whether those two layers each get their own eye's curve of the
+// display's map, or both the envelope of the two (KleptonCompositor's
+// updateGuestRateMap has the reasons). Beat Saber from 1.45 on only.
+int kl_glfb_rate_map_per_eye(void) {
+    extern int kl_guest_beatsaber_openxr(void);
+    return kl_guest_beatsaber_openxr();
+}
 
 void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate_map) {
     if (!kl_glfb_init() || !mtl_resolve()) return;

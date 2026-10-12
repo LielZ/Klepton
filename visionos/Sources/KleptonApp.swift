@@ -1056,6 +1056,7 @@ struct BootView: View {
 
             KleptonRendering.shared.apply()
             KleptonLanguage.shared.apply()
+            KleptonProgramCaches.dropIfBuildChanged()
             var result = kl_app_boot()
 
             // The audio session, and the placement is deliberate on both sides.

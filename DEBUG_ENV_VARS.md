@@ -78,10 +78,11 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   `kl_glfb_set_msaa_default`; shown for Beat Saber's two rows, off unless
   chosen) decides where this switch is not set. On the owner's headset 4x at
   the display's full resolution (foveated) dropped a song to 60 Hz halfway.
-  The setting is offered to three guests (`klfb_msaa_guest`): Beat Saber from
-  1.45 on and Maestro, which ask for the multisampled attachment themselves, and
-  Doom 3, whose plain multiview attachments (colour and depth-stencil) are
-  upgraded to it.
+  The setting is offered to two guests (`klfb_msaa_guest`): Beat Saber from
+  1.45 on and Maestro, which ask for the multisampled attachment themselves.
+  `KL_GL_MSAA_PLAIN=1` (with `KL_GL_MSAA_MV=1`) also upgrades a guest's plain
+  multiview attachments, colour and depth-stencil — what Doom 3 had in 1.1.7,
+  where its picture flickered black now and then.
 - `KL_FULL=1` / `KL_MIXED_BLACK=0` — (`KleptonApp.swift`, `Immersive`) every
   game opens a mixed immersive space (the panel runs at up to 100 Hz there and
   stays; a full space runs at up to 120 and visionOS halves that to 60 once the
@@ -2880,11 +2881,14 @@ written down is a value found twice.
 - `KL_CP_FORMAT=16` — drawable back to `rgba16Float`; the default is 8-bit
   `bgra8Unorm_srgb` (ALVR's choice — half the composite bandwidth, hardware
   sRGB encode on write). The guest's eye textures stay RGBA16F either way.
-- `KL_VRR_PER_EYE=0` — (headset compositor) give both layers of a mirrored
-  guest's rate map the envelope of the two eyes' curves, as before. Default 1:
-  each layer gets its own eye's curve (the display's, made an exact mirror
-  pair), which stores about what the display keeps — at 6890x5526, 2784x2720
-  an eye where the envelope stored 4509x2720.
+- `KL_VRR_PER_EYE=0|1` — (headset compositor) 0 gives both layers of a
+  mirrored guest's rate map the envelope of the two eyes' curves; 1 gives each
+  layer its own eye's curve (the display's, made an exact mirror pair), which
+  stores about what the display keeps — at 6890x5526, 2784x2720 an eye where
+  the envelope stored 4509x2720. Not set, the guest decides
+  (`kl_glfb_rate_map_per_eye`): a curve per eye for Beat Saber from 1.45 on,
+  the envelope for every other guest — in Doom 3 one eye coarser than the other
+  at the same spot was seen and disliked, at every size tried.
 - `KL_VRR_MIRROR_PHYS=0` — (`runtime/gfx/kl_glfb.c`) copy a foveated mirrored
   eye as the whole texture again. Default 1: only the map's physical part,
   which is all the guest wrote.
