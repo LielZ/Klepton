@@ -3568,3 +3568,30 @@ Not from his fork, found on the way (2026-10-13):
   frame. `runtime/xr/kl_ovrp.c`.
 - `KL_BUILD_MODEL=<name>` — existing override; **Red Matter 2 is told "Quest"**,
   the only Quest model name it knows.
+- `KL_OVRP_EYE_DESC_CAP=1` — the eye cap (`KL_OVRP_EYE_MAX` or the target's
+  default) also bounds the layer a guest ends up with after its OWN scale, not
+  only the size it is offered. Moss multiplies the offer by 1.5 in a level and
+  got 4608x3697 an eye over a 3072 cap: 18.8 ms of GPU a frame on the headset,
+  45 frames a second. **Default off, on for Moss** (seen on the headset: about
+  110 frames a second); Beat Saber's 1.2x level scale is wanted. His fork
+  bounds the desc always. `klovrp_fill_eye_desc`.
+- `KL_OVRP_EYE_ALIGN=<n>` — each axis of the eye size is rounded down to a
+  multiple of n, last of all. **Default 1 (off), 4 for Moss.** Unreal rounds its
+  scene buffers UP to a multiple of 4 and kl_fove compares extents exactly: Moss
+  drew a 3840x2468 scene for a 3840x2465 eye, and foveated rendering was on and
+  marked nothing (`[fove] near miss … at ANOTHER extent`, `encoders marked 0`).
+  On the Mac with 4: marked, 5.0 ms of GPU a frame instead of 18. From his fork
+  (be18669). `klovrp_eye_align`.
+- `KL_VK_ANISO=<n>` (2..16) — a Vulkan guest's linearly filtered samplers get
+  at least n-fold anisotropic filtering; compare and unnormalized samplers are
+  left alone. **Default off.** Moss asks for none at all (its Quest 2 device
+  profile ends at `r.MaxAnisotropy` 1; the census line `[vk] samplers so far`
+  says what a guest asked for). `klvkrec_CreateSampler`.
+- `KL_STATS_CARD=1`, `KL_GUEST_PACE_DIV=2` — existing switches, now also Test
+  switches for every game: the frame-rate line in the headset, and a frame on
+  every second refresh while the panel runs at its full rate.
+
+Moss's defaults since 2026-10-13 (the owner's setting on the headset): `KL_OVRP_EYE_MAX` 4608,
+`KL_OVRP_EYE_DESC_CAP` on, `KL_OVRP_EYE_ALIGN` 4, `KL_VK_ANISO` 16, `KL_GUEST_PACE_DIV` 2, foveated
+rendering at "high". "high" itself changed with it for every Vulkan game: box 0.18 and floor 0.16 (were
+0.30 and 0.08); the Test switch `KL_FOVE_BOX=0.30` + `KL_FOVE_FLOOR=0.08` is the way back.

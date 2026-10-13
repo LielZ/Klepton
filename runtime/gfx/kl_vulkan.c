@@ -9494,12 +9494,48 @@ static VkResult VKAPI_CALL klvk_CreateBufferView(VkDevice dev,
 // replayer are handed; a replayer's own creates come through here too and are
 // not recorded.
 // ---------------------------------------------------------------------------
+// KL_VK_ANISO=<n> (2..16, 0 = off): a guest's linearly filtered samplers get at least n-fold anisotropic
+// filtering. A game built for a Quest asks for what a Quest can afford: Moss runs with r.MaxAnisotropy 1 or 2
+// on the device profile a Quest 2 gets (its own config sets 8 only for the Quest 1's chip), and its
+// table-top scenes are seen at a shallow angle – the surfaces blur a short way from the eye, on a Quest 2 as
+// here. Compare and unnormalized samplers are left alone. The census line says what the guest asked for.
+static int klvk_aniso_floor(void) {
+    static int v = -1;
+    if (v < 0) {
+        // 16 for Moss: the owner's setting on the headset (2026-10-13). KL_VK_ANISO=0 is off.
+        const char *t = kl_driver_target_name();
+        v = kl_env_int("KL_VK_ANISO", t && strcmp(t, "moss") == 0 ? 16 : 0);
+        if (v < 2) v = 0;
+        if (v > 16) v = 16;
+    }
+    return v;
+}
 static VkResult VKAPI_CALL klvkrec_CreateSampler(VkDevice dev, const VkSamplerCreateInfo *ci,
         const VkAllocationCallbacks *a, VkSampler *out) {
     static PFN_vkCreateSampler real;
     if (!real && real_gdpa) real = (PFN_vkCreateSampler)real_gdpa(dev, "vkCreateSampler");
+    const VkSamplerCreateInfo *guest = ci;
+    VkSamplerCreateInfo mine;
+    if (ci) {
+        static unsigned n, by[4], raised;                 // asked: none, up to 2, up to 8, more
+        float asked = ci->anisotropyEnable ? ci->maxAnisotropy : 1.0f;
+        int floor = klvk_aniso_floor();
+        by[asked <= 1.0f ? 0 : asked <= 2.0f ? 1 : asked <= 8.0f ? 2 : 3]++;
+        if (floor && ci->magFilter == VK_FILTER_LINEAR && ci->minFilter == VK_FILTER_LINEAR &&
+            !ci->compareEnable && !ci->unnormalizedCoordinates && asked < (float)floor) {
+            mine = *ci;
+            mine.anisotropyEnable = VK_TRUE;
+            mine.maxAnisotropy = (float)floor;
+            ci = &mine;
+            raised++;
+        }
+        n++;
+        if (n == 8 || n == 64 || n == 512)
+            fprintf(stderr, "  [vk] samplers so far: %u; anisotropy asked: none %u, up to 2x %u, up to 8x %u, more %u; "
+                            "raised to %dx: %u (KL_VK_ANISO)\n", n, by[0], by[1], by[2], by[3], floor, raised);
+    }
     VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
-    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(sampler, *out, ci);
+    if (r == VK_SUCCESS && guest && out) PIPE_HOOK(sampler, *out, guest);
     return r;
 }
 static VkResult VKAPI_CALL klvkrec_CreatePipelineLayout(VkDevice dev, const VkPipelineLayoutCreateInfo *ci,

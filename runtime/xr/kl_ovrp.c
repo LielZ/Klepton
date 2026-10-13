@@ -1355,6 +1355,30 @@ void kl_ovrp_set_render_scale_default(float s) {
     if (s >= 0.2f && s <= 1.0f) g_render_scale_default = s;
 }
 
+// The cap the size below was held to, for klovrp_fill_eye_desc (KL_OVRP_EYE_DESC_CAP).
+static int g_eye_cap;
+
+// KL_OVRP_EYE_ALIGN=<n> (1 = off): each axis of the eye size is rounded DOWN to a multiple of n, last of all.
+// Unreal quantizes its scene buffers UP to a multiple of 4, and every foveation match in kl_vulkan.c compares
+// extents exactly: Moss drew a 3840x2468 scene for a 3840x2465 eye, and kl_fove left its eye pass unmarked
+// ("near miss … at ANOTHER extent", headset log of 2026-10-13) – foveated rendering was on and did nothing.
+// An eye that is already a multiple of 4 is what the guest's own buffers come out at. From rebelancap's fork
+// (be18669), where it is a per-title setting; here 4 for Moss, off elsewhere until seen.
+static int klovrp_eye_align_n(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *t = kl_driver_target_name();
+        n = kl_env_int("KL_OVRP_EYE_ALIGN", t && strcmp(t, "moss") == 0 ? 4 : 1);
+        if (n < 1 || n > 64) n = 1;
+    }
+    return n;
+}
+static void klovrp_eye_align(int *w, int *h) {
+    int n = klovrp_eye_align_n();
+    if (n <= 1) return;
+    if (*w >= n) *w -= *w % n;
+    if (*h >= n) *h -= *h % n;
+}
 void kl_ovrp_set_eye_texture_size(int w, int h) {
     // A degenerate size is a measurement that went wrong, and it would reach
     // Unity as a swapchain allocation. Keep the Quest default instead: the
@@ -1440,6 +1464,10 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
         // visionos/targets.py. Unfoveated he measured 4032 as its rung and 5120
         // as too much (a third of the frame rate, 6.3 GB peak).
         if (t && strcmp(t, "batman") == 0) cap_dflt = 4608;
+        // Moss: the display's own size, with foveated rendering at "high" (targets.py) and the game's own
+        // 1.5x held to it (KL_OVRP_EYE_DESC_CAP). The owner's setting on the headset, 2026-10-13: "hoch ist
+        // definitiv besser"; 8 ms of GPU a frame.
+        if (t && strcmp(t, "moss") == 0) cap_dflt = 4608;
         // Beat Saber from 1.45 on (kl_guest_beatsaber_openxr) is the same case
         // in Unity: its camera target is a 4x multisampled multiview array,
         // which is attached single-sampled here (klgl_want_msrtt in kl_egl.c),
@@ -1471,6 +1499,7 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
         if (t && strcmp(t, "doom3quest") == 0 && kl_glfb_mirror_foveation_wanted()) cap_dflt = 5200;
     }
     int cap = kl_env_int("KL_OVRP_EYE_MAX", cap_dflt);
+    g_eye_cap = cap;
     if (cap > 0 && (w > cap || h > cap)) {
         // Preserve the aspect ratio: clamping the axes independently would
         // change the shape of the picture, and the frustum tangents pushed
@@ -1496,6 +1525,7 @@ void kl_ovrp_set_eye_texture_size(int w, int h) {
         w = ((int)((float)w * rs + 0.5f) + 1) & ~1;
         h = ((int)((float)h * rs + 0.5f) + 1) & ~1;
     }
+    klovrp_eye_align(&w, &h);
     if (w == g_eye_w && h == g_eye_h) return;
 
     // Logged every change, not once: each one costs the guest a swapchain
@@ -7032,6 +7062,35 @@ static void klovrp_fill_eye_desc(ovrp_layer_desc_eyefov *d, int layout,
     h = (int)((float)h * texture_scale);
     if (w < 1) w = 1;
     if (h < 1) h = 1;
+    // KL_OVRP_EYE_DESC_CAP=1: the cap holds for the layer the guest ends up with, not only for the size it
+    // is offered. A guest multiplies the offer by a scale of its own: Moss asks for 1.5 in a level and was
+    // handed 4608x3697 an eye over a 3072 cap – 18.8 ms of GPU a frame on the headset, 45 frames a second
+    // on a 120 Hz display (2026-10-13). After rebelancap's fork, where KL_OVRP_EYE_MAX bounds the desc
+    // (be18669). Off by default but for Moss: Beat Saber's 1.2x level scale is wanted, and its caps are
+    // sized for it.
+    {
+        static int on = -1;
+        if (on < 0) {
+            // On for Moss: seen on the headset 2026-10-13 ("es wird wirklich besser mit der einstellung"),
+            // 110 frames a second where there were 45.
+            const char *t = kl_driver_target_name();
+            on = kl_env_on("KL_OVRP_EYE_DESC_CAP", t && strcmp(t, "moss") == 0);
+        }
+        // No display has pushed a size in a host run, so no cap was worked out: the plain default there.
+        int cap = g_eye_cap ? g_eye_cap : kl_env_int("KL_OVRP_EYE_MAX", 3072);
+        if (on && cap > 0 && (w > cap || h > cap)) {
+            float k = (float)cap / (float)(w > h ? w : h);
+            int cw = ((int)((float)w * k + 0.5f) + 1) & ~1, ch = ((int)((float)h * k + 0.5f) + 1) & ~1;
+            klovrp_eye_align(&cw, &ch);
+            static int said_w, said_h;
+            if (cw != said_w || ch != said_h) {
+                fprintf(stderr, "  [ovrp] KL_OVRP_EYE_DESC_CAP: the guest's scale %.3f asks for %dx%d an eye, "
+                                "held to %dx%d (cap %d)\n", (double)texture_scale, w, h, cw, ch, cap);
+                said_w = cw; said_h = ch;
+            }
+            w = cw; h = ch;
+        }
+    }
 
     memset(d, 0, sizeof *d);
     d->shape        = KLOVRP_SHAPE_EYEFOV;

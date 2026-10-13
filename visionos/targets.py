@@ -637,6 +637,15 @@ TARGETS = {
         # MoltenVK's, so for Moss this is a stored preference with no effect on
         # the picture until a Vulkan path for it exists.
         "foveation": True,
+        # The picture since 2026-10-13, the owner's setting on the headset: the
+        # display's own eye size (4608, kl_ovrp.c) with the game's own 1.5x held to
+        # it, foveated rendering at "high" (kl_fove), 16x anisotropic filtering
+        # (kl_vulkan.c) and a frame on every second refresh (kl_app.c). Before, it
+        # took 4608x3697 an eye by its own scale over a 3072 cap, unfoveated – 45
+        # frames a second. picture_reset: an installed copy drops its stored
+        # resolution and foveation level once, so everyone gets these.
+        "vk_foveation": "high",
+        "picture_reset": 1,
         # On an ordinary gamepad (see KleptonControllers.pollGamepad) Quill's
         # attack belongs on Square, where the game's first release had it and
         # where a thumb expects it. Moss reads attack from Touch B, which the

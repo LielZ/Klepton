@@ -273,7 +273,10 @@ final class KleptonRendering: ObservableObject {
     /// lower floor rebelancap runs his Unreal and Unity titles with. Starts at
     /// the target's own (targets.py "vk_foveation", KLVkFoveationDefault): off
     /// unless a game was looked at on a headset with it.
-    static let vkFoveationLevels = ["off", "low", "medium", "high"]
+    /// "ultra" is a level of this setting only: kl_fove is told "high" with a
+    /// smaller sharp box, a shorter ramp and a lower floor (asked for after
+    /// Moss at "high", 2026-10-13: "könnte auch noch stärker sein").
+    static let vkFoveationLevels = ["off", "low", "medium", "high", "ultra"]
     /// The number that drops a stored resolution and foveation level once
     /// (targets.py "picture_reset", KLPictureReset in Info.plist); 0 for a
     /// target that never changed its picture defaults.
@@ -487,6 +490,42 @@ enum KleptonTestSwitches {
                              "Foveation: keine Zone unter halber Auflösung"),
                   note: klT("GL games with foveated rendering. The edge of the picture gets sharper textures and costs about 70% more fragments; watch the frame rate.",
                             "GL-Spiele mit Foveated Rendering. Der Bildrand bekommt schärfere Texturen und kostet etwa 70 % mehr Bildpunkte; auf die Bildrate achten.")),
+            Entry(env: "KL_OVRP_EYE_DESC_CAP", value: "1",
+                  title: klT("Resolution: the game's own scale stays under the limit",
+                             "Auflösung: der eigene Faktor des Spiels bleibt unter der Obergrenze"),
+                  note: klT("Unity and Unreal games that enlarge the picture themselves. Moss asks for 1.5 times the resolution in a level and falls to 45 frames a second; with this it is drawn at the size it is offered. Watch the frame rate and the sharpness.",
+                            "Unity- und Unreal-Spiele, die das Bild selbst vergrößern. Moss verlangt im Level die 1,5-fache Auflösung und fällt auf 45 Bilder pro Sekunde; hiermit wird es in der angebotenen Größe gezeichnet. Auf Bildrate und Schärfe achten.")),
+            Entry(env: "KL_STATS_CARD", value: "1",
+                  title: klT("Show the frame rate in the headset",
+                             "Bildrate im Headset einblenden"),
+                  note: klT("A line at the lower left of the view: the frames the game draws a second and the rate the display runs at, refreshed once a second. Half-Life: Alyx has this as a setting of its own.",
+                            "Eine Zeile unten links im Blickfeld: die Bilder, die das Spiel pro Sekunde zeichnet, und die Rate, mit der das Display läuft, einmal pro Sekunde aufgefrischt. Half-Life: Alyx hat dafür eine eigene Einstellung.")),
+            Entry(env: "KL_VK_ANISO", value: "16",
+                  title: klT("Textures: 16x anisotropic filtering",
+                             "Texturen: 16-fache anisotrope Filterung"),
+                  note: klT("Vulkan games. Surfaces seen at a shallow angle – floors, table tops – stay sharp further away. Games built for a Quest often ask for none at all (Moss does). Look at such surfaces and at the frame rate.",
+                            "Vulkan-Spiele. Flächen, die man flach ansieht – Böden, Tischplatten –, bleiben weiter hinten scharf. Für die Quest gebaute Spiele verlangen oft gar keine (Moss etwa). Auf solche Flächen und auf die Bildrate achten.")),
+            Entry(env: "KL_GUEST_PACE_DIV", value: "2",
+                  title: klT("Frame rate: the game draws every second picture of the display",
+                             "Bildrate: das Spiel zeichnet jedes zweite Bild des Displays"),
+                  note: klT("An even 60 of 120 (or 50 of 100) frames a second, with the head movement still corrected at the full rate – for a game that does not quite hold the full rate and stutters unevenly. Not applied while the system itself shows the game at half rate. Half-Life: Alyx has this as a setting of its own.",
+                            "Gleichmäßige 60 von 120 (oder 50 von 100) Bildern pro Sekunde, die Kopfbewegung wird weiter mit voller Rate ausgeglichen – für ein Spiel, das die volle Rate nicht ganz hält und ungleichmäßig ruckelt. Greift nicht, solange das System das Spiel selbst mit halber Rate zeigt. Half-Life: Alyx hat dafür eine eigene Einstellung.")),
+            Entry(env: "KL_FOVE_BOX", value: "0.30",
+                  title: klT("Foveated rendering “Strong”: the profile it had before",
+                             "Foveated Rendering „Stark“: das frühere Profil"),
+                  note: klT("Vulkan games with foveated rendering at Strong. Strong has a smaller sharp middle (18% of the picture's height) and a finer edge now; this brings back the larger middle (30%) with the coarser edge. Turn it on if a game looked better before.",
+                            "Vulkan-Spiele mit Foveated Rendering auf „Stark“. „Stark“ hat jetzt eine kleinere scharfe Mitte (18 % der Bildhöhe) und einen feineren Rand; das hier bringt die größere Mitte (30 %) mit dem gröberen Rand zurück. Einschalten, wenn ein Spiel vorher besser aussah."),
+                  also: [("KL_FOVE_FLOOR", "0.08")]),
+            Entry(env: "KL_OVRP_EYE_MAX", value: "4608",
+                  title: klT("Resolution: the limit is 4608 pixels an eye (3072 for most games)",
+                             "Auflösung: die Obergrenze liegt bei 4608 Bildpunkten je Auge (sonst meist 3072)"),
+                  note: klT("Unity and Unreal games. Draws about twice as many pixels; meant to be used with foveated rendering (start window) at Medium or Strong. Watch the frame rate.",
+                            "Unity- und Unreal-Spiele. Zeichnet etwa doppelt so viele Bildpunkte; gedacht zusammen mit Foveated Rendering (Startfenster) auf Mittel oder Stark. Auf die Bildrate achten.")),
+            Entry(env: "KL_OVRP_EYE_ALIGN", value: "4",
+                  title: klT("Resolution: the eye size is a multiple of 4",
+                             "Auflösung: die Augengröße ist ein Vielfaches von 4"),
+                  note: klT("Unreal games that draw with Vulkan. Unreal rounds its own buffers up to a multiple of 4; when the eye picture is one or two rows smaller, foveated rendering is on and does nothing. On for Moss.",
+                            "Unreal-Spiele, die mit Vulkan zeichnen. Unreal rundet seine eigenen Puffer auf ein Vielfaches von 4; ist das Augenbild ein, zwei Zeilen kleiner, ist Foveated Rendering eingeschaltet und bewirkt nichts. Bei Moss an.")),
             Entry(env: "KL_AAUDIO_OLD_BURST", value: "1",
                   title: klT("Sound: the old buffer size (240 frames)",
                              "Ton: die alte Puffergröße (240 Frames)"),
@@ -582,10 +621,17 @@ extension KleptonRendering {
         // first time it is asked, which is after this. A GL guest never asks.
         let launchLine = ProcessInfo.processInfo.environment["KL_FOVEATION"]
         if vkFoveation != "off" {
-            setenv("KL_FOVEATION", vkFoveation, 0)
+            setenv("KL_FOVEATION", vkFoveation == "ultra" ? "high" : vkFoveation, 0)
             if vkFoveation == "high" {
-                setenv("KL_FOVE_BOX", "0.30", 0)
-                setenv("KL_FOVE_FLOOR", "0.08", 0)
+                // Since 2026-10-13: a smaller sharp middle (0.18 of the height, was 0.30) and an edge twice
+                // as fine (0.16, was 0.08) – about a fifth fewer pixels, and the coarse edge was what showed.
+                // Asked for and kept on by the owner after Moss with it on the headset.
+                setenv("KL_FOVE_BOX", "0.18", 0)
+                setenv("KL_FOVE_FLOOR", "0.16", 0)
+            } else if vkFoveation == "ultra" {
+                setenv("KL_FOVE_BOX", "0.20", 0)
+                setenv("KL_FOVE_RAMP", "0.15", 0)
+                setenv("KL_FOVE_FLOOR", "0.06", 0)
             }
         }
         NSLog("[cp] foveated rendering (Vulkan): setting \(vkFoveation) (target default \(Self.targetVkFoveation))"

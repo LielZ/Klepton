@@ -452,6 +452,7 @@ struct PlayerSettingsView: View {
                                 Text(klT("Light", "Leicht")).tag("low")
                                 Text(klT("Medium", "Mittel")).tag("medium")
                                 Text(klT("Strong", "Stark")).tag("high")
+                                Text(klT("Very strong", "Sehr stark")).tag("ultra")
                             }
                             .pickerStyle(.segmented)
                             .labelsHidden()
@@ -1127,9 +1128,11 @@ struct BootView: View {
         // Before configure, which is where the runtime starts reading its
         // environment.
         klAlyxApply()
+        // The test switches first: none of these overwrites a value that is set, so a switch under
+        // Advanced › Test wins over the picture setting it retunes (the foveation profile, 2026-10-13).
+        KleptonTestSwitches.applyEnvironment()
         KleptonRendering.shared.applyEnvironment()
         KleptonDiagnostics.applyEnvironment()
-        KleptonTestSwitches.applyEnvironment()
         // On the main run loop: the thread below is inside kl_app_boot for as
         // long as there is anything to show, and a timer of its own would not
         // fire until it came back.
