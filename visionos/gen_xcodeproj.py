@@ -395,6 +395,9 @@ fwchildren = "\n".join(f'\t\t\t\t{g["ref"]},' for g in guest)
 _launcher_display = {"hl1": "HL1VR", "hl2": "HL2VR", "portal": "P1VR"}
 _display = (_launcher_display.get(KLT['name'], KLT['display']) if _launcher_on
             else KLT['display'])
+# A second install of the same target beside the first (the Steam build of a game
+# that is also there from the Meta Store) needs a name of its own on the headset.
+_display = os.environ.get("KLEPTON_DISPLAY_NAME") or _display
 # Trailing newline, glued at line-start to the next setting — the same shape as
 # ENTITLEMENTS_SETTING / ASSETCATALOG_SETTING above, so it lands on its own line in
 # the output and expands to nothing (no blank line) when the flag is off.

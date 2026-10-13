@@ -2046,8 +2046,17 @@ static void klplat_user_init(void) {
     }
 }
 static uint64_t klplat_user_id(void) { pthread_once(&g_user_once, klplat_user_init); return g_user_id; }
+// Walkabout Mini Golf keys its account with its own backend on the id as well:
+// PlayFabController.Login signs in with a custom id made of the platform's user
+// id and the platform's name ("1000000000000042Meta"), with nothing else to
+// prove it. Since its HTTP requests go through (the socket() fix), that
+// sign-in succeeds - and with one id for everybody, every player of this
+// runtime would sign in to the same account and sync the same cloud profiles
+// (seen on a Mac host, 2026-10-13: signed in after 0.4 s, then two seconds of
+// download and an upload). The game itself carries a profile over when the id
+// changes: it copies it to the new id's folder (LAST_DATAPATH_Oculus).
 int kl_ovrplat_user_id_per_install(const char *target) {
-    return target && strcmp(target, "x3634830803298285") == 0;
+    return target && (strcmp(target, "x3634830803298285") == 0 || strcmp(target, "walkabout") == 0);
 }
 static uint64_t klplat_User_GetLoggedInUser(void) {
     plat_hit("ovr_User_GetLoggedInUser");

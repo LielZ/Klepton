@@ -15,7 +15,6 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include "klepton.h"
 #include "kl_jni.h"
 #include "kl_fault.h"
 #include "kl_target.h"
@@ -465,9 +464,12 @@ static void klj_editor_flush(void *self) {
         d->fval = s->fval;
         d->sval = s->sval ? strdup(s->sval) : NULL;
     }
-    KLJ_LOG("SharedPreferences[%s]: %s%u change%s -> %u entries in %s", p->name,
+    // Which key, for a flush of one: a guest that saves hundreds of times at
+    // start is saving the same few, and the name says what it is doing.
+    KLJ_LOG("SharedPreferences[%s]: %s%u change%s%s%s -> %u entries in %s", p->name,
             ed->clear ? "clear + " : "", ed->pending.n,
-            ed->pending.n == 1 ? "" : "s", p->kv.n, p->path);
+            ed->pending.n == 1 ? "" : "s", ed->pending.n == 1 ? " to " : "",
+            ed->pending.n == 1 ? ed->pending.v[0].key : "", p->kv.n, p->path);
     klj_prefs_save(p);
     klj_pref_clear(&ed->pending);
     ed->clear = 0;

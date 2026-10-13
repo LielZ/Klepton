@@ -329,10 +329,10 @@ static void ue4_maybe_stdout_cmdline(const char *proj) {
             //     FShaderPipelineCache::NumPrecompilesRemaining() reaching 0. The
             //     precompile stalls (~529 PSOs then never drains), so the segment
             //     never advances to Calibration. DISABLING the cache made it worse
-            //     (the segment then never sees the cache open/complete). Instead a
-            //     guest patch forces NumPrecompilesRemaining()->0 (see
-            //     kl_guestpatch.c "wrath2-pso-done") so the segment completes while
-            //     the cache still opens normally; PSOs compile on demand.
+            //     (the segment then never sees the cache open/complete). A guest
+            //     patch that forced NumPrecompilesRemaining()->0 stood in for it
+            //     and is gone — see kl_guestpatch.c: the precompile drains now,
+            //     and the segment is left to the game.
             snprintf(extra_buf, sizeof extra_buf,
                      " -ini:Engine:[/Script/AndroidRuntimeSettings.AndroidRuntimeSettings]:"
                      "bSupportsVulkan=True%s",

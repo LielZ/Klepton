@@ -107,8 +107,23 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   window's "Player name" holds: the display name as typed, the Oculus ID the
   same with only letters, digits, `.`, `_` and `-` kept; unset, "Klepton
   Player" / "kleptonplayer". The id is 1000000000000042 for every player unless
-  given; for a game that keys an account of its own on it (Demeo) the app makes
-  one random number per installation and passes it here.
+  given; for a game that keys an account of its own on it (Demeo, Walkabout
+  Mini Golf) the app makes one random number per installation and passes it
+  here.
+- `KL_STEAM_ID=<64-bit id>` / `KL_STEAM_NAME=<name>` / `KL_STEAM_APPID=<id>` /
+  `KL_STEAM_LANGUAGE=<name>` — (`kl_steamapi.c`, the stand-in for Valve's
+  `libsteam_api.so` in the Android build of a game that Steam ships). The id is
+  what `ISteamUser::GetSteamID` answers; only an individual account in the
+  public universe is taken, anything else leaves the fixed
+  76561197960265729. The app passes one per installation for the same games as
+  `KL_PLAT_USER_ID`, and for the same reason: Walkabout signs in to its own
+  backend with "<steam id>Steam". The name is the persona name (default
+  "Player"; the start window's "Player name"), the app id is the game's by
+  target, the language is Steam's word for the device's (`german`, `english`,
+  …). Add-on ownership comes from `klepton-entitlements.txt` only (`app_id` and
+  one `sku <Steam app id>` per add-on); every function without an answer of its
+  own names itself once (`[steam] …: not implemented — answering 0`) and the
+  end-of-run report lists them.
 - `KL_OVRP_UNANSWERED=unsupported|abort` — what an OVRPlugin entry point with no
   answer in `kl_ovrp.c` does when the guest calls it: end the run with its name
   (`abort`, the default) or say `UNSUPPORTED` and go on, named once in the log
@@ -1075,6 +1090,22 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   objects, `Resources.FindObjectsOfTypeAll` includes inactive ones, and the gap
   between the two is the measurement — `VRLaserPointer=0/1` means the laser
   exists and is switched off.
+
+- `KL_PROBE_CLASSAT=<hex>[:<offset>][,…]` — which class a metadata slot of
+  libil2cpp holds, with its static fields. Compiled code reaches a class through
+  such a slot (`adrp`/`ldr` of a fixed address, then `[class, #0xb8]` for the
+  statics); the number is the slot's address as `llvm-objdump` prints it. With
+  `:<offset>` the static at that offset is an object, and its class is named
+  too. Printed at frame 600 and again at `KL_PROBE_CLASSAT_AGAIN` (default
+  2400): a slot says "not initialised yet" until the function that uses it has
+  run once. `KL_PROBE_FIND` gives the function's address to disassemble.
+- `KL_PROBE_WATCH=<hex>:<offset>[><offset2>][p][,…]` — a static byte of the
+  class behind such a slot, printed with the frame number whenever it changes;
+  with `><offset2>` the static is an object and the byte is read inside it; a
+  trailing `p` watches a pointer for being set at all. For a flag a guest waits
+  on: when it flips, or that it never does. How Walkabout's start was read
+  (2026-10-13): `PlayFabController.IsLoggedIn` stayed 0 for a build whose HTTP
+  requests failed, and the game sat out its own offline wait.
 
 **One caveat, recorded so it is not trusted.** The probe also prints
 `eventsystem: overUI=...`, which stays `no` even when the pointer works:

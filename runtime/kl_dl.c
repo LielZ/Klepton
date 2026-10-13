@@ -15,6 +15,7 @@
 #include "kl_opensl.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_steamapi.h"
 #include "kl_mediandk.h"
 #include "kl_vulkan.h"
 #include "kl_aaudio.h"
@@ -29,6 +30,7 @@ static char   g_dlerr[256];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void kl_set_library_path(const char *dir) { snprintf(g_libdir, sizeof g_libdir, "%s", dir); }
+const char *kl_library_path(void) { return g_libdir; }
 
 static const char *basename_of(const char *p) {
     const char *s = strrchr(p, '/');
@@ -492,7 +494,7 @@ static int kl_core_shim_claims(const char *path);
 int kl_can_dlopen(const char *path) {
     if (!path) return 0;
     return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||
-           kl_ovrplat_claims(path) || kl_mediandk_claims(path) ||
+           kl_ovrplat_claims(path) || kl_steamapi_claims(path) || kl_mediandk_claims(path) ||
            kl_vulkan_claims(path) || kl_aaudio_claims(path) ||
            kl_openxr_claims(path) || kl_core_shim_claims(path) || kl_can_load(path);
 }
@@ -725,6 +727,10 @@ void *klb_dlopen(const char *path, int flags) {
     // OVRPlugin: the real one only forwards to a system service that is not here.
     void *plat = kl_ovrplat_dlopen(path);
     if (plat) return plat;
+    // The Steam API of an Android build from Steam: a client of the Steam on the
+    // headset, which is not here either (kl_steamapi.h).
+    void *steam = kl_steamapi_dlopen(path);
+    if (steam) return steam;
     void *md = kl_mediandk_dlopen(path);
     if (md) return md;
     // Vulkan (BONELAB). Same reasoning as the GL line above: there is no
@@ -839,6 +845,7 @@ void *klb_dlsym(void *handle, const char *name) {
     if (kl_opensl_is_handle(handle)) return kl_opensl_sym(name);
     if (kl_ovrp_is_handle(handle)) return kl_ovrp_sym(name);
     if (kl_ovrplat_is_handle(handle)) return kl_ovrplat_sym(name);
+    if (kl_steamapi_is_handle(handle)) return kl_steamapi_sym(name);
     if (kl_mediandk_is_handle(handle)) return kl_mediandk_sym(name);
     if (kl_vulkan_is_handle(handle)) return kl_vulkan_sym(name);
     if (kl_aaudio_is_handle(handle)) return kl_aaudio_sym(name);

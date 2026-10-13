@@ -585,7 +585,11 @@ final class KleptonPlayer: ObservableObject {
                 UserDefaults.standard.set(String(id), forKey: Self.idKey)
             }
             setenv("KL_PLAT_USER_ID", String(id), 0)
+            // The Steam build of such a game asks Steam's library instead of Meta's: the same number as a
+            // Steam id – an individual account in the public universe, its account number taken from ours.
+            setenv("KL_STEAM_ID", String(0x0110_0001_0000_0000 as UInt64 + id % 0xFFFF_FFFE + 1), 0)
         }
+        if !n.isEmpty { setenv("KL_STEAM_NAME", n, 0) }
         NSLog("[app] player name: " + (n.isEmpty ? "not set (the runtime's own)" : "\"\(n)\"")
               + (Self.ownId ? "; the player id is this installation's own" : ""))
     }

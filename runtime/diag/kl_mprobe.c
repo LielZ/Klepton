@@ -587,6 +587,65 @@ static void probe_xr_display(unsigned frame) {
 // each MethodInfo's methodPointer (its first field - stable across il2cpp
 // versions), and keep the nearest method at or below each target. One pass,
 // a few seconds, printed once.
+// KL_PROBE_CLASSAT=<hex>[,<hex>...] - which class a metadata slot of libil2cpp
+// holds. Compiled code reaches a class through such a slot (`adrp`/`ldr` of a
+// fixed address, then `[x, #0xb8]` for its statics); once the function has run,
+// the slot holds the Il2CppClass. Printed with the class's static fields, which
+// is what a disassembled `ldrb w8, [statics]` is reading.
+static void mprobe_class_at(void) {
+    const char *spec = kl_env_str("KL_PROBE_CLASSAT", NULL);
+    if (!spec || !*spec) return;
+    kl_image *img = kl_find_image("libil2cpp.so");
+    if (!img) return;
+    typedef const char *(*k_ns_fn)(Il2CppClass *);
+    typedef void *(*get_fields_fn)(Il2CppClass *, void **);
+    typedef const char *(*f_name_fn)(void *);
+    typedef size_t (*f_off_fn)(void *);
+    typedef int (*f_flags_fn)(void *);
+    k_ns_fn k_ns = (k_ns_fn)kl_sym(img, "il2cpp_class_get_namespace");
+    get_fields_fn get_fields = (get_fields_fn)kl_sym(img, "il2cpp_class_get_fields");
+    f_name_fn f_name = (f_name_fn)kl_sym(img, "il2cpp_field_get_name");
+    f_off_fn f_off = (f_off_fn)kl_sym(img, "il2cpp_field_get_offset");
+    f_flags_fn f_flags = (f_flags_fn)kl_sym(img, "il2cpp_field_get_flags");
+    uintptr_t base = (uintptr_t)kl_base(img);
+    for (const char *p = spec; *p; ) {
+        uintptr_t off = (uintptr_t)strtoull(p, NULL, 16);
+        // The slot holds the address of the class's own variable (the code does
+        // `ldr x8, [slot]; ldr x8, [x8]`), and that variable holds the class.
+        uintptr_t var = *(uintptr_t *)(base + off);
+        uintptr_t v = (var >= 0x100000000ull && !(var & 7)) ? *(uintptr_t *)var : 0;
+        // A variable not yet initialised holds an encoded metadata index, not a pointer.
+        if (v < 0x100000000ull || (v & 7)) {
+            fprintf(stderr, "  [mprobe] class at %#llx: not initialised yet (%#llx)\n", (unsigned long long)off, (unsigned long long)v);
+        } else {
+            Il2CppClass *k = (Il2CppClass *)v;
+            const char *ns = k_ns ? k_ns(k) : "";
+            fprintf(stderr, "  [mprobe] class at %#llx: %s%s%s\n", (unsigned long long)off, ns ? ns : "", ns && *ns ? "." : "", il.class_get_name(k));
+            // `<slot>:<offset>`: the static at that offset is an object - say what it is.
+            const char *colon = p;
+            while (*colon && *colon != ',' && *colon != ':') colon++;
+            if (*colon == ':') {
+                uintptr_t statics = *(uintptr_t *)((uintptr_t)k + 0xb8);
+                uintptr_t obj = statics >= 0x100000000ull ? *(uintptr_t *)(statics + strtoul(colon + 1, NULL, 0)) : 0;
+                if (obj >= 0x100000000ull && !(obj & 7)) {
+                    Il2CppClass *ok = *(Il2CppClass **)obj;
+                    const char *ons = k_ns ? k_ns(ok) : "";
+                    fprintf(stderr, "  [mprobe]     object at static %lu: %s%s%s (%p)\n", strtoul(colon + 1, NULL, 0),
+                            ons ? ons : "", ons && *ons ? "." : "", il.class_get_name(ok), (void *)obj);
+                } else {
+                    fprintf(stderr, "  [mprobe]     object at static %lu: none\n", strtoul(colon + 1, NULL, 0));
+                }
+            }
+            void *it = NULL, *fld;
+            while (get_fields && f_name && (fld = get_fields(k, &it)) != NULL)
+                if (f_flags && (f_flags(fld) & 0x10))
+                    fprintf(stderr, "  [mprobe]     static %s (offset %zu)\n", f_name(fld), f_off ? f_off(fld) : 0);
+        }
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+    }
+}
+
 static void mprobe_resolve_offsets(void) {
     const char *spec = kl_env_str("KL_PROBE_RESOLVE", NULL);
     if (!spec || !*spec) return;
@@ -607,7 +666,7 @@ static void mprobe_resolve_offsets(void) {
         return;
     }
     uintptr_t base = (uintptr_t)kl_base(img);
-    enum { MAXT = 8 };
+    enum { MAXT = 96 };
     uintptr_t tgt[MAXT]; int nt = 0;
     for (const char *p = spec; *p && nt < MAXT; ) {
         tgt[nt++] = base + (uintptr_t)strtoull(p, NULL, 16);
@@ -743,8 +802,17 @@ static void mprobe_find_methods(void) {
                 }
                 uint32_t fl = m_flags ? m_flags(m, NULL) : 0;
                 const char *ns = k_ns ? k_ns(k) : "";
-                fprintf(stderr, "  [mprobe] find: %s%s%s::%s(%s)%s\n", ns ? ns : "", ns && *ns ? "." : "",
-                        il.class_get_name(k), name, sig, (fl & 0x10) ? " static" : "");
+                // Where its code is, as an offset into the file: where to start
+                // `llvm-objdump -d --start-address=` on it. (MethodInfo.methodPointer
+                // is its first field, see mprobe_resolve_offsets.)
+                char at[48] = "";
+                {
+                    kl_image *lib = kl_find_image("libil2cpp.so");
+                    uintptr_t code = *(uintptr_t *)m;
+                    if (lib && code) snprintf(at, sizeof at, "  @libil2cpp+%#llx", (unsigned long long)(code - (uintptr_t)kl_base(lib)));
+                }
+                fprintf(stderr, "  [mprobe] find: %s%s%s::%s(%s)%s%s\n", ns ? ns : "", ns && *ns ? "." : "",
+                        il.class_get_name(k), name, sig, (fl & 0x10) ? " static" : "", at);
                 found++;
             }
         }
@@ -1120,6 +1188,62 @@ void kl_mprobe_tick(unsigned frame) {
     if (!rs_done && frame >= 600 && kl_env_str("KL_PROBE_RESOLVE", NULL) && mprobe_init()) {
         rs_done = 1;
         mprobe_resolve_offsets();
+    }
+    // KL_PROBE_WATCH=<slot>:<offset>[,...] - a static byte of the class behind a
+    // metadata slot (see KL_PROBE_CLASSAT; the statics are what compiled code
+    // reads through `[class, #0xb8]`), printed with the frame whenever it
+    // changes. For a flag a guest waits on: when it flips, or that it never does.
+    {
+        static const char *spec; static int init;
+        enum { MAXW = 16 };
+        static uintptr_t slot[MAXW]; static unsigned woff[MAXW]; static int last[MAXW]; static int nw;
+        // `<slot>:<off>><off2>`: the static at <off> is an object; watch the byte at
+        // <off2> inside it. A trailing `p` watches a pointer for being set at all.
+        static int woff2[MAXW]; static int wptr[MAXW];
+        if (!init) {
+            init = 1;
+            spec = kl_env_str("KL_PROBE_WATCH", NULL);
+            for (const char *p = spec; p && *p && nw < MAXW; ) {
+                char *end = NULL;
+                slot[nw] = (uintptr_t)strtoull(p, &end, 16);
+                woff[nw] = (end && *end == ':') ? (unsigned)strtoul(end + 1, &end, 0) : 0;
+                woff2[nw] = (end && *end == '>') ? (int)strtoul(end + 1, &end, 0) : -1;
+                wptr[nw] = end && *end == 'p';
+                last[nw] = -2;
+                nw++;
+                while (*p && *p != ',') p++;
+                if (*p == ',') p++;
+            }
+        }
+        kl_image *img = nw ? kl_find_image("libil2cpp.so") : NULL;
+        for (int i = 0; img && i < nw; i++) {
+            uintptr_t var = *(uintptr_t *)((uintptr_t)kl_base(img) + slot[i]);
+            uintptr_t k = (var >= 0x100000000ull && !(var & 7)) ? *(uintptr_t *)var : 0;
+            int now = -1;                                   // class not there yet
+            if (k >= 0x100000000ull && !(k & 7)) {
+                uintptr_t statics = *(uintptr_t *)(k + 0xb8);
+                if (statics >= 0x100000000ull) {
+                    uintptr_t at = statics + woff[i];
+                    if (woff2[i] >= 0) {
+                        uintptr_t obj = *(uintptr_t *)at;
+                        at = obj >= 0x100000000ull ? obj + (unsigned)woff2[i] : 0;
+                    }
+                    if (at) now = wptr[i] ? (*(uintptr_t *)at != 0) : *(unsigned char *)at;
+                }
+            }
+            if (now != last[i]) {
+                fprintf(stderr, "  [mprobe] watch %#llx:%u>%d%s = %d at frame %u\n", (unsigned long long)slot[i], woff[i], woff2[i],
+                        wptr[i] ? "p" : "", now, frame);
+                last[i] = now;
+            }
+        }
+    }
+    // Twice, so a slot a later scene initialises is named as well.
+    static int ca_done;
+    if (ca_done < 2 && frame >= (unsigned)(ca_done ? kl_env_int("KL_PROBE_CLASSAT_AGAIN", 2400) : 600)
+        && kl_env_str("KL_PROBE_CLASSAT", NULL) && mprobe_init()) {
+        ca_done++;
+        mprobe_class_at();
     }
     // KL_PROBE_TIMESCALE=<x>: UnityEngine.Time.timeScale, set again every 120
     // frames from KL_PROBE_CALL_FROM on (a guest sets its own at pauses and

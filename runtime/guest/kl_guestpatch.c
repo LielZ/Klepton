@@ -370,20 +370,19 @@ static const kl_gp_word k_wrath2_forcevk[] = {
     { 0xc319348, 0xa9025ff8, 0xd65f03c0, "ret" },
 };
 
-// Wrath2 (libUE4.so) — force the "COMPILING SHADERS" title segment to complete.
+// Wrath2 (libUE4.so) — the "COMPILING SHADERS" title segment is left to the game.
 //
 // AAW_CompileShadersTitleScreenSegment gates on
-// FShaderPipelineCache::NumPrecompilesRemaining() reaching 0, but the precompile
-// stalls (~529 PSOs then never drains — the batched precompile stops making
-// progress), so the segment loops forever and never advances to Calibration.
-// Force NumPrecompilesRemaining() to return 0 so the segment finishes; the cache
-// still opens normally and PSOs compile on demand (first-use hitches, not a hang).
-//   0xcded830  str d8, [sp, #-0x50]!      -> mov w0, #0
-//   0xcded834  stp x24, x23, [sp, #0x10]  -> ret
-static const kl_gp_word k_wrath2_pso_done[] = {
-    { 0xcded830, 0xfc1b0fe8, 0x52800000, "mov w0, #0  (NumPrecompilesRemaining -> 0)" },
-    { 0xcded834, 0xa9015ff8, 0xd65f03c0, "ret" },
-};
+// FShaderPipelineCache::NumPrecompilesRemaining() reaching 0. A patch here
+// ("wrath2-pso-done": 0xcded830 -> mov w0, #0; ret) used to answer 0 for it,
+// from the time the precompile stalled at ~529 PSOs and the segment never
+// ended. The precompile drains now, a pipeline per guest frame, and all the
+// patch still did was end the game's own screen after ten seconds: the eye
+// picture stayed black for the minutes the rest of the pipelines took, with
+// nothing saying why. Without it (headset, 2026-10-13) the screen stood for
+// 3 min 50 s while the count went from 3,600 to 8,980, and the game went on to
+// its calibration by itself. Should the precompile stall again, the segment
+// stays up and the log's "pipeline warmup" count stops climbing.
 
 // NOTE (hl2/libtogl.so multiview): TWO reverted experiments now.
 // (1) Forcing the generate BIT on (0xa1788 `tbnz w23,#0` -> `b`) fired generation at
@@ -626,9 +625,6 @@ static const kl_gp_patch k_patches[] = {
     { "wrath2-force-vulkan-available", "libUE4.so",
       "FAndroidMisc::IsVulkanAvailable() always returns true (the RHI gate)",
       k_wrath2_forcevk, sizeof k_wrath2_forcevk / sizeof *k_wrath2_forcevk },
-    { "wrath2-pso-done", "libUE4.so",
-      "FShaderPipelineCache::NumPrecompilesRemaining() returns 0 (title segment completes)",
-      k_wrath2_pso_done, sizeof k_wrath2_pso_done / sizeof *k_wrath2_pso_done },
 
     { "liminal-touch-connected", "libil2cpp.so",
       "the Touch controllers read as connected at the startup device check",

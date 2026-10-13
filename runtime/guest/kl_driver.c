@@ -24,6 +24,7 @@
 #include "kl_openxr.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_steamapi.h"
 #include "kl_mprobe.h"
 #include "kl_songs.h"
 #include "kl_sample.h"
@@ -915,6 +916,7 @@ void kl_driver_report(FILE *out) {
     kl_mediandk_report(out);
     kl_ovrp_report(out);
     kl_ovrplat_report(out);
+    kl_steamapi_report(out);
     kl_openxr_report(out);
     kl_madv_report();
     kl_mem_report();

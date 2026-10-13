@@ -41,6 +41,7 @@
 #include <math.h>
 #include <unistd.h>
 #include "kl_openxr.h"
+#include "kl_steamapi.h"
 #include "kl_jni.h"
 #include "kl_ovrp.h"
 #include "kl_egl.h"
@@ -2575,6 +2576,33 @@ static void klxr_pitches(float *grip, float *aim) {
                         "(KL_XR_GRIP_PITCH), aim a further %.1f deg "
                         "(KL_XR_AIM_PITCH)\n",
                 (double)grip_pitch, (double)aim_pitch);
+    }
+    // The Steam build of a game that is also in the Meta Store (Walkabout Mini
+    // Golf from depot 1408232): the same two poses, devicepose and pointer, and
+    // the same numbers handed over — and its hand pointed UP where the Meta
+    // build's sits right. The game places its hand differently per store, so
+    // the difference is its own and has to be taken out here. Judged on the
+    // headset with a fresh profile (2026-10-13): wrong at 37, right at 0, with
+    // the aim left 37 below. For this game only; no other Steam build has been
+    // looked at.
+    //
+    // Not cached with the pair above: which build this is comes from the game's
+    // files, and on the Mac those are known only once the target is set up.
+    {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (t && strcmp(t, "walkabout") == 0 && (kl_steamapi_shipped() || kl_steamapi_in_use()) &&
+            !getenv("KL_XR_GRIP_PITCH") && !getenv("KL_XR_AIM_PITCH")) {
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  [xr] controller pose, Steam build of this game: grip pitched "
+                                "0.0 deg instead, aim a further -37.0 deg\n");
+            }
+            if (grip) *grip = 0.0f;
+            if (aim)  *aim  = -37.0f;
+            return;
+        }
     }
     if (grip) *grip = grip_pitch;
     if (aim)  *aim  = aim_pitch;

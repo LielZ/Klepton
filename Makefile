@@ -64,7 +64,7 @@ RUNTIME_SHIP := $(LX_SRC) runtime/guest/kl_linuxproc.c \
            $(RUNTIME_JNI) \
            runtime/gfx/kl_egl.c runtime/media/kl_opensl.c runtime/media/kl_audio.c runtime/xr/kl_ovrp.c \
            runtime/xr/kl_ovrp_sret.S runtime/gfx/kl_reproject.c runtime/gfx/kl_present.c \
-           runtime/xr/kl_ovrplat.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
+           runtime/xr/kl_ovrplat.c runtime/xr/kl_steamapi.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
            runtime/gfx/kl_vulkan.c runtime/gfx/kl_mtl_foveate.m \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
            runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_xashservers.c runtime/guest/kl_sdl2.c \
@@ -645,6 +645,12 @@ il2cpp: build/t_il2cpp
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
 check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_mtxtable build/t_bcast build/t_fault build/t_glcaps
+	@# The guest steps read $(TARGET)'s own files. Without them the loader steps print nothing and pass, and the
+	@# run ends at the il2cpp step with a bare "Error 1" - a check that looked green until its last line. A
+	@# working copy without the game's tree (a fresh git worktree) is told so here, before anything runs.
+	@test -f $(LIBS)/libil2cpp.so || { echo "check needs the guest it tests: $(LIBS)/libil2cpp.so is not here."; \
+	  echo "  Unpack $(TARGET) into this working copy (see BUILDING.md), link or clone the tree from another one,"; \
+	  echo "  or name a guest that is here: make check TARGET=<name>"; exit 1; }
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
