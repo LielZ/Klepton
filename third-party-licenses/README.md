@@ -1,29 +1,30 @@
-# Lizenzen der mitgelieferten Binärteile
+# Licences of the bundled binaries
 
-Ein Toolchain-Paket enthält neben dem Quelltext dieses Repositorys (MIT, siehe `LICENSE`)
-vorgebaute Bibliotheken Dritter:
+Besides the source of this repository (MIT, see `LICENSE`), a toolchain package contains
+prebuilt third-party libraries:
 
-| Teil | Wo im Paket | Lizenz | Text |
+| Part | Where in the package | Licence | Text |
 |---|---|---|---|
-| ANGLE (libEGL, libGLESv2), mit den Änderungen aus `angle-patches/klepton.patch` | `vendor/out/xros`, `vendor/out/xrsim` | BSD-3-Clause | `ANGLE-LICENSE.txt` |
+| ANGLE (libEGL, libGLESv2), with the changes in `angle-patches/klepton.patch` | `vendor/out/xros`, `vendor/out/xrsim` | BSD-3-Clause | `ANGLE-LICENSE.txt` |
 | MoltenVK | `vendor-moltenvk/out` | Apache-2.0 | `MoltenVK-LICENSE.txt` |
 
-Dazu kommt Quelltext Dritter, der mit der Runtime übersetzt wird:
+It also carries third-party source that is compiled with the runtime:
 
-| Teil | Wo im Paket | Lizenz | Text |
+| Part | Where in the package | Licence | Text |
 |---|---|---|---|
-| Fossilize (Valve), Stand 556da9f, nur die Bibliotheksquellen | `vendor-fossilize` | MIT | `vendor-fossilize/LICENSE` |
-| RapidJSON (in Fossilize enthalten) | `vendor-fossilize/rapidjson` | MIT | `vendor-fossilize/rapidjson/license.txt` |
-| miniz (in Fossilize enthalten) | `vendor-fossilize/miniz` | MIT | `vendor-fossilize/miniz/LICENSE` |
-| Vulkan-Header (Khronos, in Fossilize enthalten) | `vendor-fossilize/khronos` | Apache-2.0 oder MIT | Kopf jeder Datei |
+| Fossilize (Valve), at 556da9f, library sources only | `vendor-fossilize` | MIT | `vendor-fossilize/LICENSE` |
+| RapidJSON (part of Fossilize) | `vendor-fossilize/rapidjson` | MIT | `vendor-fossilize/rapidjson/license.txt` |
+| miniz (part of Fossilize) | `vendor-fossilize/miniz` | MIT | `vendor-fossilize/miniz/LICENSE` |
+| Vulkan headers (Khronos, part of Fossilize) | `vendor-fossilize/khronos` | Apache-2.0 or MIT | head of each file |
+| SMOL-V, at 55000ef, one marked change | `vendor-smolv` | MIT or public domain | `vendor-smolv/LICENSE.txt` |
 
-Das Aufzeichnen und Vorab-Bauen der Vulkan-Pipelines (`runtime/gfx/kl_fossilize.cpp`,
-`runtime/gfx/kl_vk_pipe_hooks.h`, `tools/alyx_pipelines.py`) folgt Glovebox
-(github.com/glovebox-vr/glovebox, MIT); die Dateien nennen das jeweils im Kopf.
+Recording and pre-building the Vulkan pipelines (`runtime/gfx/kl_fossilize.cpp`,
+`runtime/gfx/kl_vk_pipe_hooks.h`, `tools/alyx_pipelines.py`) follows Glovebox
+(github.com/glovebox-vr/glovebox, MIT); each file says so at its head.
 
-Die Steam-Anbindung der Spiel-App (`visionos/SteamCloudKit`, Anmeldung und Steam-Cloud-Spielstände) besteht aus
-Teilen von Glovebox' `SteamLauncherKit` (MIT, `visionos/SteamCloudKit/LICENSE-Glovebox.txt`); was übernommen und
-was geändert ist, steht in `visionos/SteamCloudKit/README.md`.
+The game app's Steam connection (`visionos/SteamCloudKit`, sign-in and Steam Cloud saves) consists of
+parts of Glovebox's `SteamLauncherKit` (MIT, `visionos/SteamCloudKit/LICENSE-Glovebox.txt`); what was taken
+and what was changed is in `visionos/SteamCloudKit/README.md`.
 
-Der Patch gegenüber dem ANGLE-Quelltext liegt vollständig in `angle-patches/klepton.patch`.
-Spielinhalte und aus ihnen übersetzte Bibliotheken sind nie Teil eines Pakets.
+The patch against the ANGLE source is complete in `angle-patches/klepton.patch`.
+Game content and libraries translated from it are never part of a package.
