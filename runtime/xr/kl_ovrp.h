@@ -154,6 +154,10 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              float vx, float vy, float vz,
                              float avx, float avy, float avz);
+// Has a frontend ever published a head pose / this hand's pose (sticky)?
+int kl_ovrp_head_pose_published(void);
+int kl_ovrp_hand_pose_published(int hand);
+
 void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
                                   float index_trigger, float hand_trigger,
                                   float stick_x, float stick_y);
@@ -757,6 +761,18 @@ int kl_ovrp_gl_array(void);
 void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz,
                       float *qx, float *qy, float *qz, float *qw,
                       float tangents[4]);
+
+// The frustum the guest is told for eye `eye` (0 = left, 1 = right): the same
+// tangents kl_ovrp_eye_view hands out, read without touching the pose latch.
+// out = left, right, top, bottom, all positive.
+void kl_ovrp_eye_tangents(int eye, float out[4]);
+
+// The frustum the guest's live eye layer DESCRIBES for eye `eye` (its
+// ovrpLayerDesc_EyeFov.Fov, l/r/t/b tangents, positive). Under symmetric
+// projection that is the union cone the eye was actually rendered with, which
+// is where its straight-ahead point sits in the (widened) eye image.
+// 0 when no eye layer carries one (OpenXR guests, before SetupLayer).
+int kl_ovrp_eye_layer_fov(int eye, float out[4]);
 
 // The head pose as the GUEST sees it — pinned for the duration of its frame by
 // kl_ovrp_frame_latch, and therefore NOT the same thing as

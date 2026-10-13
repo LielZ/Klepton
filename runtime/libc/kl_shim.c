@@ -161,6 +161,25 @@ __attribute__((noreturn)) static void kl_stack_chk_fail(void) {
 // not known here, so anything landing inside the block routes to stderr. Known
 // gap: the true stride is recoverable from the GLOB_DAT addend.
 static char g_sF[4096] __attribute__((aligned(16)));
+// Where a bogus FILE * goes: NOT stderr itself. A read through it fails, and a
+// failed read sets the stream's error flag — on Darwin's stderr that makes every
+// later fprintf(stderr) of this runtime return -1 and print nothing (one
+// fgets(NULL) in Half-Life: Alyx's tier0 silenced the rest of the log, fault
+// report included). So a stream of its own: writes go to fd 2 (the log, as
+// before), reads are EOF.
+static int kl_bogus_read(void *c, char *b, int n)        { (void)c; (void)b; (void)n; return 0; }
+static int kl_bogus_write(void *c, const char *b, int n) { (void)c; return (int)write(2, b, (size_t)n); }
+static FILE *kl_bogus_file_sink(void) {
+    static FILE *f;
+    if (!f) {
+        FILE *n = funopen(NULL, kl_bogus_read, kl_bogus_write, NULL, NULL);
+        if (!n) return stderr;
+        setvbuf(n, NULL, _IONBF, 0);
+        f = n;
+    }
+    clearerr(f);
+    return f;
+}
 FILE *kl_host_file(void *guest) {
     if ((char *)guest >= g_sF && (char *)guest < g_sF + sizeof g_sF) return stderr;
     // A FILE * small enough to be a page-zero offset is not a FILE * — it is an
@@ -182,7 +201,7 @@ FILE *kl_host_file(void *guest) {
             seen[n++] = guest;
             fprintf(stderr, "[klepton] bogus guest FILE * %p — routed to stderr\n", guest);
         }
-        return stderr;
+        return kl_bogus_file_sink();
     }
     return (FILE *)guest;
 }
@@ -193,9 +212,15 @@ static size_t kl_fwrite(const void *p, size_t a, size_t b, void *f) { return fwr
 // async loader's throughput is the loading-screen pacing question. Bytes are
 // attributed per open file (kl_file_path) so a slow trickle names its file.
 extern const char *kl_file_path(void *f);
+extern void kl_bank_note_io(const char *op, void *f, long long a, long long b, long long res);
+extern int  kl_bank_is_open(void *f);              // kl_libc.c — gate, false for every other file
 static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
     FILE *hf = kl_host_file(f);
+    // The archive trace: WHERE libzip is reading (the offset it starts from) and
+    // whether it got what it asked for. Silent unless this is an open archive.
+    long long at = kl_bank_is_open(hf) ? (long long)ftello(hf) : -1;
     size_t r = fread(p, a, b, hf);
+    if (at >= 0) kl_bank_note_io("fread", hf, at, (long long)(a * b), (long long)(r * a));
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_TRACE_IO", 0);
     if (on) {
@@ -227,7 +252,9 @@ static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
     }
     return r;
 }
-static int kl_fclose(void *f)                      { return fclose(kl_host_file(f)); }
+extern void kl_bank_note_close(void *f);           // kl_libc.c — the bank probe
+static int kl_fclose(void *f)                      { kl_bank_note_close(f);
+                                                     return fclose(kl_host_file(f)); }
 static int kl_fflush(void *f)                      { return fflush(f ? kl_host_file(f) : NULL); }
 static char *kl_fgets(char *s, int n, void *f)     { return fgets(s, n, kl_host_file(f)); }
 // bionic's fgets_unlocked (API 28): Darwin has no such name. The locked fgets
@@ -238,10 +265,24 @@ static int kl_getc_(void *f)                       { return getc(kl_host_file(f)
 static int kl_feof(void *f)                        { return feof(kl_host_file(f)); }
 static int kl_ferror(void *f)                      { return ferror(kl_host_file(f)); }
 static void kl_clearerr(void *f)                   { clearerr(kl_host_file(f)); }
-static int kl_fseek(void *f, long o, int w)        { return fseek(kl_host_file(f), o, w); }
-static int kl_fseeko(void *f, off_t o, int w)      { return fseeko(kl_host_file(f), o, w); }
+// The offsets ARE the evidence for the bank probe (a 3.4 GB archive whose
+// central directory and Init.bnk both sit above 2^31), so each of these reports
+// the offset it was handed and the offset the host ended up at.
+static int kl_fseek(void *f, long o, int w)        { FILE *hf = kl_host_file(f); int r = fseek(hf, o, w);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("fseek", hf, (long long)o, w,
+                                                                         r ? -1 : (long long)ftello(hf));
+                                                     return r; }
+static int kl_fseeko(void *f, off_t o, int w)      { FILE *hf = kl_host_file(f); int r = fseeko(hf, o, w);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("fseeko", hf, (long long)o, w,
+                                                                         r ? -1 : (long long)ftello(hf));
+                                                     return r; }
 static long kl_ftell(void *f)                      { return ftell(kl_host_file(f)); }
-static off_t kl_ftello(void *f)                    { return ftello(kl_host_file(f)); }
+static off_t kl_ftello(void *f)                    { FILE *hf = kl_host_file(f); off_t r = ftello(hf);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("ftello", hf, 0, 0, (long long)r);
+                                                     return r; }
 static int kl_setvbuf(void *f, char *b, int m, size_t n) { return setvbuf(kl_host_file(f), b, m, n); }
 
 // ---------- sockets: bionic -> Darwin option constants ----------
@@ -728,6 +769,23 @@ static void kl_grow_sock_buffers(int fd) {
             fprintf(stderr, "  [net] fd %d socket buffers grown: rcvbuf=%d "
                             "sndbuf=%d (asked %d)\n", fd, got_r, got_s, want);
     }
+}
+
+// inet_pton/inet_ntop take the family as an argument, so they carry the same
+// 10 -> 30 divergence as socket() below and cannot be direct forwards. Darwin
+// answers an unknown family with -1/EAFNOSUPPORT, and -1 is TRUE to curl's
+// Curl_host_is_ipnum — `inet_pton(AF_INET, h) || inet_pton(AF_INET6, h)` — so
+// every hostname read as an IP literal and curl sent no SNI. Steam's CDN
+// answers a ClientHello without SNI with a fatal internal_error alert (15 03 03
+// 00 02 02 50), which Steam Link logs as "CURL error SSL connect error (35)"
+// on every api.steampowered.com request, and the shell sits at "Connecting…".
+static int kl_inet_pton(int af, const char *src, void *dst) {
+    if (af == 10) af = AF_INET6;
+    return inet_pton(af, src, dst);
+}
+static const char *kl_inet_ntop(int af, const void *src, char *dst, socklen_t size) {
+    if (af == 10) af = AF_INET6;
+    return inet_ntop(af, src, dst, size);
 }
 
 static int kl_socket(int domain, int type, int protocol) {
@@ -1887,6 +1945,17 @@ static char *kl_strchr_chk(char *s, int ch, size_t dl) {
     kl_strlen_chk(s, dl);                  // proves the object is dl bytes
     return strchr(s, ch);
 }
+// bionic: __strlcat_chk(dst, src, supplied_size, compiler_size). strlcat itself
+// is on Darwin, so this is only the bounds half of the contract. Same shape for
+// strlcpy.
+static size_t kl_strlcat_chk(char *d, const char *s, size_t n, size_t dl) {
+    if (n > dl) die("__strlcat_chk overflow");
+    return strlcat(d, s, n);
+}
+static size_t kl_strlcpy_chk(char *d, const char *s, size_t n, size_t dl) {
+    if (n > dl) die("__strlcpy_chk overflow");
+    return strlcpy(d, s, n);
+}
 // bionic: __vsnprintf_chk(dest, supplied_size, flags, compiler_size, fmt, va).
 static int kl_vsnprintf_chk(char *d, size_t n, int flags, size_t dl,
                             const char *fmt, void *gva) {
@@ -1954,6 +2023,20 @@ static int kl_execv(const char *p, char *const argv[]) {
     errno = ENOSYS;
     return -1;
 }
+// bionic's `timezone` is a long VARIABLE (seconds west of UTC, standard
+// time). Darwin has only the BSD timezone() FUNCTION under that name, so the
+// variable is ours, filled once at load from the host's idea of standard
+// time (January: no DST). tzset is forwarded rather than wrapped, so a guest
+// that calls it and re-reads the variable still sees this value.
+static long kl_timezone_var;
+__attribute__((constructor)) static void kl_init_timezone(void) {
+    tzset();
+    struct tm jan = {0};
+    jan.tm_year = 120; jan.tm_mon = 0; jan.tm_mday = 15;
+    time_t t = mktime(&jan);
+    struct tm lt;
+    if (t != (time_t)-1 && localtime_r(&t, &lt)) kl_timezone_var = -lt.tm_gmtoff;
+}
 
 // ---------- small bionic-isms ----------
 static void kl_set_abort_message(const char *m) { fprintf(stderr, "[guest abort] %s\n", m ? m : ""); }
@@ -1972,6 +2055,16 @@ static void kl_android_log_write(int p, const char *t, const char *m) {
 X(klv_printf) X(klv_fprintf) X(klv_sprintf) X(klv_snprintf) X(klv_asprintf)
 X(klv_dprintf) X(klv_syslog) X(klv_warnx) X(klv_android_log_print) X(klv_sscanf) X(klv_fscanf)
 X(klv_open) X(klv_fcntl) X(klv_ioctl) X(klv_strtold) X(klv_wcstold) X(klv_strtold_l)
+X(klv_roundl) X(klb_pthread_gettid_np) X(klb_faccessat)
+X(klb_mincore) X(klb_mkdtemp) X(klb_mallopt)
+X(klb_pthread_barrier_init) X(klb_pthread_barrier_wait) X(klb_pthread_barrier_destroy)
+X(klb_fstatat) X(klb_rmdir) X(klb_remove) X(klb_chmod) X(klb_chown) X(klb_lchown)
+X(klb_truncate) X(klb_mkfifo) X(klb_readlink) X(klb_symlink) X(klb_link) X(klb_utimes)
+X(klb_utime) X(klb_unlinkat) X(klb_mkdirat) X(klb_fchmodat) X(klb_fchownat)
+X(klb_readlinkat) X(klb_renameat) X(klb_symlinkat) X(klb_utimensat) X(klb_freopen)
+X(klb_kill) X(klb_raise) X(klb_signal) X(klb_sigwait) X(klb_sigsuspend) X(klb_sigpending)
+X(klb___fpclassifyd) X(klb_popen) X(klb_pclose)
+X(klb_statfs64) X(klb_execlp)
 X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_read)
 X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
 X(klb___sched_cpucount) X(klb___libc_current_sigrtmin) X(klb___libc_current_sigrtmax)
@@ -2278,6 +2371,7 @@ static const kl_entry g_shim[] = {
     E("close", klb_close), E("lseek", klb_lseek), E("pread", klb_pread),
     E("getaddrinfo", kl_getaddrinfo), E("connect", kl_connect),
     E("socket", kl_socket),
+    E("inet_pton", kl_inet_pton), E("inet_ntop", kl_inet_ntop),
     E("bind", kl_bind), E("sendto", kl_sendto), E("accept", kl_accept),
     E("getifaddrs", klb_getifaddrs), E("freeifaddrs", klb_freeifaddrs),
     E("recvfrom", kl_recvfrom), E("__recvfrom_chk", kl___recvfrom_chk),
@@ -2483,6 +2577,7 @@ static const kl_entry g_shim[] = {
     E("pthread_attr_setschedparam", klb_pthread_attr_setschedparam),
     E("pthread_attr_setstacksize", klb_pthread_attr_setstacksize),
     E("pthread_attr_setdetachstate", klb_pthread_attr_setdetachstate),
+    E("pthread_attr_setinheritsched", klb_pthread_attr_setinheritsched),
     E("pthread_attr_getstack", klb_pthread_attr_getstack),
     E("pthread_getattr_np", klb_pthread_getattr_np),
     E("pthread_key_create", klb_pthread_key_create),
@@ -2502,12 +2597,11 @@ static const kl_entry g_shim[] = {
     E("pthread_getname_np", pthread_getname_np),
     E("sched_setscheduler", klb_sched_setscheduler),
     E("sched_getscheduler", klb_sched_getscheduler),
-    E("pthread_attr_setinheritsched", klb_pthread_attr_setinheritsched),
     // Deadpool VR's other imports with a plain answer. fesetround: the rounding
     // modes are FPCR bits and have the same values on both sides, so a direct
     // forward. mkdtemp: forwarded like mkstemp next to it in the table.
     E("clock_nanosleep", klb_clock_nanosleep), E("__poll_chk", klb___poll_chk),
-    E("fesetround", fesetround), E("mkdtemp", mkdtemp),
+    E("fesetround", fesetround),   // mkdtemp: with the path family below
     E("sem_init", klb_sem_init), E("sem_destroy", klb_sem_destroy),
     E("sem_post", klb_sem_post), E("sem_wait", klb_sem_wait),
     E("sem_timedwait", klb_sem_timedwait), E("sem_getvalue", klb_sem_getvalue),
@@ -2550,6 +2644,45 @@ static const kl_entry g_shim[] = {
     E("mallctl", kl_mallctl), E("mallctlnametomib", kl_mallctlnametomib),
     E("mallctlbymib", kl_mallctlbymib),
     E("MallocExtension_Internal_GetNumericProperty", kl_MallocExtension_GetNumericProperty),
+
+    // ---- libc and pthread surface that cannot ride the generated table ----
+    // Barriers are a real implementation (kl_pthread.c): Darwin has no
+    // pthread_barrier_t to forward to. QuakeQuest parks renderer workers on one.
+    E("pthread_barrier_init", klb_pthread_barrier_init),
+    E("pthread_barrier_wait", klb_pthread_barrier_wait),
+    E("pthread_barrier_destroy", klb_pthread_barrier_destroy),
+    E("pthread_gettid_np", klb_pthread_gettid_np),
+    // The rest of the path family: translated through kl_guest_path, the Linux
+    // AT_* numbering mapped, and failures published to the guest errno slot
+    // (kl_libc.c, "the rest of the path family"). fstatat also translates the
+    // struct it writes, which a forward wrote in Darwin's layout.
+    E("fstatat", klb_fstatat), E("fstatat64", klb_fstatat),
+    E("faccessat", klb_faccessat), E("mkdtemp", klb_mkdtemp),
+    E("rmdir", klb_rmdir), E("remove", klb_remove),
+    E("chmod", klb_chmod), E("chown", klb_chown), E("lchown", klb_lchown),
+    E("truncate", klb_truncate), E("mkfifo", klb_mkfifo),
+    E("readlink", klb_readlink), E("symlink", klb_symlink),   // link: with the first batch above
+    E("utimes", klb_utimes), E("utime", klb_utime),
+    E("unlinkat", klb_unlinkat), E("mkdirat", klb_mkdirat),
+    E("fchmodat", klb_fchmodat), E("fchownat", klb_fchownat),
+    E("readlinkat", klb_readlinkat), E("renameat", klb_renameat),
+    E("symlinkat", klb_symlinkat), E("utimensat", klb_utimensat),
+    E("freopen", klb_freopen),
+    // Signal numbers: the SIGUSR2/SIGSYS swap — see kl_sig_to_darwin.
+    E("kill", klb_kill), E("raise", klb_raise), E("signal", klb_signal),
+    E("sigwait", klb_sigwait), E("sigsuspend", klb_sigsuspend),
+    E("sigpending", klb_sigpending),
+    // Layout or numbering mismatches the compiler cannot see: bionic's FP_*
+    // numbering, popen("getprop ...") answered
+    // without a subprocess, statfs64 (= statfs on LP64), execlp (refused).
+    E("__fpclassifyd", klb___fpclassifyd),
+    E("popen", klb_popen), E("pclose", klb_pclose),
+    E("statfs64", klb_statfs64), E("execlp", klb_execlp),
+    E("mincore", klb_mincore), E("mallopt", klb_mallopt),
+    E("roundl", klv_roundl),
+    // FORTIFY forms and a DATA symbol.
+    E("__strlcat_chk", kl_strlcat_chk), E("__strlcpy_chk", kl_strlcpy_chk),
+    E("timezone", &kl_timezone_var),
 
     E("__klepton_unresolved", kl_unresolved),
 };

@@ -150,13 +150,28 @@ static int g_input_refusals;    // input opens declined because the mic was off
 static int klaa_burst_frames(void) {
     const char *e = getenv("KL_AAUDIO_BURST");
     int n = e ? atoi(e) : 0;
-    // 240 frames is 5 ms at 48 kHz and is what this guest's own jitter buffer
-    // is configured in multiples of. AAudio's real burst is the HAL's; the
-    // guest only uses it to size its buffer, so any sane value works and a
-    // small one keeps the callback rate close to Android's.
     if (n < 32 || n > 8192) {
-        n = 240;
-        // AC Nexus's Wwise (2019.2) mixes in larger blocks than that and its
+        // 256 frames, and not "any sane value works", which is what this said
+        // while the number was 240. The burst is the size of every pull the
+        // guest's mixer is asked to serve, and a mixer that renders in fixed
+        // blocks serves it out of the block it has: ask a 1024-frame block for
+        // 240 frames five times and the fifth pull comes back with 64 lit frames
+        // and 176 zeros, which are then played — a 40 Hz gate on the music, not
+        // a dropout (rebelancap, shinyquagsire23/Klepton pull request 12, from a
+        // guest-side capture). A power of two divides every block size a real
+        // mixer uses, and 256 is the number the guest is already told through
+        // AudioManager.getProperty(OUTPUT_FRAMES_PER_BUFFER) (KLJ_AUDIO_FRAMES).
+        // The default for every game since 2026-10-13, on the owner's word after
+        // the test copies; KL_AAUDIO_OLD_BURST=1 (a switch in the start
+        // window's test group) goes back to 240 for the games that had it.
+        n = kl_env_on("KL_AAUDIO_OLD_BURST", 0) ? 240 : 256;
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        // Steam Link too. 240 was chosen for it — 5 ms at 48 kHz, what its own
+        // jitter buffer is configured in multiples of — and it was first left
+        // there; its owner hears dropouts in its sound and asked for 256 to be
+        // tried on it as well (2026-10-13). The switch above is the way back.
+        // AC Nexus's Wwise (2019.2) mixes in larger blocks than 240 and its
         // AAudio sink runs dry between them when it is asked for 240 frames at
         // a time: "Voice Starvation" 225 times a minute, a steady crackle, with
         // the device ring itself never underrunning. Asked for 1024 it logged
@@ -167,10 +182,16 @@ static int klaa_burst_frames(void) {
         // block size and not a game's; there is no telling from here which
         // guest carries that Wwise, so they are named. Pistol Whip is the
         // fourth (fix 26, 2026-10-11).
-        extern const char *kl_driver_target_name(void);
-        const char *t = kl_driver_target_name();
+        // (With 256 as the default these four may no longer need it — 256 divides
+        // 1024 — but 1024 is what each was heard with, so it stays until one of
+        // them has been heard at 256.)
+        // Tetris Effect: Connected is the fifth, and the first one heard at
+        // 256: dropouts and a crackle on the headset (owner, 2026-10-13) — so
+        // 256 does NOT serve this Wwise, and the four above stay at 1024 for a
+        // reason now, not only for want of a hearing.
         static const char *const wwise[] = { "x5812519008825194", "x2897337400373711",
-                                             "x3484270071659289", "x2104963472963790" };
+                                             "x3484270071659289", "x2104963472963790",
+                                             "x3386618894743567" };
         for (unsigned i = 0; t && i < sizeof wwise / sizeof *wwise; i++)
             if (strcmp(t, wwise[i]) == 0) n = 1024;
     }

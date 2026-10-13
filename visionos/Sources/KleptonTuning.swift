@@ -267,6 +267,32 @@ final class KleptonRendering: ObservableObject {
     /// with fewer than four samples (and is not one that is held at two).
     var offersVkMsaa: Bool { (2...3).contains(Self.vkGuestSamples) }
 
+    /// Foveated rendering for a Vulkan guest (KL_FOVEATION, kl_fove.m): the
+    /// level as a choice, where a GL guest has the one switch above. "off",
+    /// "low", "medium" or "high" — "high" with the smaller sharp box and the
+    /// lower floor rebelancap runs his Unreal and Unity titles with. Starts at
+    /// the target's own (targets.py "vk_foveation", KLVkFoveationDefault): off
+    /// unless a game was looked at on a headset with it.
+    static let vkFoveationLevels = ["off", "low", "medium", "high"]
+    /// The number that drops a stored resolution and foveation level once
+    /// (targets.py "picture_reset", KLPictureReset in Info.plist); 0 for a
+    /// target that never changed its picture defaults.
+    private static let pictureResetKey = "klepton.picture.reset"
+    static let targetPictureReset: Int =
+        Int((Bundle.main.object(forInfoDictionaryKey: "KLPictureReset") as? String) ?? "") ?? 0
+    private static let vkFoveationKey = "klepton.vk.foveation"
+    static let targetVkFoveation: String = {
+        let v = (Bundle.main.object(forInfoDictionaryKey: "KLVkFoveationDefault") as? String) ?? "off"
+        return vkFoveationLevels.contains(v) ? v : "off"
+    }()
+    @Published var vkFoveation: String {
+        didSet { UserDefaults.standard.set(vkFoveation, forKey: Self.vkFoveationKey) }
+    }
+    /// Where the choice is shown in place of the switch: a game known to draw
+    /// with Vulkan — a run left its sample count behind (`rememberRun`), or the
+    /// target itself starts foveated.
+    var offersVkFoveation: Bool { Self.vkGuestSamples > 0 || Self.targetVkFoveation != "off" }
+
     /// How finely the compositor puts the finished picture on the display
     /// (KL_CP_QUALITY; `AlyxOutput` has the values and what was measured).
     /// Starts at the target's own (targets.py "output", KLOutputDefault): light
@@ -348,8 +374,27 @@ final class KleptonRendering: ObservableObject {
                       + "\(Self.targetOutput.title))")
             }
         }
+        // A target whose picture defaults were changed for everyone can ask for
+        // the stored resolution and Vulkan foveation level to be dropped once
+        // (targets.py "picture_reset", KLPictureReset): a copy that was set up
+        // under the old defaults would otherwise keep them for good.
+        let pictureApplied = UserDefaults.standard.integer(forKey: Self.pictureResetKey)
+        if Self.targetPictureReset > pictureApplied {
+            let had = (UserDefaults.standard.object(forKey: Self.scaleKey) as? Double,
+                       UserDefaults.standard.object(forKey: Self.vkFoveationKey) as? String)
+            UserDefaults.standard.removeObject(forKey: Self.scaleKey)
+            UserDefaults.standard.removeObject(forKey: Self.vkFoveationKey)
+            UserDefaults.standard.set(Self.targetPictureReset, forKey: Self.pictureResetKey)
+            NSLog("[cp] resolution and foveated rendering (Vulkan): stored choices "
+                  + "(\(had.0.map { String(format: "%.0f%%", $0 * 100) } ?? "none"), \(had.1 ?? "none")) "
+                  + "dropped once for this target's new defaults "
+                  + String(format: "(%.0f%%, ", Self.targetRenderScale * 100) + "\(Self.targetVkFoveation); "
+                  + "reset \(Self.targetPictureReset), was \(pictureApplied))")
+        }
         vkMsaa = (UserDefaults.standard.object(forKey: Self.vkMsaaKey) as? Int)
             .map { $0 == 4 ? 4 : 0 } ?? Self.targetVkMsaa
+        vkFoveation = (UserDefaults.standard.object(forKey: Self.vkFoveationKey) as? String)
+            .flatMap { Self.vkFoveationLevels.contains($0) ? $0 : nil } ?? Self.targetVkFoveation
         output = (UserDefaults.standard.object(forKey: Self.outputKey) as? Int)
             .flatMap { AlyxOutput(rawValue: $0)?.rawValue } ?? Self.targetOutput.rawValue
         // object(forKey:), so that "never chosen" is the target's default
@@ -407,12 +452,145 @@ enum KleptonDiagnostics {
     }
 }
 
+/// Behaviour that is in the runtime but not yet the default: each entry is one
+/// environment switch, off unless chosen, so a change taken over from another
+/// fork can be tried on the headset without a build per trial. The group is in
+/// every build, released ones too (the owner's decision, 2026-10-13, after
+/// looking at the test copies: "Lass die Flags dann noch in der Test Sektion
+/// auch später im Release") — a player with a game that misbehaves can try a
+/// switch and say which one helped.
+enum KleptonTestSwitches {
+    struct Entry: Identifiable {
+        let env: String          // the variable
+        let value: String        // what it is set to when the switch is on
+        let title: String
+        let note: String
+        /// Further variables that belong to the same switch.
+        var also: [(String, String)] = []
+        var id: String { env + "=" + value }
+        var key: String { "klepton.test." + env + (also.isEmpty ? "" : "." + value) }
+    }
+
+    /// KL_TEST_SWITCHES=0 on the launch line hides the group and ignores what
+    /// it stored, for a run that must not depend on a leftover choice.
+    static var available: Bool { klEnvOn("KL_TEST_SWITCHES", default: true) }
+
+    static var entries: [Entry] {
+        [
+            Entry(env: "KL_GLFB_DEPTH_LINEAR", value: "0",
+                  title: klT("Depth textures: nearest instead of linear without compare",
+                             "Tiefentexturen: nächster Wert statt linear ohne Vergleich"),
+                  note: klT("GL games. Changes what a game reads from a depth texture it filters linearly; look at lights, fog and particles in a level.",
+                            "GL-Spiele. Ändert, was ein Spiel aus einer linear gefilterten Tiefentextur liest; in einem Level auf Lichter, Nebel und Partikel achten.")),
+            Entry(env: "KL_VRR_FLOOR", value: "0.50",
+                  title: klT("Foveation: no zone below half resolution",
+                             "Foveation: keine Zone unter halber Auflösung"),
+                  note: klT("GL games with foveated rendering. The edge of the picture gets sharper textures and costs about 70% more fragments; watch the frame rate.",
+                            "GL-Spiele mit Foveated Rendering. Der Bildrand bekommt schärfere Texturen und kostet etwa 70 % mehr Bildpunkte; auf die Bildrate achten.")),
+            Entry(env: "KL_AAUDIO_OLD_BURST", value: "1",
+                  title: klT("Sound: the old buffer size (240 frames)",
+                             "Ton: die alte Puffergröße (240 Frames)"),
+                  note: klT("Games that play through AAudio (most Unreal and newer Unity games) are handed 256 frames at a time now, which divides the blocks sound engines mix in; 240 could be heard as a fine crackle. Turn this on if a game sounds worse than it used to.",
+                            "Spiele, die über AAudio spielen (die meisten Unreal- und neueren Unity-Spiele), bekommen jetzt 256 Frames auf einmal; das teilt die Blöcke, in denen Sound-Engines mischen, 240 konnte als feines Knistern hörbar sein. Einschalten, wenn ein Spiel schlechter klingt als früher.")),
+            Entry(env: "KL_XR_BOOT_GATE", value: "1",
+                  title: klT("OpenXR: the first frame waits for head and hands",
+                             "OpenXR: das erste Bild wartet auf Kopf und Hände"),
+                  note: klT("OpenXR games (Steam Link, Counter-Strike, Doom 3). For a game that starts with a tilted floor or the controllers in the wrong place: it is held up to four seconds until the headset has reported both.",
+                            "OpenXR-Spiele (Steam Link, Counter-Strike, Doom 3). Für ein Spiel, das mit schiefem Boden oder falsch liegenden Controllern startet: es wird bis zu vier Sekunden gehalten, bis das Headset beides gemeldet hat."),
+                  also: [("KL_XR_HONEST_HEAD", "1")]),
+            Entry(env: "KL_CROWN_SILENCE", value: "0",
+                  title: klT("Sound: do not go silent when the game leaves the view",
+                             "Ton: nicht stummschalten, wenn das Spiel die Sicht verlässt"),
+                  note: klT("The sound stops at once on a press of the Digital Crown and comes back with the game. Switch this on if a game stays silent after a system window was open.",
+                            "Beim Druck auf die Digital Crown verstummt der Ton sofort und kommt mit dem Spiel zurück. Einschalten, falls ein Spiel stumm bleibt, nachdem ein Systemfenster offen war.")),
+            Entry(env: "KL_FMOD_BLOCK", value: "256",
+                  title: klT("Sound: FMOD is told a block of 256 frames (512 so far)",
+                             "Ton: FMOD bekommt 256 Frames als Blockgröße genannt (bisher 512)"),
+                  note: klT("Games whose sound engine is FMOD (Asgard's Wrath 2, Vampire). Listen for dropouts and for sound that lags.",
+                            "Spiele mit FMOD als Sound-Engine (Asgard's Wrath 2, Vampire). Auf Aussetzer und nachhängenden Ton achten.")),
+            Entry(env: "KL_AUDIO_ONE_OUTPUT", value: "1",
+                  title: klT("Sound: the game is shown one audio output instead of none",
+                             "Ton: dem Spiel wird ein Tonausgang gezeigt statt keinem"),
+                  note: klT("For a game that stays silent: some sound engines pick their output from the list of devices and give up on an empty one.",
+                            "Für ein Spiel, das stumm bleibt: manche Sound-Engines wählen ihren Ausgang aus der Geräteliste und geben bei einer leeren auf.")),
+            Entry(env: "KL_EGL_CREATE_CONTEXT_EXT", value: "1",
+                  title: klT("EGL: name EGL_KHR_create_context",
+                             "EGL: EGL_KHR_create_context nennen"),
+                  note: klT("Every game. Engines then ask for another GL context: Beat Saber for GLES 3.2, Asgard's Wrath 2 for GLES 3.2 where it took GLES 2. Watch the start and the loading screens.",
+                            "Jedes Spiel. Engines fragen dann einen anderen GL-Kontext an: Beat Saber GLES 3.2, Asgard's Wrath 2 GLES 3.2 statt bisher GLES 2. Auf Start und Ladebildschirme achten.")),
+            Entry(env: "KL_GL_BACKEND_EXT", value: "1",
+                  title: klT("GL: also offer anisotropic filtering, DXT and BGRA",
+                             "GL: auch anisotrope Filterung, DXT und BGRA anbieten"),
+                  note: klT("GL games. A Unity game may then filter textures anisotropically: sharper floors at flat angles.",
+                            "GL-Spiele. Ein Unity-Spiel filtert Texturen dann womöglich anisotrop: schärfere Böden bei flachem Blick.")),
+        ]
+    }
+
+    /// Into the environment, before kl_app_configure. Never over the launch
+    /// line's value.
+    static func applyEnvironment() {
+        guard available else { return }
+        // setenv with overwrite 0: of two switches for one variable the first
+        // listed wins, and the launch line wins over both.
+        for e in entries where UserDefaults.standard.bool(forKey: e.key) {
+            setenv(e.env, e.value, 0)
+            for (k, v) in e.also { setenv(k, v, 0) }
+            NSLog("[app] test switch: \(e.env)=\(e.value)"
+                  + e.also.map { " \($0.0)=\($0.1)" }.joined())
+        }
+    }
+}
+
+struct TestSwitchesView: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(klT("Changes that are built in but not switched on yet. Each applies from the next start of the game.",
+                     "Änderungen, die eingebaut, aber noch nicht eingeschaltet sind. Jede gilt ab dem nächsten Start des Spiels."))
+                .font(.caption).foregroundStyle(.secondary)
+            ForEach(KleptonTestSwitches.entries) { e in
+                TestSwitchRow(entry: e)
+            }
+        }
+    }
+}
+
+private struct TestSwitchRow: View {
+    let entry: KleptonTestSwitches.Entry
+    @State private var on: Bool
+    init(entry: KleptonTestSwitches.Entry) {
+        self.entry = entry
+        _on = State(initialValue: UserDefaults.standard.bool(forKey: entry.key))
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle(entry.title, isOn: $on)
+                .onChange(of: on) { _, v in UserDefaults.standard.set(v, forKey: entry.key) }
+            Text(entry.note + " (" + entry.env + "=" + entry.value
+                 + entry.also.map { " " + $0.0 + "=" + $0.1 }.joined() + ")")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
 extension KleptonRendering {
     /// The part of the settings the runtime reads from its environment, which
     /// it starts doing in kl_app_configure — so this runs before that, where
     /// `apply` runs after. Never over a value given on the launch line.
     func applyEnvironment() {
-        guard !klIsAlyx(), let o = AlyxOutput(rawValue: output), o != .full else { return }
+        guard !klIsAlyx() else { return }
+        // Foveated rendering for a Vulkan guest. kl_fove reads KL_FOVEATION the
+        // first time it is asked, which is after this. A GL guest never asks.
+        let launchLine = ProcessInfo.processInfo.environment["KL_FOVEATION"]
+        if vkFoveation != "off" {
+            setenv("KL_FOVEATION", vkFoveation, 0)
+            if vkFoveation == "high" {
+                setenv("KL_FOVE_BOX", "0.30", 0)
+                setenv("KL_FOVE_FLOOR", "0.08", 0)
+            }
+        }
+        NSLog("[cp] foveated rendering (Vulkan): setting \(vkFoveation) (target default \(Self.targetVkFoveation))"
+              + (launchLine.map { " — overridden by KL_FOVEATION=\($0)" } ?? ""))
+        guard let o = AlyxOutput(rawValue: output), o != .full else { return }
         setenv("KL_CP_QUALITY", o.quality, 0)
         NSLog("[cp] display output: setting \(o.title) (render quality \(o.quality))")
     }

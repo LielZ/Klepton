@@ -215,6 +215,12 @@ int kl_lx_open(const char *path, int lx_flags, int mode) {
         if (ii) { memset(ii, 0, sizeof *ii); snprintf(ii->guest, sizeof ii->guest, "%s", path); }
         return ifd;
     }
+    if (kl_lx_hand_is(path)) {                      // the hand a game's "weapon hand" option names
+        int dfd = kl_lx_hand_open();
+        kl_lx_fdinfo *di = dfd >= 0 ? kl_lx_fd(dfd) : NULL;
+        if (di) { memset(di, 0, sizeof *di); snprintf(di->guest, sizeof di->guest, "%s", path); }
+        return dfd;
+    }
     if (path && kl_lx_proc_is(path)) {
         int pfd = kl_lx_proc_open(path);
         kl_lx_fdinfo *pi = pfd >= 0 ? kl_lx_fd(pfd) : NULL;

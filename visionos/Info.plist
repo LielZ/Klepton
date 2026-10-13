@@ -33,6 +33,10 @@
 	<string>$(KL_FOVEATION_RESET)</string>
 	<key>KLVkMsaaDefault</key>
 	<string>$(KL_VK_MSAA_DEFAULT)</string>
+	<key>KLVkFoveationDefault</key>
+	<string>$(KL_VK_FOVEATION_DEFAULT)</string>
+	<key>KLPictureReset</key>
+	<string>$(KL_PICTURE_RESET)</string>
 	<key>KLOutputDefault</key>
 	<string>$(KL_OUTPUT_DEFAULT)</string>
 	<key>KLStartScreen</key>
@@ -81,5 +85,9 @@
 	<string>Klepton connects to spatial controllers that are not visible to the system as standard game controllers.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Steam Link finds the PCs on your network by broadcasting to them, and streams from the one you pair with.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_klepton-lan._udp</string>
+	</array>
 </dict>
 </plist>

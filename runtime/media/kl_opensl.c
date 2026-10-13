@@ -184,6 +184,8 @@ typedef struct { void *pLocator; void *pFormat; } SLDataSource;
 typedef struct { void *pLocator; void *pFormat; } SLDataSink;   // same shape
 
 #define SL_DATAFORMAT_PCM 2
+#define SL_ANDROID_DATAFORMAT_PCM_EX 4
+#define SL_ANDROID_PCM_REPRESENTATION_FLOAT 3
 
 // ---- objects ----
 #define KL_SL_QUEUE 16
@@ -209,7 +211,10 @@ typedef struct kl_sl_player {
     unsigned head, tail, count;
     unsigned generation;                    // bumped on every re-creation
 
-    unsigned rate, channels, bits;          // from the PCM format
+    unsigned rate, channels, bits;          // from the PCM format — what the sink is fed
+    unsigned src_bits;                      // ...and what the guest enqueues, when that differs
+    int      src_float;                     // SL_ANDROID_PCM_REPRESENTATION_FLOAT
+    int16_t *conv; size_t conv_cap;         // the feeder's conversion scratch
     int      mixes;                          // 1: feed kl_audio; 0: usleep-pace only
     int      heard;                          // has handed over a non-silent buffer
     int      yielded;                        // silent, standing aside (silent_yield)
@@ -387,6 +392,38 @@ static void *feeder(void *arg) {
         SLuint32 size = p->q[p->head].size;
         p->head = (p->head + 1) % KL_SL_QUEUE;
         p->count--;
+        if (buf && p->src_bits) {
+            // Only this thread touches the scratch. Samples, not frames: the
+            // channel count is the same on both sides.
+            size_t n = size / (p->src_bits / 8);
+            if (n > p->conv_cap) {
+                int16_t *nb = realloc(p->conv, n * sizeof *nb);
+                if (nb) { p->conv = nb; p->conv_cap = n; }
+            }
+            if (n <= p->conv_cap) {
+                const uint8_t *in = buf;
+                for (size_t i = 0; i < n; i++) {
+                    int32_t v;
+                    if (p->src_float) {
+                        float f; memcpy(&f, in + 4 * i, 4);
+                        if (!(f == f)) f = 0.0f;
+                        if (f > 1.0f) f = 1.0f; else if (f < -1.0f) f = -1.0f;
+                        v = (int32_t)(f * 32767.0f);
+                    } else if (p->src_bits == 32) {
+                        int32_t w; memcpy(&w, in + 4 * i, 4); v = w >> 16;
+                    } else if (p->src_bits == 24) {
+                        v = (int32_t)((uint32_t)in[3 * i + 1] | ((uint32_t)(int8_t)in[3 * i + 2] << 8));
+                    } else {
+                        v = ((int32_t)in[i] - 128) << 8;      // 8-bit PCM is unsigned
+                    }
+                    p->conv[i] = (int16_t)v;
+                }
+                buf = p->conv;
+                size = (SLuint32)(n * sizeof(int16_t));
+            } else {
+                buf = NULL;                                   // no scratch: pace it silently
+            }
+        }
         unsigned frame = (p->channels * p->bits) / 8;
         if (!frame) frame = 4;
         unsigned rate = p->rate ? p->rate : 48000;
@@ -671,6 +708,7 @@ static void player_stop(kl_sl_player *p) {
     pthread_mutex_destroy(&p->lock);
     pthread_cond_destroy(&p->wake);
     pthread_cond_destroy(&p->cb_done);
+    free(p->conv); p->conv = NULL; p->conv_cap = 0;   // after the join: the feeder owned it
 }
 
 // Wait for any buffer-queue callback already on the stack to return. Real OpenSL
@@ -721,7 +759,27 @@ static SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *out,
             p->rate = f->samplesPerSec / 1000;
             p->channels = f->numChannels;
             p->bits = f->bitsPerSample;
+        } else if (f->formatType == SL_ANDROID_DATAFORMAT_PCM_EX) {
+            // The extended form: the same seven fields and then the sample
+            // REPRESENTATION, which is how a guest says "32-bit float". Read as
+            // plain PCM it was not read at all — the player kept the default
+            // 16-bit and float samples went to the device as integers.
+            const SLuint32 *ex = s->pFormat;
+            p->rate = f->samplesPerSec / 1000;
+            p->channels = f->numChannels;
+            p->bits = f->bitsPerSample;
+            p->src_float = ex[7] == SL_ANDROID_PCM_REPRESENTATION_FLOAT;
         }
+    }
+    // The sink takes 16-bit and nothing else (kl_audio_open). A guest that
+    // enqueues another width is converted in the feeder, so it is heard instead
+    // of refused; rebelancap's sink takes guest formats natively, which is the
+    // larger change this stands in for until that sink is taken over.
+    if (p->src_float ? p->bits == 32 : (p->bits == 8 || p->bits == 24 || p->bits == 32)) {
+        p->src_bits = p->bits;
+        p->bits = 16;
+        fprintf(stderr, "  [sl] audio player enqueues %u-bit %s — converted to 16-bit for the sink\n",
+                p->src_bits, p->src_float ? "float" : "PCM");
     }
     fprintf(stderr, "  [sl] audio player: %u Hz, %u ch, %u bit\n",
             p->rate, p->channels, p->bits);
@@ -1128,6 +1186,30 @@ void *kl_opensl_sym(const char *name) {
         if (strcmp(g_sl_syms[i].name, name) == 0) return g_sl_syms[i].addr;
     sl_slot(name);
     return kl_named_stub(name, (void *)klsl_called);
+}
+
+// The live census for a device log, where the end-of-run report never prints
+// (the app is killed, not exited): whether the guest is feeding an OpenSL
+// output at all, and whether anything it feeds can be heard. The line and its
+// place in the [hb] loop are from rebelancap's fork (eab213b); the counters are
+// this sink's own.
+void kl_opensl_heartbeat(FILE *f) {
+    const kl_sl_player *p = NULL;
+    int nstarted = 0;
+    for (int i = 0; i < KL_SL_MAX_PLAYERS; i++)
+        if (g_players[i].started) { nstarted++; if (!p) p = &g_players[i]; }
+    if (!p) {
+        if (kl_aaudio_output_rate())
+            fprintf(f, "  [sl] heartbeat: no OpenSL player; an AAudio stream owns the output "
+                       "(%u Hz), peak %d\n", kl_aaudio_output_rate(), kl_audio_peak());
+        return;
+    }
+    fprintf(f, "  [sl] heartbeat: %d player(s), first state=%s consumed=%lu "
+               "(%u Hz, %u ch, %u bit, %s), output peak %d\n",
+            nstarted, p->state == SL_PLAYSTATE_PLAYING ? "PLAYING"
+          : p->state == SL_PLAYSTATE_PAUSED  ? "PAUSED"  : "STOPPED",
+            g_buffers_consumed, p->rate, p->channels, p->bits,
+            p->mixes ? "mixed" : "paced silently", kl_audio_peak());
 }
 
 void kl_opensl_report(FILE *f) {

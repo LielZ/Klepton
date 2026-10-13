@@ -209,9 +209,11 @@ answers GL and kl_glfb never initializes.
   Host-only; it exists to produce the known-good frame a real backend gets
   diffed against.
 - `KL_EGL_EXTENSIONS=<space-separated list>` — override what
-  `eglQueryString(EGL_EXTENSIONS)` answers. The default names the three we
+  `eglQueryString(EGL_EXTENSIONS)` answers. The default names the four we
   actually implement (`EGL_KHR_image_base`,
-  `EGL_ANDROID_image_native_buffer`, `EGL_ANDROID_get_native_client_buffer`);
+  `EGL_ANDROID_image_native_buffer`, `EGL_ANDROID_get_native_client_buffer`,
+  and `EGL_KHR_create_context`, without which SDL2 refuses to request a GLES 3
+  context at all);
   set it EMPTY to restore the pre-VRChat behaviour. Worth having as an A/B
   because a guest may branch on a name here — and because an empty list, though
   legal, is what no Android driver actually ships: AVPro Video walks this string
@@ -276,6 +278,41 @@ answers GL and kl_glfb never initializes.
   sRGB).
 - `KL_GLFB_NOSWIZZLE=1` — drop the four `GL_TEXTURE_SWIZZLE_*` parameters.
   Single-channel textures then sample as red; a probe only.
+- `KL_EGL_CREATE_CONTEXT_EXT=1` — add `EGL_KHR_create_context` to the EGL
+  extension string. It is the `eglCreateContext` attribute set, and SDL2 will
+  not ask for a GLES 3 context on a display that does not advertise it. **Off
+  by default in this fork** (upstream of here it is in the default list): with
+  the name present Asgard's Wrath 2 creates its EGL contexts as GLES 3.2 where
+  it took GLES 2, and Beat Saber asks for 3.2/3.0 where it asked for plain 3
+  (Mac host), so it waits for a headset run. `KL_EGL_EXTENSIONS` still replaces
+  the whole string.
+- `KL_GL_BACKEND_EXT=1` — also name what ANGLE's own extension string has.
+  The GL description then repeats a short candidate list
+  (`GL_EXT_texture_format_BGRA8888`, the DXT/BC family, and
+  `GL_EXT_texture_filter_anisotropic`) when, and only when, ANGLE names them;
+  `[glfb] backend extensions adopted:` lists what was taken. Once anything is
+  adopted, `MAX_TEXTURE_MAX_ANISOTROPY` and the compressed-format pair are
+  answered by ANGLE instead of the table. **Off by default in this fork**
+  (upstream of here it is on, with `KL_GL_NO_BACKEND_EXT=1` as the way back):
+  every verified game was verified against the core-only description, and a
+  Unity guest that is shown anisotropic filtering starts using it.
+- `KL_GLFB_DEPTH_LINEAR=0` — rewrite a LINEAR filter on a depth texture whose
+  compare mode is NONE to NEAREST (ES leaves that sample undefined and Metal
+  returns 0, which reads as "everything is in shadow"); restored if the guest
+  later turns compare mode on. **Off by default in this fork** (`=1`, the
+  guest's write is left alone; upstream of here the rewrite is the default):
+  both Beat Saber builds make that write at start, so the rewrite changes what
+  a verified game samples. A switch in the start window's test group.
+- `KL_GLFB_NO_INT_PRECISION=1` — do not insert `precision highp int;` into
+  shaders that leave int precision to the stage default (which differs between
+  vertex and fragment, so a uniform declared in both fails to link).
+- `KL_GLFB_NOMIP=1` — demote every mipmapped min filter to its level-0 form,
+  on textures and sampler objects. Default off; a per-title workaround for a
+  guest that samples a mip level it should not (Tetris Effect's backdrop).
+- `KL_GLFB_PROGRAM_BINARY=0` — refuse `glProgramBinary` outright, leaving the
+  program unlinked so the guest recompiles from source. By default the binary
+  is forwarded and a rejected one (LINK_STATUS 0) is named in the log and
+  counted in the exit report.
 - `KL_GLFB_ERRPROBE=1` — bracket draws and blits with `glGetError` and print
   the first 20 with the state around them (draw FBO, program, viewport;
   `glCheckFramebufferStatus` on 0x506). Consumes the pending error. Also
@@ -811,6 +848,28 @@ The guest's own memory management, and the three seams that used to disable it.
   refusal leaves the SDK waiting on a completion that never comes, behind the
   launch precache's own black clear.
 
+- `KL_APK=<path>` — the APK behind `getPackageCodePath()` and
+  `ApplicationInfo.sourceDir`, which Unity opens as a zip for its streaming
+  assets. Host default is `beatsaber.apk`; set it (with `KL_FILES_DIR`) when
+  host-booting another title. visionOS ignores it — `kl_app.c` passes the
+  staged APK explicitly.
+
+## JNI surface (`runtime/jni/`)
+
+- `KL_UE_KEYBOARD=1` — hold UE's GameActivity virtual keyboard open
+  (`runtime/jni/kl_jni_ue4.c`) so a frontend can type into it through
+  `kl_jni_soft_input_*` (`runtime/kl_jni.h`), the same four calls Unity's soft
+  input answers. The default, with no keyboard on the host, ends every entry
+  immediately by committing the text the guest opened it with — the engine's
+  only end-of-entry native is an accept, and an entry nobody closes leaves the
+  widget holding input for the rest of the session.
+- `KL_UE_KEYBOARD_TEXT=<s>` — the default auto-close commits `<s>` instead of
+  the seed (initials on a score screen). Never applied to a password field.
+- `KL_TRACE_DLSYM=1` — also covers the synthetic `libandroid.so` handle
+  (`runtime/guest/kl_ndk.c`): every `dlsym` a guest makes on it prints
+  `[ndk] dlsym("…") -> served|NULL`. That handle answers before kl_dl's own
+  tracer runs, so FMOD's asset-layer probes would otherwise be invisible.
+
 ## Device identity (`runtime/kl_jni.c`)
 
 - `KL_BUILD_<FIELD>=<value>` — override one `android/os/Build` (or
@@ -923,9 +982,26 @@ m_boot's fault handler on every fatal path:
   backtrace — a hang names the parked owner, not just the waiters.
 - mutex waiters: who is blocked on which guest mutex and from where.
 
+Mutexes and rwlocks are keyed by guest address (`mtx_entry_for`,
+`rwl_entry_for`): Unreal memcpy's arrays holding locks, and most of its lock
+sites never call `pthread_rwlock_init`, so a slot index in guest storage was
+believed after a move. A destroyed mutex's entry stays in its bucket and is
+taken over by the next one there. Barriers keep a slot index in guest storage;
+that side table grows in 4096-slot chunks and logs
+`[klb] sync side table g_bar grew past N slots` at each power of two past
+65536.
+
 - `KL_TRACE_MUTEX=1` — log the first 200 mutex init/destroy events (guest
   address, slot/map index, tid, return address). How the slot-23 double-init
   was caught.
+- `KL_MUTEX_POLICY=fairshare` — create every guest mutex with Darwin's
+  `_PTHREAD_MUTEX_POLICY_FAIRSHARE` (hand the mutex to a waiter on unlock)
+  instead of the default first-fit, where an unlocking thread that re-locks at
+  once nearly always wins. Engines that pass ONE mutex between two threads as a
+  baton (`Unlock(); Sleep(0); Lock();`) starve under first-fit: The Simpsons:
+  Hit & Run's streaming loader took 2+ s per 1.4 MB zone. Prints
+  `[thr] guest mutexes use the FAIRSHARE policy` once. Default off; any other
+  value (`firstfit`) is the A/B.
 
 ## Guest-thread sampler (`runtime/diag/kl_sample.c`, `runtime/guest/kl_il2cpp.c`)
 
@@ -1228,6 +1304,15 @@ puts the camera on the ground with its hands underneath it.
   silence but the assertion that a controller whose position is changing in the
   same sample is stationary. `kl_openxr` was already careful to distinguish
   those; the zeros defeated it from the publishing side.
+- `KL_OVRP_STICK_MOVE=0|1` — move the complete guest tracking rig with the
+  left thumbstick, relative to the head's horizontal facing direction. Head and
+  both hands receive the same accumulated X/Z offset, so this is artificial
+  locomotion rather than a detached camera. Default on only for Richie's Plank
+  Experience (`x1642239225880682`), whose room-scale plank can cross visionOS's
+  fixed immersive safety boundary; off for every other target. A radial 0.20
+  deadzone prevents drift.
+- `KL_OVRP_STICK_MOVE_SPEED=<metres/second>` — full-deflection speed for the
+  artificial locomotion above. Default **1.0**.
 - `KL_OVRP_EYE_HEIGHT=<metres>` — standing eye height for the *default* head
   pose, i.e. what a headless run reports when no frontend has called
   `kl_ovrp_set_head_pose`. **Default 1.6**, and forced to 0 when the guest
@@ -1548,6 +1633,19 @@ puts the camera on the ground with its hands underneath it.
   fovea is always 1.0, falling off linearly). Lower is cheaper and blurrier in
   the periphery; 1.0 is a map that does nothing. Ignored on device when the
   drawable's own curve was sampled.
+- `KL_VRR_FLOOR=<0.01..1>` — **the smallest per-zone rate the guest's map may
+  carry**, applied on device after the display's curve is sampled (to the
+  envelope, to the curves per eye, and to the synthetic curve alike). A fragment
+  shader under a rate map runs in physical space, so `dFdx`/`dFdy` and every
+  texture LOD derived from them measure physical pixels: a zone at rate `r`
+  samples `log2(1/r)` mip levels higher than it would unfoveated. The display's
+  own periphery (≈0.12 x, ≈0.10 y) is +3.1/+3.3 levels, a soft, screen-fixed
+  over-blur. The floor bounds it at `log2(1/floor)` levels — 0.50 is +1 — at a
+  fragment cost of 28.6% -> 48.8% of the unfoveated eye on the measured curve.
+  One `[cp] foveation LOD:` line states the worst bias on both axes before and
+  after, and the fragment fraction. **Off unless set in this fork** (upstream of
+  here the default is 0.50): the eye sizes shipped for Beat Saber 1.45 and
+  Doom 3 were chosen for the fragment count of the raw curve.
 - `KL_VRR_ZONES=<n>` — how many equal screen-space zones each axis of that
   synthetic curve is divided into, default 16, capped at 64. Also the unwarp
   grid's cell count, which is what makes the unwarp exact rather than a sampling
@@ -1569,7 +1667,29 @@ puts the camera on the ground with its hands underneath it.
   packaged Vulkan-only and says so itself when refused ("This device does not
   support Vulkan but the app was not packaged with ES 3.1 support", out of its
   own message box), so this restores that refusal exactly and is the A/B for
-  anything that suspects the API choice.
+  anything that suspects the API choice. Unset or `1` presents
+  `VK_MAKE_VERSION(1,1,0)`; any value **> 1 is used as the version word**
+  itself, because Unreal decides from the number — UE5.3 (Pinball FX VR)
+  refuses Vulkan at 1.0.3 without calling a single vk* function and accepts it
+  at 1.1.
+- `KL_UE4_MULTIVIEW` — tri-state override of the mobile-multiview clear
+  (`runtime/guest/kl_ue4.c`). UE4 prepends `layout(num_views = 2) in;` to every
+  cooked shader when `GSupportsMobileMultiView` is true, ANGLE's Metal backend
+  has no multiview, and the compile failure becomes a ForceQuit — so on a **GL**
+  guest the runtime clears that flag (log: *"mobile multiview was ON —
+  cleared"*). On a **Vulkan** guest none of that applies, and clearing it
+  forces UE4's DoubleWide stereo path (static meshes that vanish as the head
+  moves on Into the Radius), so it is left alone (log: *"mobile multiview left
+  alone — this guest brought up a VULKAN device"*), and a value cleared before
+  the device existed is put back. **In this fork ANGLE has multiview**: a guest
+  that is named the `GL_OVR_multiview` extensions (the Array eye layout on GL —
+  Maestro) is never cleared, whatever the value.
+  - **unset (default)** — decide from `kl_vulkan_guest_active()`.
+  - **`=1`** — never clear, whatever the RHI.
+  - **`=0`** — always clear, Vulkan included.
+- `AndroidThunkJava_ForceQuit()` is logged with the guest's call stack and not
+  obeyed in this fork; the bounded quit that came with the surface around it
+  (`KL_UE4_FORCE_QUIT`, `KL_UE4_QUIT_LIMIT`, `KL_UE4_QUIT_TRACE`) is not taken.
 - `KL_UE4_WAIT=<seconds>` — the pump budget for a NativeActivity guest, default
   5. There is no frame count on this door: the guest owns its own game thread
   and its own frame loop, so seconds are the only unit. **RE4 needs 300** — its
@@ -2244,15 +2364,16 @@ reads no knobs).
   did for its whole life before `kl_audio.c`. The A/B for anything that looks
   like an audio-induced timing change — and read **by value** (`kl_env_on`),
   since it defaults on.
-- `KL_AAUDIO_BURST=<frames>` — the frames-per-callback the AAudio surface
-  (`runtime/media/kl_aaudio.c`) reports and asks the guest's data callback to fill.
-  Default 240, which is 5 ms at 48 kHz and the unit Steam Link's own jitter
-  buffer is configured in multiples of. Clamped to 32..8192. AAudio is a *pull*
-  API, unlike OpenSL's buffer queue, so this is the size of every call INTO the
-  guest; the device is still the clock, because the feeder paces on
-  `kl_audio_write`. There is no knob for the input direction: capture streams
-  are refused by design (no microphone is presented — see `kl_aaudio.h`), which
-  the guest logs as `AAUDIO_ERROR_UNAVAILABLE` and carries on from.
+- `KL_AAUDIO_BURST=<frames>` — the size of every pull an AAudio guest's mixer
+  is asked to serve, 32..8192. Default **256** (since 2026-10-13; it was 240):
+  a power of two divides the fixed blocks sound engines mix in, where 240
+  against a 1024-frame block left every fifth pull with 176 zeros, a fine
+  crackle. Steam Link keeps 240 (its jitter buffer is configured in multiples
+  of it) and four titles with an older Wwise keep 1024, which is what each was
+  heard with. A value given here overrides all of that.
+- `KL_AAUDIO_OLD_BURST=1` — the default is 240 again, for the games that had
+  it. The way back if a game sounds worse at 256; a switch in the start
+  window's test group.
 - `KL_AUDIO_DUMP=<path>` — tee exactly the frames the render callback will
   hand the hardware into a WAV. The only way to check *what* is being played
   rather than merely that something is: counts and peak levels cannot tell
@@ -2356,6 +2477,20 @@ reads no knobs).
   without ever checking saved state. It checks; the files simply do not exist.
 - `KL_TRACE_IMAGES=1` — log each loaded image's base and span, the stub pool
   mapping, and each emitted stub. Read by `kl_image.c`.
+- `KL_TRACE_MMAP=1` — log every guest `mmap`/`mprotect` (`[mm]` lines): the
+  request, the result or errno, and the caller as image+offset. Read by
+  `kl_libc.c`. The instrument for a guest that runs its own ELF loader: which
+  call left a page without the permission it later needed. Unaligned
+  `mprotect` on 16 KiB pages is widened (write) or narrowed (otherwise) and
+  named in `[klepton] mprotect(...) is not 16 KiB-aligned` either way.
+
+Signal numbers: Linux and Darwin disagree on SIGUSR2 (12 vs 31) and SIGSYS
+(31 vs 12), and Darwin 12 is fatal, so a guest's SIGUSR2 handler was refused
+and its `pthread_kill(…, SIGUSR2)` killed the process. That one pair is
+swapped on every entry point that takes a signal number or mask (`sigaction`,
+`signal`, `kill`, `raise`, `pthread_kill`, `pthread_sigmask`, `sigwait`,
+`sigsuspend`, `sigpending`); every other number passes through as before. `KL_SIG_SWAP=0` restores the pass-through
+of both numbers (this fork's switch; read once).
 
 ## Steam Link (`runtime/guest/kl_slink.c`, `build_run_host.sh`)
 
@@ -2730,6 +2865,224 @@ vendored the whole path refuses by name and none of these do anything.
   `vendor-moltenvk/out/macos`); `KL_MVK_DYLIB=<path>` names the file outright.
   Both are the A/B against a different MoltenVK build.
 
+## Fixed foveation (`runtime/gfx/kl_fove.m`) — Vulkan guests, OFF by default
+
+Confirmed on the headset with Half-Life: Alyx, then extended to the Unity and
+Unreal eye shapes below. Design, measured facts and known gaps:
+`docs/FOVEATION.md`. GLES guests foveate through `KL_VRR` instead.
+
+Three eye shapes are recognised (all need `KL_FOVEATION` on; with it unset
+nothing is installed, swizzled or handed out, and kl_vulkan's render-pass
+records are never written):
+
+1. **OpenVR double-wide** (Half-Life: Alyx): a `vkCmdBeginRendering` pass whose
+   colour and depth are both the extent of the texture the guest Submits.
+   Needs an OpenVR runtime that reports that extent; none is in this tree yet,
+   so kl_fove carries the maths and the map but this shape is not recognised.
+2. **The runtime's own eye images** (every Unity/Unreal Vulkan guest): a `vkCmdBeginRenderPass[2]` pass whose colour attachment 0 IS
+   an eye image kl_ovrp (or kl_openxr) handed the guest, or whose resolve
+   attachment 0 is (an eye-size MSAA target resolved into the eye in the pass),
+   with a depth attachment of the same extent and sample count. A 2-layer
+   ARRAY eye (multiview, viewMask 0x3) gets ONE rate map with two layers, layer
+   l centred on eye l's projection centre (`kl_ovrp_eye_tangents`, which
+   kl_openxr's xrLocateViews also answers from; inside the submitted
+   ViewportRect when one is recorded) and is foveated only as a LAYERED Metal
+   pass (renderTargetArrayLength 2 — MoltenVK's lowering of multiview on Apple
+   GPUs); a one-slice pass over the pair draws unfoveated (counted). Every
+   patched shader passes `[[render_target_array_index]]` to the decoder (an
+   existing argument or stage_in member is reused, else one is added; Metal
+   answers 0 when the vertex stage does not write it). An MSAA pass that
+   resolves in-pass is expanded on the single-sample image it resolves into
+   (MoltenVK opens it with storeAction Unknown + resolveTexture); the expand
+   runs per slice. Measured on GORN 2 (host): 4x MSAA multiview colour+depth
+   resolved into the kl_ovrp swapchain, one layered encoder per frame.
+3. **The guest's own eye-size intermediate** (Batman: Arkham Shadow's render
+   pipeline; UE's SceneColor -> tonemap is the same family). The scene pass's
+   colour is NOT an eye image but is eye-sized (2 layers / viewMask 0x3 for a
+   pair, depth of the same extent and samples). (a) **In-pass**: a later
+   subpass of the SAME render pass writes (or resolves into) a runtime eye
+   image (Batman: Arkham Shadow: `#0 depth x2, #1 colour x2 DONT_CARE-stored, #2
+   R8G8B8A8_SRGB x1 STORE`, 3 subpasses, the post subpass reads #1 as an input
+   attachment). Marked at once: every Metal encoder of the pass (scene
+   subpasses and the eye subpass) gets the SAME 2-layer map; the scene stays in
+   physical layout (it is transient — required: its storeOp is DONT_CARE, the
+   eye attachment is not LOADed, all subpasses share one view mask), subpass
+   inputs read it at the physical position (the MSAA-eye rule), and the EYE image is
+   expanded after the pass. (b) **Copied / sampled later**: the pass's colour is
+   a CANDIDATE, confirmed (sticky until vkDestroyImage) by a
+   vkCmdCopyImage[2] / vkCmdBlitImage[2] / vkCmdResolveImage[2] into an eye
+   image, or by the next render pass that draws into an eye image (sampled —
+   a heuristic: that pass is assumed to read it). The confirming frame stays
+   unfoveated; afterwards the intermediate is marked like an eye and expanded
+   before the next render, compute **or blit** encoder (so its copy into the
+   eye reads screen layout). A layered MSAA intermediate with no in-pass
+   resolve stays unfoveated (counted, as for eyes).
+   **Size slack (Deadpool):** the intermediate need not be exactly
+   eye-size — equal or up to +16 px per axis, never smaller
+   (`kl_fove_inter_extent_ok`), because Unreal rounds its scene target up
+   (Deadpool: 5088x3236 scene for a 5088x3234 eye; the exact match left it
+   silently unfoveated, `fove high 0%`). The map is sized to the intermediate
+   (`[fove] map 5088x3236, 2 layer(s)`) and the expand runs on it (or on what it
+   resolves into), so the eye being smaller changes nothing downstream.
+   **Transient MSAA scene (Deadpool):** UE4's
+   depth-read subpass pair — `#0 colour x2 CLEAR/DONT_CARE, #1 x1
+   DONT_CARE/STORE, #2 depth x2`, subpass 0 draws the MSAA scene, subpass 1
+   LOADs it (depth read as an input) and resolves #0 into #1. MoltenVK opens
+   subpass 0 as a layered encoder that STORES the samples with no resolve,
+   which the rule above refused (`layered MSAA … UNFOVEATED`), and subpass 1
+   then LOADed with nothing pending (`a pass LOADs the eye …`) — both every
+   frame, `fove 0%`. When kl_vulkan sees the confirmed intermediate's colour
+   is storeOp DONT_CARE and a later subpass resolves it into a single-sample
+   attachment (`kl_fove_note_ms_transient`), the layered no-resolve encoder is
+   marked and its pending entry HELD (no expand; the samples die with the
+   pass), the LOADing resolve encoder is marked with the same map, and the
+   x1 resolve target is what gets expanded (the layered single-sample
+   expand), before the pass that samples it. No per-sample expand is needed.
+   Proof lines: `[vk] [fove] intermediate …: MSAA x2 scene with storeOp
+   DONT_CARE, resolved by a later subpass into attachment #1 (x1) …`, `[fove]
+   intermediate slot N: MSAA scene is TRANSIENT …`, `[fove] transient MSAA
+   intermediate: first HELD … encoder` + `first RESOLVING … encoder`, `[fove]
+   first expand: … x2 slices`, and in the 10 s line `transient MSAA held N /
+   resolved N` with `eye LOADs left unfoveated 0`, `layered MSAA without
+   resolve … 0`, `eye subpasses UNMAPPED 0`. A LOAD of held samples left
+   unmapped is a `BROKEN FRAME` (counted as UNMAPPED). A layered MSAA store
+   whose samples ARE kept (not DONT_CARE) still draws unfoveated: the
+   per-sample expand remains one-slice only.
+- **Re-centre on the frame record.** A layered (ARRAY) map built before the first frame record used the
+   full image for each eye's straight-ahead point; Deadpool renders each eye
+   into a ~4012-wide sub-rect of a 5088 texture, so the fovea sat 682 px off
+   (a hard clear/blurry seam in both eyes). `kf_map_for` now recomputes an
+   ARRAY map's centres on lookup and rebuilds it in place when one moves more
+   than **4 px** — never while a pending expand refers to it, at most 8 times
+   per run (old maps kept alive for frames in flight). Line: `[fove] map WxH
+   RE-CENTRED (#n): it was built at x,y / x,y — the frame record moved the
+   straight-ahead point …`; after the 8th, `… re-centres were already made —
+   kept`. Full-image records (Into the Radius, Batman: Arkham Shadow) give the same centre as no record
+   and never rebuild. No knob.
+
+- `KL_FOVEATION=off|low|medium|high` — default **off**. Profiles (box / floor,
+  ramp 0.19 H): low 0.603 H / 0.333, medium 0.508 H / 0.22, high 0.381 H /
+  0.125. No rate-map support (visionOS Simulator) = off with one line; no
+  2-layer support = 2-layer eye pairs stay unfoveated (one line). Logs `[fove]`.
+- **Lines that prove engagement on a Unity/OVRPlugin guest** (one run):
+  `[vk] [fove] EYE PASS (marked) render pass …: MSAA colour resolved into a
+  runtime eye image WxH x4 (2 layer(s), … viewMask 0x3) …`, `[fove] eye target
+  registered: … 2-layer eye pair`, `[fove] map WxH, 2 layer(s) (one per eye) …
+  layer 0 = eye 0 centre …` + `layer 1 = eye 1 centre …` (centres NOT 50%/50%
+  on the headset — asymmetric frusta; each centre names the
+  render viewport it came from, `…; viewport 0,0 WxH of WxH[, another
+  generation: scaled as a fraction]` or `…; no frame record: full image`),
+  `[fove] marked encoder #1: … + resolve
+  … array length 2`, `[fove] first expand: … x2 slices`, and every 10 s
+  `[fove] libraries …; encoders marked N (layered N) …, eye LOADs left
+  unfoveated 0, one-slice passes … 0, layered MSAA without resolve … 0;
+  expands N (… of a resolve target N marks …); refused 0 …`. A near miss is
+  named once with its full attachment table: `[vk] [fove] near miss, NOT
+  marked: … | why: …` (+ `[vk] [fove] near miss images: …`), and a transfer
+  into an eye image (the guest drew elsewhere) as `[vk] [fove] vkCmdBlitImage
+  INTO a runtime eye image …`.
+- **Map centre and the viewport generation.** The
+  per-eye centre is the frustum's straight-ahead fraction inside the guest's
+  render viewport, and that rect is now read as a FRACTION of the texture it
+  was measured against (`kl_ovrp_render_pose.viewport_of`), applied to the
+  image the map is built for. Read as pixels instead, a guest that re-creates
+  its eye images after the first frame (Into the Radius 5088x4081 -> 6784x4528;
+  Unity's ~1.2x resize and again on map entry) would get a map built from the
+  previous generation's rect — the fovea 848 px left / 204 px up, a blur band
+  on the right eye's outer edge. viewport_of 0 or a rect that does not fit it =
+  the full image. To check a guest that resizes its eye images: compare its
+  `[fove] map … centre` lines against W x fx, H x ~0.456 (the line's own
+  percentages), and the `of WxH` it names against the map's WxH.
+  - **In an installed game this is a setting**: the start window shows the
+    level (Off / Light / Medium / Strong) in place of the foveation switch for
+    a game known to draw with Vulkan, and hands it over as `KL_FOVEATION`
+    (`Strong` also sets `KL_FOVE_BOX=0.30 KL_FOVE_FLOOR=0.08`). Where it starts
+    is the target's `vk_foveation` in `visionos/targets.py` — `medium` for
+    Marvel's Deadpool VR, off for everything else. A value on the launch line
+    wins.
+- `KL_FOVE_MSAA=0` — leave MSAA eyes UNFOVEATED (one `[vk] [fove] … MSAA`
+  line / near-miss reason). Default 1. MSAA paths: the depth-only
+  clear of a tiler-0 MSAA eye is mapped and leaves a depth_only pending entry;
+  2d_ms reads of an eye image at `gl_FragCoord` keep the PHYSICAL position;
+  an MSAA eye stored with no resolve is expanded per sample (resolve the
+  physical region, blit each fovea rectangle with all samples, periphery +
+  per-sample fovea back) — one slice only: a LAYERED MSAA pass that stores
+  its samples with no resolve draws unfoveated (counted). `KL_FOVE_MSAA_FOVEA=0`
+  (debug) — the per-sample fovea copy off.
+- `KL_FOVE_BOX=<fraction of H>`, `KL_FOVE_RAMP=<fraction of H>`,
+  `KL_FOVE_FLOOR=<rate 0.02..1>` — override the level's numbers (box 0.30 /
+  floor 0.08 was found invisible on the headset in Half-Life: Alyx).
+- `KL_FOVE_BUFFER=<1..30>` — the fragment buffer slot for the rate-map
+  parameters (default 20). A `[[position]]` shader already using it is
+  refused and foveation turns itself off; a clobber inside a foveated pass
+  does the same.
+- `KL_FOVE_FRAGCOORD=0|grid|gridraw` (debug) — unpatched shaders / a 64-px
+  position grid with or without the remap. `KL_FOVE_EXPAND=0` (debug) — leave
+  the eye in physical layout. `KL_FOVE_MSL_DUMP=<absolute dir>` (debug) —
+  every MSL source, as patched. `KL_FOVE_TRACE_ENC=<n>` (debug) —
+  the first n Metal render-pass descriptors after an eye is registered
+  (textures, types, sample counts, slices, load/store, resolve, array length).
+- `KL_FOVE_FENCE=0|1` — default **1** (confirmed on the headset with
+  Half-Life: Alyx). MoltenVK orders its passes with its own
+  MTLFences, so without this the guest's next reader of the eye can run
+  concurrently with the expand and see the raw physical (compressed) layout
+  (Half-Life: Alyx without it: shrunken copies of the scene in the top-left of
+  the left eye). Every expand path's last encoder updates a fence (`kl-fove-expand`;
+  the layered single-sample expand chains slice 0 -> slice 1 through a second
+  fence) and every render/compute/blit encoder opened afterwards on the same
+  queue waits on it (same command buffer at once; a later one once the
+  expand's buffer is committed). `0` = unordered (control). Proof lines:
+  `[fove] ON … expand ON (fenced: the guest's later passes wait for it)`,
+  `[fove] expand fence: the guest's encoders after an expand wait for it (first
+  wait: …)`, and every 10 s `[fove] expand fence: encoders
+  after an expand: waited on its own buffer N, on a later buffer N; NOT waited:
+  other buffer while the expand's was uncommitted N, other queue N; expands
+  recorded at an encoder N, at commit N`. "other queue" = an encoder on a
+  different MTLCommandQueue (no fence can order it — Metal fences are
+  per-queue; the swizzle is class-wide, so the runtime's own Metal work, e.g.
+  the compositor, is counted there too); non-zero "uncommitted" means the
+  guest encodes the reader into another command buffer before committing the
+  expand's — read it before anything else. The first expand also logs the eye
+  image's hazard tracking mode.
+- `KL_FOVE_INTERMEDIATE=0|1` — default **1** whenever `KL_FOVEATION` is on.
+  `0` = shape 3 above is never marked (the near-miss line of shape 2 comes
+  back). Proof lines (Batman: Arkham Shadow, in-pass): `[vk] [fove] intermediate CONFIRMED:
+  VkImage … -> eye image … via subpass (attachment #2 of render pass …)`,
+  `[vk] [fove] EYE PASS (marked) render pass …: eye-size intermediate, a later
+  subpass writes a runtime eye image …`, `[fove] intermediate target
+  registered: … via subpass …`, `[fove] intermediate slot N: eye image … is
+  written in-pass from it` (one per swapchain stage), `[fove] intermediate:
+  first marked scene encoder` + `first marked EYE-SUBPASS encoder`, `[fove]
+  first expand: … x2 slices`, and in the 10 s line `intermediate marked N (eye
+  subpasses N, eye subpasses UNMAPPED 0, expands before a blit N)`. Copy /
+  sampled shape: `[vk] [fove] intermediate CONFIRMED: … via copy|blit|resolve
+  (vkCmd…)` or `via sampled (…)` and `[fove] intermediate: expanded before a
+  blit encoder`. **`[fove] BROKEN FRAME: the eye subpass of a foveated
+  intermediate was left UNMAPPED`** (UNMAPPED > 0) = the picture is wrong
+  that frame — set `KL_FOVE_INTERMEDIATE=0` and bring the line back. The
+  transfer census line (`vkCmd… INTO a runtime eye image …`) now also names
+  the first region's layers/offsets/extent and whether the source is a
+  candidate/confirmed intermediate; the copy_commands2 spellings are hooked
+  too.
+- `KL_FOVE_PROBE=1` (debug) — the first 4 transfers of each kind into an eye
+  image (not just the first), and the first 4 depth-less passes drawing into
+  an eye image with the last candidate intermediate. It also swizzles MoltenVK's
+  render/compute encoder classes and prints every fence wait/update,
+  useResource, memory barrier, texture bind and dispatch on the 2 encoders
+  after each of the first 4 expands (`(THE EYE)` marks the eye), plus 10 s
+  totals. `KL_FOVE_SLOW=<n>` (debug stress) — n busy
+  iterations per fragment of the MSAA periphery expand, to widen the race
+  window (no effect on single-sample expands).
+- `KL_FOVE_AREA_SNAP=0|1` — default **1**. An eye pass whose render area
+  falls a few px (< 8) short of its framebuffer is widened to the whole
+  framebuffer: MoltenVK clears an attachment with a Metal clear only when the
+  render area IS the framebuffer extent, and otherwise opens it with LOAD, and
+  a pass that LOADs an eye with nothing foveated pending cannot be mapped.
+  Unreal rounds its scene buffer up (an area of 4608x2935 on a 4608x2936 eye);
+  without this every eye pass LOADed and nothing was foveated. The extra
+  rows/columns lie outside every viewport the guest submits. Line: `[vk] [fove]
+  area snap #1: eye pass area WxH widened to its framebuffer WxH …`.
+
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 
 The Vulkan side of BONELAB. Not part of the runtime yet —
@@ -2748,6 +3101,16 @@ these are the gate's own knobs.
 
 Read on the device/simulator; `visionos/run.sh` forwards every `KL_*` it sees
 except its own control vars (next section).
+
+- `KL_SHADER_CACHE_GUARD=0` — keep a guest's compiled-program caches across a
+  driver change. By default `kl_app.c` stamps `kern.osversion`, `hw.model` and
+  `KL_GLFB_REWRITE_GEN` into `<files>/.klepton-gl-driver` and, when the stamp
+  moves (an OS update, a rewrite-rule change), deletes every
+  `ProgramBinaryCache` / `UnityShaderCache` directory beneath it, once
+  (upstream of this fork also `ShaderCache`, `il2cpp_cache` and `GPUCache`;
+  left out here until a guest is seen keeping GL program binaries under those
+  names). A stale cache reloads into programs
+  that never link, which UE4 titles turn into a crash on the first level load.
 
 - `KL_TARGET=<name>` — which guest the app boots: `beatsaber`, `superhot` or
   `steamlink-vr` (`visionos/targets.py --list`). The **default is compiled in**
@@ -3092,3 +3455,116 @@ Not knobs — the shim reads these to answer the guest with host truth.
 - `LANG` — `kl_jni.c` derives `Locale.getDefault()`'s language and country
   from it (`en_US.UTF-8` becomes en/US). Empty, unset, or `C*` falls back to
   en/US.
+- `KL_BACKUP_EXCLUDE=0` — do not mark the game's files as left out of the device
+  backup at this start. The **default marks them**: the APK, the unpacked assets,
+  the expansion folders, the Linux trees and the shader lists are what the
+  installer can put back, and in Documents they would otherwise go into the
+  owner's device backup (72 GB for Half-Life: Alyx). Saves and settings are never
+  marked. A mark already set stays. `visionos/Sources/KleptonBackup.swift`.
+- `KL_ALYX_GPU_IDS=0` — Half-Life: Alyx: leave `hlvr/cfg/deckard/video2.txt`
+  alone at start. The **default puts the running GPU's VendorID/DeviceID into
+  it**, because the game replaces the whole file with its automatic setup when
+  they differ, and the device id changes with a system update. The boot log's
+  `video file:` line says what was found. `alyx_video_gpu_ids` in `kl_app.c`.
+- `KL_ALYX_TEX_FLOOR=0` — Half-Life: Alyx: leave out the two launch arguments
+  `+r_texture_stream_resolution_bias_min 1.0 +r_texture_budget_dynamic 0`
+  (the texture streamer's floor and a pool that keeps its given size), for a
+  comparison with the game's own 0.8. `KleptonAlyx.swift`.
+- `KL_VK_EYE_ENVGUARD=0` — Half-Life: Alyx: leave the `vr_eyeball` pixel
+  shaders as the game ships them. The **default (on for `alyx`) rewrites them**
+  when their modules are created: they index the scene's cubemap table with a
+  packed value instead of its upper bits and so read far past the end of a
+  constant buffer — zeros on a PC GPU, which bounds-checks that, and whatever
+  lies there on Metal, which does not: NPC eyes flashing solid red, green, blue
+  or magenta for a frame or three. Six modules of Steam build 25487405 are
+  recognised by their shape; `[vk] eye cubemap fix:` lines in the log say how
+  many were rewritten. `runtime/gfx/kl_vk_eyefix.c`, after Glovebox.
+
+- `KL_PERF_LOG=0` — no `[perf]` line. The **default writes one a minute** while
+  a guest that owns its frame loop draws: its frames a second, the rate the app
+  is displayed at (the poses the compositor offered), the GPU time of the scene
+  command buffers where that is measured (`KL_MTL_GPU_TIME`), the thermal state
+  (0 nominal .. 3 critical) and memory used / left. `kl_app.c`, `perf_tick`.
+- `KL_MTL_GPU_TIME=0|1` — the GPU time of the command buffers that carry the
+  multisampled scene pass, from their own start and end times (a completed
+  handler each; **on for `alyx`**). Feeds `[perf]` and the readout.
+- `KL_STATS_CARD=1` — one line at the lower left of the view: frames a second,
+  display rate, GPU time, thermal state. Redrawn at most once a second.
+  Half-Life: Alyx sets it from "Show frame rate" in its start window.
+- `KL_GUEST_PACE_DIV=<n>` — a guest paced through `xrWaitFrame` starts a frame
+  on every nth refresh of the panel (default 1). Timed against the panel's own
+  period, so a display rate the system has halved does not make it a quarter.
+  Alyx: "Frame cadence".
+- `KL_VK_MSAA_MEMORYLESS=1` — the multisampled depth target of the scene pass
+  in Metal memoryless storage (88 MB at Alyx's largest picture with 2x, about
+  165 MB at the medium one with 4x). **Alyx sets it** unless "Keep depth
+  samples out of memory" is switched off in its start window.
+  `[vk] memoryless:` lines say what was moved, `[mtl] memoryless:` lines count
+  any pass that wanted to load or store it — which must stay none.
+- `KL_VK_METER_STORE_EVERY=<n>` — with `KL_VK_PASS_BARRIERS=0`: the scene
+  pass's multisampled colour, which is stored for the exposure meter to read,
+  is stored on every nth frame only (default 1). Measured as no gain
+  (`KL_VK_METER_STORE_AB`, 2026-10-13), so nothing sets it.
+- `KL_ALYX_CADENCE=1|2`, `KL_ALYX_FEWER_EFFECTS=0|1`, `KL_ALYX_STATS`,
+  `KL_ALYX_LEAN_DEPTH=0|1` — Alyx's frame cadence, effects, frame-rate readout
+  and depth samples, named by a launch instead of the start window.
+- `KL_ALYX_AUTO_SIZE=1`, `KL_ALYX_LEAN_METER=1` — two trials that are not in
+  the window: the engine's own picture-size controller (it only ever went
+  down) and `KL_VK_METER_STORE_EVERY=8`.
+- `KL_ALYX_FAST_DEVICE=0|1` — the picture size of Alyx's "Balanced" and
+  "Sharp": 1 the largest, as found on the Vision Pro with the M5, 0 one size
+  below it, for the M2. Default by `hw.machine` (`RealityDevice17` and later: 1).
+- `KL_ALYX_TEXTURE_POOL=<MB>` (0, 1024, 1536, 2048, 2560, 3072) and
+  `KL_ALYX_TEXTURE_CAP=<px>` (1024, 2048, 4096) — Half-Life: Alyx's texture
+  memory and the finest size a texture is loaded at, named by a launch instead
+  of the start window. 0 is "Automatic": what the
+  picture size leaves (1536 MB at the smallest picture, 768 at the largest).
+- `KL_VK_METER_STORE_AB=<frames>` — measure `KL_VK_METER_STORE_EVERY` inside
+  one run: the colour is stored every frame for `<frames>` frames, then every
+  8th for as many, and so on; after every four rounds of each a `[vk]
+  KL_VK_METER_STORE_AB:` line gives the scene GPU time of both and the
+  difference. For a run from `Documents/lx/env.txt`; not a switch in the window.
+- `KL_VK_FOVEATE_OUTER=<tangent>` — with `KL_VK_FOVEATE`: the tangent at which
+  the edge rate is reached; beyond it everything is drawn at that rate. Default
+  is the widest edge of the cone, a fall over the whole picture. Alyx's
+  "Strongest" sets 0.70 (35 degrees).
+
+## Taken over from rebelancap's fork, round 4 (avp-play issue 16)
+
+What was taken before the release is additive or a switch; his audio sink and
+his pose/frame-record core replace ours and are not in. Each of the switches
+below is also a row under Advanced > Test in a game's start window.
+
+- `KL_FMOD_BLOCK=<frames>` — the block size `org.fmod.FMOD.getOutputBlockSize`
+  answers. **Default 512**, what Asgard's Wrath 2 and Vampire were heard with;
+  his fork answers 256 (the number `OUTPUT_FRAMES_PER_BUFFER` gives).
+  `runtime/jni/kl_jni_fmod.c`.
+- `KL_AUDIO_ONE_OUTPUT=1` — `AudioManager.getDevices` shows the guest one
+  output (the built-in speaker) instead of an empty list. **Default off, on for
+  Pistol Whip**; his fork answers one to every guest, because Meta's XR Audio
+  sink for Wwise picks its output from that list. `runtime/jni/kl_jni_net.c`.
+- `KL_CROWN_SILENCE=0` — do not silence the output when the scene goes inactive
+  or the compositor layer is torn down. **Default on**: the Digital Crown takes
+  the immersive space away at once, the system backgrounds the app up to half a
+  minute later, and until then the game played on. `KleptonAudio.swift`,
+  `kl_audio_set_silenced`.
+- `KL_XR_BOOT_GATE=1`, `KL_XR_BOOT_GATE_MS=<ms>` (4000), `KL_XR_HONEST_HEAD=1` —
+  OpenXR guests: hold the first frame until a head pose and both hands have
+  been published, and report an unpublished head as untracked. **Default off**
+  (his: on wherever a display paces the frames). `runtime/xr/kl_openxr.c`.
+- `KL_OVRP_GL_ARRAY=0|1` — existing switch; **now also on for Tetris Effect**
+  (`x3386618894743567`), which asks for the Array eye layout on GL whatever it
+  is told. His fork describes such a layer as Stereo instead.
+- The `[bank]` lines (soundbank and expansion-file opens, stats and failures)
+  are always on, as in his fork. `runtime/libc/kl_libc.c`.
+- `[sl] heartbeat:` every ten seconds in a device log: players, state, buffers
+  consumed, the output peak. `kl_opensl_heartbeat`.
+
+Not from his fork, found on the way (2026-10-13):
+
+- `KL_OVRP_RECO_EYE=0|1` — `ovrp_GetLayerRecommendedResolution` answers the eye
+  texture size at density 1 instead of the eye layer's own (largest) size.
+  **Default on for Red Matter 2**, which otherwise draws at its ceiling in every
+  frame. `runtime/xr/kl_ovrp.c`.
+- `KL_BUILD_MODEL=<name>` — existing override; **Red Matter 2 is told "Quest"**,
+  the only Quest model name it knows.

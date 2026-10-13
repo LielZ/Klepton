@@ -31,6 +31,8 @@
 #include "kl_vtdec.h"
 #include "kl_avdec.h"
 #include "kl_vulkan.h"
+#include "kl_glfb.h"
+#include "kl_driver.h"
 
 void kl_unresolved_named(const char *name);     // kl_shim.c
 
@@ -51,7 +53,8 @@ enum { AMEDIA_OK = 0,
        AMEDIA_ERROR_MALFORMED         = -10001,
        AMEDIA_ERROR_UNSUPPORTED       = -10002,
        AMEDIA_ERROR_INVALID_OBJECT    = -10003,
-       AMEDIA_ERROR_INVALID_PARAMETER = -10004 };
+       AMEDIA_ERROR_INVALID_PARAMETER = -10004,
+       AMEDIA_ERROR_INVALID_OPERATION = -10005 };
 enum { AMEDIACODEC_INFO_TRY_AGAIN_LATER    = -1,
        AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED = -2,
        AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED = -3 };
@@ -693,6 +696,12 @@ typedef struct {
     struct { void *pb; int64_t pts_us; } q[KLM_READER_MAX];
     int      head, count;
     unsigned n_queued, n_acquired, n_dropped;
+    unsigned texture;
+    unsigned n_latched, n_upload_failed, n_empty_updates;
+    int64_t first_pts_ns;
+    int is_surface_texture;
+    void *latched_image;
+    int64_t timestamp_ns;
 
     pthread_t dispatch;
     int       running;
@@ -843,6 +852,11 @@ static void klm_AImageReader_delete(void *reader) {
         r->head = (r->head + 1) % KLM_READER_MAX;
         r->count--;
     }
+    if (r->is_surface_texture)
+        fprintf(stderr,"  [media] SurfaceTexture summary: queued=%u latched=%u skipped=%u upload_failed=%u empty_updates=%u first_pts_ns=%lld last_pts_ns=%lld\n",
+            r->n_queued,r->n_latched,r->n_dropped,r->n_upload_failed,r->n_empty_updates,
+            (long long)r->first_pts_ns,(long long)r->timestamp_ns);
+    if (r->latched_image) kl_glfb_image_destroy(r->latched_image);
     kl_ndk_window_free(r->window);
     pthread_mutex_destroy(&r->lock);
     pthread_cond_destroy(&r->cv);
@@ -881,6 +895,98 @@ static void klm_reader_publish(klm_reader *r, CVPixelBufferRef pb, int64_t pts_u
     pthread_mutex_unlock(&r->lock);
 }
 
+// SurfaceTexture's producer window is a real reader window, so codec release
+// reaches the existing asynchronous notification and latest-frame queue.
+void *kl_mediandk_texture_new(unsigned texture) {
+    void *out = NULL;
+    if (klm_AImageReader_newWithUsage(1, 1, 0x22, 0, KLM_READER_MAX, &out)) return NULL;
+    ((klm_reader *)out)->texture = texture;
+    ((klm_reader *)out)->is_surface_texture = 1;
+    return out;
+}
+void *kl_mediandk_texture_window(void *reader) {
+    void *window = NULL;
+    return klm_AImageReader_getWindow(reader, &window) == AMEDIA_OK ? window : NULL;
+}
+void kl_mediandk_texture_listener(void *reader, void *context, void (*callback)(void *, void *)) {
+    klm_listener l = {context, callback};
+    klm_AImageReader_setImageListener(reader, callback ? &l : NULL);
+}
+int kl_mediandk_texture_update(void *reader) {
+    klm_reader *r = reader;
+    if (!r || r->magic != KLM_READER_MAGIC || !r->texture) return 0;
+    void *image = NULL;
+    if (klm_AImageReader_acquireLatestImage(r, &image) != AMEDIA_OK) { r->n_empty_updates++; return 0; }
+    klm_image *im = image;
+    void *next = kl_glfb_image_from_pixels(im->pixels, NULL, NULL);
+    int64_t timestamp = im->pts_us * 1000;
+    klm_AImage_delete(im);
+    if (!next) { r->n_upload_failed++; return 0; }
+    if (!kl_glfb_image_bind_texture(next, r->texture)) {
+        r->n_upload_failed++;
+        kl_glfb_image_destroy(next);
+        return 0;
+    }
+    if (r->latched_image) kl_glfb_image_destroy(r->latched_image);
+    r->latched_image = next;
+    r->timestamp_ns = timestamp;
+    if (!r->n_latched) r->first_pts_ns=timestamp;
+    r->n_latched++;
+    KLM_FIRST(said_texture, "SurfaceTexture latched decoded frame into texture %u\n", r->texture);
+    return 1;
+}
+long long kl_mediandk_texture_timestamp(void *reader) {
+    klm_reader *r = reader;
+    return r && r->magic == KLM_READER_MAGIC ? r->timestamp_ns : 0;
+}
+void kl_mediandk_texture_size(void *reader, int width, int height) {
+    klm_reader *r = reader;
+    if (r && r->magic == KLM_READER_MAGIC && width > 0 && height > 0)
+        kl_ndk_window_set_size(r->window, width, height);
+}
+void kl_mediandk_texture_attach(void *reader, unsigned texture) {
+    klm_reader *r = reader;
+    if (r && r->magic == KLM_READER_MAGIC) r->texture = texture;
+}
+void kl_mediandk_texture_detach(void *reader) {
+    klm_reader *r = reader;
+    if (!r || r->magic != KLM_READER_MAGIC) return;
+    if (r->latched_image) kl_glfb_image_destroy(r->latched_image);
+    r->latched_image = NULL;
+    r->texture = 0;
+}
+void kl_mediandk_texture_delete(void *reader) { klm_AImageReader_delete(reader); }
+
+// A decoder handoff gate with real CVPixelBuffers and the real reader queue.
+static void texture_test_callback(void *ctx, void *reader) {
+    (void)reader;
+    __atomic_add_fetch((int *)ctx, 1, __ATOMIC_SEQ_CST);
+}
+int kl_mediandk_texture_selftest(FILE *f) {
+    klm_reader *r = kl_mediandk_texture_new(17);
+    if (!r) return 0;
+    int called = 0;
+    kl_mediandk_texture_listener(r, &called, texture_test_callback);
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferCreate(NULL, 16, 8, kCVPixelFormatType_32BGRA, NULL, &pb)) {
+        kl_mediandk_texture_delete(r); return 0;
+    }
+    klm_reader_publish(r, pb, 12);
+    klm_reader_publish(r, pb, 34);
+    CVPixelBufferRelease(pb);
+    for (int i = 0; i < 100 && __atomic_load_n(&called, __ATOMIC_SEQ_CST) < 2; i++) usleep(1000);
+    void *im = NULL;
+    int w = 0, h = 0;
+    kl_ndk_window_size(r->window, &w, &h);
+    int ok = kl_ndk_window_owner(r->window) == r && w == 16 && h == 8 &&
+        __atomic_load_n(&called, __ATOMIC_SEQ_CST) == 2 &&
+        klm_AImageReader_acquireLatestImage(r, &im) == AMEDIA_OK;
+    if (im) { ok &= ((klm_image *)im)->pts_us == 34; klm_AImage_delete(im); }
+    kl_mediandk_texture_delete(r);
+    fprintf(f, "%s: SurfaceTexture window, async notification, decoded frame and latest timestamp\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 // ---------------------------------------------------------------------------
 // AMediaCodec
 
@@ -896,6 +1002,8 @@ typedef struct {
     int      started;
 
     pthread_mutex_t lock;
+    int playback_backpressure;
+    unsigned n_input_waits;
     struct { uint8_t *data; int in_use; } in[KLM_IN_BUFFERS];
     struct { void *pb; int64_t pts_us; int in_use;
              uint8_t *lin; size_t lin_cap, lin_size; } out[KLM_OUT_SLOTS];
@@ -924,6 +1032,8 @@ static void *klm_AMediaCodec_createDecoderByType(const char *mime) {
     klm_codec *c = calloc(1, sizeof *c);
     if (!c) return NULL;
     c->magic = KLM_CODEC_MAGIC;
+    const char *target=kl_driver_target_name();
+    c->playback_backpressure=target && !strcmp(target,"x2249318828413747");
     snprintf(c->mime, sizeof c->mime, "%s", mime ? mime : "");
     pthread_mutex_init(&c->lock, NULL);
     c->dec = kl_vtdec_create(mime);
@@ -971,17 +1081,20 @@ static int klm_AMediaCodec_configure(void *codec, const void *format,
     return AMEDIA_OK;
 }
 
+static int klm_AMediaCodec_flush(void *codec);
+
 static int klm_AMediaCodec_start(void *codec) {
     klm_codec *c = codec;
     if (!c || c->magic != KLM_CODEC_MAGIC) return AMEDIA_ERROR_INVALID_PARAMETER;
-    c->started = 1;
+    pthread_mutex_lock(&c->lock); c->started = 1; pthread_mutex_unlock(&c->lock);
     return AMEDIA_OK;
 }
 
 static int klm_AMediaCodec_stop(void *codec) {
     klm_codec *c = codec;
     if (!c || c->magic != KLM_CODEC_MAGIC) return AMEDIA_ERROR_INVALID_PARAMETER;
-    c->started = 0;
+    pthread_mutex_lock(&c->lock); c->started = 0; pthread_mutex_unlock(&c->lock);
+    if (c->playback_backpressure) klm_AMediaCodec_flush(c);
     return AMEDIA_OK;
 }
 
@@ -1001,7 +1114,8 @@ static int klm_AMediaCodec_flush(void *codec) {
     klm_codec_drop_outputs(c);
     for (int i = 0; i < KLM_IN_BUFFERS; i++) c->in[i].in_use = 0;
     pthread_mutex_unlock(&c->lock);
-    kl_vtdec_flush(c->dec);
+    if (c->playback_backpressure) kl_vtdec_flush_playback(c->dec);
+    else kl_vtdec_flush(c->dec);
     return AMEDIA_OK;
 }
 
@@ -1013,6 +1127,10 @@ static int klm_AMediaCodec_delete(void *codec) {
     for (int i = 0; i < KLM_IN_BUFFERS; i++) free(c->in[i].data);
     for (int i = 0; i < KLM_OUT_SLOTS; i++) free(c->out[i].lin);
     pthread_mutex_unlock(&c->lock);
+    if(c->playback_backpressure) {
+        unsigned in=0,out=0,dropped=0;kl_vtdec_stats(c->dec,&in,&out,&dropped,NULL,NULL);
+        fprintf(stderr,"  [media] playback codec summary: submitted=%u decoded=%u decoder_dropped=%u dequeued=%u input_backpressure=%u\n",in,out,dropped,c->n_out,c->n_input_waits);
+    }
     kl_vtdec_destroy(c->dec);
     pthread_mutex_destroy(&c->lock);
     g_life_in += c->n_in; g_life_out += c->n_out; g_life_rendered += c->n_rendered;
@@ -1032,12 +1150,22 @@ static ssize_t klm_AMediaCodec_dequeueInputBuffer(void *codec, int64_t timeoutUs
     int64_t waited = 0;
     for (;;) {
         pthread_mutex_lock(&c->lock);
-        for (int i = 0; i < KLM_IN_BUFFERS; i++)
+        if (c->playback_backpressure && !c->started) {
+            pthread_mutex_unlock(&c->lock); return AMEDIA_ERROR_INVALID_OPERATION;
+        }
+        unsigned occupied=0;
+        if (c->playback_backpressure) {
+            occupied=kl_vtdec_pending(c->dec);
+            for(int i=0;i<KLM_IN_BUFFERS;i++)occupied+=c->in[i].in_use!=0;
+            for(int i=0;i<KLM_OUT_SLOTS;i++)occupied+=c->out[i].in_use!=0;
+        }
+        if (occupied < 12) for (int i = 0; i < KLM_IN_BUFFERS; i++)
             if (!c->in[i].in_use) {
                 c->in[i].in_use = 1;
                 pthread_mutex_unlock(&c->lock);
                 return i;
             }
+        if (occupied >= 12) c->n_input_waits++;
         pthread_mutex_unlock(&c->lock);
         if (timeoutUs == 0 || (timeoutUs > 0 && waited >= timeoutUs))
             return AMEDIACODEC_INFO_TRY_AGAIN_LATER;
@@ -1130,27 +1258,26 @@ static void *klm_AMediaCodec_getOutputFormat(void *codec) {
 static int klm_AMediaCodec_queueInputBuffer(void *codec, size_t idx, off_t offset,
                                             size_t size, uint64_t time_us,
                                             uint32_t flags) {
-    klm_codec *c = codec;
-    if (!c || c->magic != KLM_CODEC_MAGIC || idx >= KLM_IN_BUFFERS)
-        return AMEDIA_ERROR_INVALID_PARAMETER;
+    klm_codec *c=codec;
+    if(!c || c->magic!=KLM_CODEC_MAGIC || idx>=KLM_IN_BUFFERS) return AMEDIA_ERROR_INVALID_PARAMETER;
     pthread_mutex_lock(&c->lock);
-    uint8_t *p = c->in[idx].data;
-    c->in[idx].in_use = 0;
+    uint8_t *p=c->in[idx].data;
     c->n_in++;
     pthread_mutex_unlock(&c->lock);
-    if (!p) return AMEDIA_ERROR_UNKNOWN;
-    KLM_FIRST(said_in, "first access unit queued: %zu bytes, pts %llu us, flags 0x%x\n",
-              size, (unsigned long long)time_us, flags);
-    if (offset < 0 || size > KLM_IN_CAP || (size_t)offset > KLM_IN_CAP - size)
-        return AMEDIA_ERROR_INVALID_PARAMETER;
-    if (flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) return AMEDIA_OK;
-    // A codec-config buffer is parameter sets and nothing else, which is
-    // exactly what kl_vtdec absorbs without producing a frame. No special case
-    // is needed here; the flag is checked only so an empty one is not an error.
-    if (!size) return (flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) ? AMEDIA_OK
-                                                                    : AMEDIA_ERROR_INVALID_PARAMETER;
-    return kl_vtdec_submit(c->dec, p + offset, size, (int64_t)time_us) == 0
-             ? AMEDIA_OK : AMEDIA_ERROR_UNKNOWN;
+    int result=AMEDIA_OK;
+    if(!p) result=AMEDIA_ERROR_UNKNOWN;
+    else if(offset<0 || size>KLM_IN_CAP || (size_t)offset>KLM_IN_CAP-size) result=AMEDIA_ERROR_INVALID_PARAMETER;
+    else if(!(flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)) {
+        if(!size) result=(flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) ? AMEDIA_OK : AMEDIA_ERROR_INVALID_PARAMETER;
+        else {
+            KLM_FIRST(said_in,"first access unit queued: %zu bytes, pts %llu us, flags 0x%x\n",size,(unsigned long long)time_us,flags);
+            result=kl_vtdec_submit(c->dec,p+offset,size,(int64_t)time_us)==0 ? AMEDIA_OK : AMEDIA_ERROR_UNKNOWN;
+        }
+    }
+    // Keep the reservation until submission is accounted, so another producer
+    // cannot race through the bounded decoded/output-frame budget.
+    pthread_mutex_lock(&c->lock);c->in[idx].in_use=0;pthread_mutex_unlock(&c->lock);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +1396,10 @@ static ssize_t klm_AMediaCodec_dequeueOutputBuffer(void *codec,
     if (!c || c->magic != KLM_CODEC_MAGIC) return AMEDIA_ERROR_INVALID_PARAMETER;
     int64_t waited = 0;
     for (;;) {
+        pthread_mutex_lock(&c->lock);
+        int stopped=c->playback_backpressure && !c->started;
+        pthread_mutex_unlock(&c->lock);
+        if (stopped) return AMEDIA_ERROR_INVALID_OPERATION;
         int64_t pts = 0;
         CVPixelBufferRef pb = kl_vtdec_pull(c->dec, &pts);
         if (pb) {

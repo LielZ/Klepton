@@ -106,6 +106,23 @@ void kl_app_lifecycle_report(void);
 // the time the caller continues.
 int  kl_app_guest_start(void);
 void kl_app_guest_publish(void);
+
+// The panel's own refresh rate, as the compositor measured it: what
+// KL_GUEST_PACE_DIV divides. Not the rate the guest is told (KL_DISPLAY_HZ can
+// force that), and not the rate the app is being shown at, which the system
+// may halve.
+void kl_app_set_panel_hz(float hz);
+// The system's thermal state (ProcessInfo.ThermalState's raw value, 0 nominal
+// .. 3 critical), for the [perf] line and the readout.
+void kl_app_note_thermal(int state);
+// How the game ran over the last second: the frames it started, the poses the
+// compositor offered it (the rate the app is displayed at), and the GPU time
+// of its scene command buffers, 0 where that is not measured. Returns 0 until
+// the game has started a frame.
+int kl_app_perf(float *game_fps, float *display_hz, float *gpu_ms, int *thermal);
+// The least memory left before the app's limit while the game drew, in MB; -1
+// where that is not known.
+long long kl_app_min_avail_mb(void);
 void kl_app_guest_stop(void);
 
 // Where the guest thread has got to. 0 = still in _begin (nothing to present

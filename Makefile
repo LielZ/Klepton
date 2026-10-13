@@ -44,7 +44,8 @@ RUNTIME_JNI := runtime/kl_jni.c \
            runtime/jni/kl_jni_net.c runtime/jni/kl_jni_softinput.c \
            runtime/jni/kl_jni_services.c runtime/jni/kl_jni_io.c \
            runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
-           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c
+           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c \
+           runtime/jni/kl_jni_haptics.c
 
 # The Linux process runtime (runtime/linux/) and its door. Part of what ships:
 # a Linux guest in the visionOS app is the same code as build/m_linux.
@@ -65,12 +66,12 @@ RUNTIME_SHIP := $(LX_SRC) runtime/guest/kl_linuxproc.c \
            runtime/gfx/kl_egl.c runtime/media/kl_opensl.c runtime/media/kl_audio.c runtime/xr/kl_ovrp.c \
            runtime/xr/kl_ovrp_sret.S runtime/gfx/kl_reproject.c runtime/gfx/kl_present.c \
            runtime/xr/kl_ovrplat.c runtime/xr/kl_steamapi.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
-           runtime/gfx/kl_vulkan.c runtime/gfx/kl_mtl_foveate.m \
+           runtime/gfx/kl_vulkan.c runtime/gfx/kl_vk_eyefix.c runtime/gfx/kl_mtl_foveate.m \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
            runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_xashservers.c runtime/guest/kl_sdl2.c \
            runtime/guest/kl_gles3jni.c runtime/guest/kl_driver.c \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
-           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
+           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_fove.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
            runtime/guest/kl_mono.c \
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \
@@ -99,7 +100,7 @@ RUNTIME_HDRS := $(RUNTIME_ALL_HDRS) $(wildcard tests/*.h) \
                 runtime/data/phonon_hrtf_cipic_124.sofa \
                 runtime/data/kl_menu_font.ttf
 
-.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
+.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest x18race uevk jniobj
 all: build/t_opus
 
 build/t_opus: tests/t_opus.c $(RUNTIME) $(RUNTIME_HDRS)
@@ -389,12 +390,37 @@ build/t_softinput: tests/t_softinput.c $(RUNTIME) $(RUNTIME_HDRS)
 softinput: build/t_softinput
 	./build/t_softinput
 
+# UE's GameActivity virtual keyboard — the same gate for the other engine's
+# keyboard. A missing AndroidThunkJava_ShowVirtualKeyboardInput aborts, and the
+# obvious fix (a no-op) trades the abort for an editor the engine holds open
+# forever, which produces no crash and no log line. No guest, no window, no
+# headset; milliseconds, in `make check`.
+build/t_uevk: tests/t_uevk.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_uevk.c $(RUNTIME) $(LDLIBS)
+
+uevk: build/t_uevk
+	./build/t_uevk
+
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(LDLIBS)
 
 vatest: build/t_variadic
 	./build/t_variadic
+
+# The JNI object model: a jobject a host-side static caches must outlive the
+# local frame it was built in, and every erased spelling Unity's C# produces for
+# a call must resolve to the same binding and the same object. Both failures
+# abort a boot hundreds of lines from the binding at fault (see kl_jni.c's
+# kl_jni_object_lifetime_selftest). No guest, no window, no headset;
+# milliseconds, in `make check`.
+build/t_jniobj: tests/t_jniobj.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jniobj.c $(RUNTIME) $(LDLIBS)
+
+jniobj: build/t_jniobj
+	./build/t_jniobj
 
 # kl_view.c is the KL_VIEW=1 interactive viewer (SDL3); only m_boot links it,
 # so only this rule carries the pkg-config flags. kl_view.c compiles to a stub
@@ -449,8 +475,26 @@ build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_x18.c runtime/kl_x18.c runtime/kl_env.c
 
+# klepton-ld's SPLIT veneer placement (two pools, per-slice choice, halving that
+# keeps odd-word tails instruction-aligned) on a synthetic sparse library wider
+# than two `b` windows — no host tree carries one (Deadpool VR's libUE4 is the
+# real case). Also run by `make check`.
+.PHONY: ldsplit
+ldsplit: build/klepton-ld
+	python3 tests/t_ld_split.py build/klepton-ld build/ldsplit
+
 x18: build/t_x18
 	python3 tools/check_x18.py build/t_x18 $(foreach f,$(GUEST_LIBS),$(LIBS)/$(f).so)
+
+# The `br x18` veneer's race windows, manufactured and executed so the fix can
+# be checked somewhere other than a headset. Seeds the TSD slot through
+# kl_thread_init, so it links the runtime.
+build/t_x18race: tests/t_x18race.c $(RUNTIME) runtime/kl_x18.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_x18race.c $(RUNTIME) $(LDLIBS)
+
+x18race: build/t_x18race
+	./build/t_x18race
 
 # The CTR_EL0 veneer, EXECUTED. Same shape as t_x18: linked against
 # the decoder alone, so a veneer bug cannot hide behind a working loader. It
@@ -639,12 +683,27 @@ build/t_il2cpp: tests/t_il2cpp.c $(RUNTIME) $(RUNTIME_HDRS)
 il2cpp: build/t_il2cpp
 	./build/t_il2cpp
 
+# The foveation tests (kl_fove.m, docs/FOVEATION.md): profile maths and tables,
+# plus GPU self-tests that skip themselves without a Metal device.
+build/t_fove: tests/t_fove.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_fove.c $(RUNTIME) $(LDLIBS)
+
 # Full regression sweep — run this first when picking work back up.
 #
+# tgkill/tkill(tid, 0) liveness probes answered by the raw-syscall door.
+build/t_tgkill: tests/t_tgkill.c $(RUNTIME)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_tgkill.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: tgkill
+tgkill: build/t_tgkill
+	./build/t_tgkill
+
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_mtxtable build/t_bcast build/t_fault build/t_glcaps
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_mtxtable build/t_bcast build/t_fault build/t_glcaps build/t_x18race build/t_tgkill build/klepton-ld build/t_uevk build/t_jniobj build/t_fove
 	@# The guest steps read $(TARGET)'s own files. Without them the loader steps print nothing and pass, and the
 	@# run ends at the il2cpp step with a bare "Error 1" - a check that looked green until its last line. A
 	@# working copy without the game's tree (a fresh git worktree) is told so here, before anything runs.
@@ -652,6 +711,12 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	  echo "  Unpack $(TARGET) into this working copy (see BUILDING.md), link or clone the tree from another one,"; \
 	  echo "  or name a guest that is here: make check TARGET=<name>"; exit 1; }
 	@echo "=== variadic ABI ===" && ./build/t_variadic
+	@./build/t_x18race > build/x18race.log 2>&1 || { cat build/x18race.log; exit 1; }
+	@head -1 build/x18race.log && tail -1 build/x18race.log
+	@./build/t_tgkill > build/tgkill.log 2>&1 || { cat build/tgkill.log; exit 1; }
+	@grep -E '=== tgkill' build/tgkill.log && tail -1 build/tgkill.log
+	@python3 tests/t_ld_split.py build/klepton-ld build/ldsplit > build/ldsplit.log 2>&1 || { cat build/ldsplit.log; exit 1; }
+	@echo "=== klepton-ld SPLIT placement (synthetic 300 MB library) ===" && tail -1 build/ldsplit.log
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
@@ -662,6 +727,10 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@grep -E '=== OpenXR actions' build/xrinput.log && tail -1 build/xrinput.log
 	@./build/t_softinput > build/softinput.log 2>&1 || { cat build/softinput.log; exit 1; }
 	@head -1 build/softinput.log && tail -1 build/softinput.log
+	@./build/t_jniobj > build/jniobj.log 2>&1 || { cat build/jniobj.log; exit 1; }
+	@head -1 build/jniobj.log && tail -1 build/jniobj.log
+	@./build/t_uevk > build/uevk.log 2>&1 || { cat build/uevk.log; exit 1; }
+	@head -1 build/uevk.log && tail -1 build/uevk.log
 	@./build/t_ctr > build/ctr.log 2>&1 || { cat build/ctr.log; exit 1; }
 	@head -2 build/ctr.log && tail -1 build/ctr.log
 	@./build/t_mtxtable > build/mtxtable.log 2>&1 || { cat build/mtxtable.log; exit 1; }
@@ -670,6 +739,8 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@head -1 build/bcast.log && tail -1 build/bcast.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
 	@head -3 build/haptics.log && tail -1 build/haptics.log
+	@./build/t_fove > build/fove.log 2>&1 || { cat build/fove.log; exit 1; }
+	@head -1 build/fove.log && tail -1 build/fove.log
 	@$(MAKE) -s ovrpabi
 # The opus roundtrip is the one gate here that RUNS guest code rather than
 # inspecting it, so it is worth keeping wherever it exists — but libunityopus.so

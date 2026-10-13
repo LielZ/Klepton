@@ -2,6 +2,40 @@ import SwiftUI
 import Foundation
 import CompositorServices
 import UIKit
+import Network
+
+/// The local-network permission, asked for while a window can show the question.
+///
+/// visionOS grants the local network per app, after an alert the user answers,
+/// and nothing a guest does on its own raises that alert here. Steam Link's
+/// shell finds and pairs with the PC through a dual-stack socket, as IPv4-mapped
+/// addresses, which pass without the permission and do not raise the alert. Its
+/// VR part then streams over a plain IPv4 socket from inside the immersive
+/// space: every datagram is refused ("Broken pipe", then "No route to host" —
+/// 193,000 in one minute), no alert comes up there, the app is not even listed
+/// under Settings > Privacy & Security > Local Network, and the PC sits at
+/// "waiting for connection". A sweep of the subnet used to raise the alert by
+/// accident; on a network too large to sweep (a /16) nothing did, so a new
+/// install could pair and never stream (seen 2026-10-13 with second installs
+/// beside a working one, on three toolchain states alike).
+///
+/// Plain datagrams sent from the window did not raise the alert either, nor did
+/// a restart of the headset. A Bonjour browse does, at once: the alert comes
+/// with the window, the user allows, and the stream runs. The service browsed
+/// for is our own name and nobody offers it (NSBonjourServices in Info.plist
+/// has to list it); the browse is there to be seen by the system, not to find
+/// anything.
+enum KLLocalNetwork {
+    private static var browser: NWBrowser?
+    static func ask() {
+        guard browser == nil else { return }
+        let b = NWBrowser(for: .bonjour(type: "_klepton-lan._udp", domain: nil), using: .udp)
+        b.stateUpdateHandler = { NSLog("[net] local-network browse: \(String(describing: $0))") }
+        b.browseResultsChangedHandler = { _, _ in }
+        b.start(queue: .main)
+        browser = b
+    }
+}
 
 // The visionOS host app (Swift for the platform layer).
 //
@@ -129,6 +163,16 @@ enum Immersive {
 enum Lifecycle {
     static func scenePhaseChanged(to phase: ScenePhase) {
         NSLog("[app] scene phase -> \(phase)")
+        // The crown press delivers .inactive at once but .background only when
+        // the system gets round to it (measured ~30 s). The music belongs to
+        // the immersive moment: go silent on the first, and still exit on the
+        // second. .active restores — the boot transition passes through a
+        // 2 s .inactive on the way in, which this round-trips harmlessly.
+        switch phase {
+        case .inactive: KleptonAudio.setSilenced(true)
+        case .active:   KleptonAudio.setSilenced(false)
+        default: break
+        }
         // Coming back is the audio's cue, and it needs one: this OS silently
         // stops calling CoreAudio's render callback across a scene transition —
         // the boot window being closed while the immersive space runs is one,
@@ -150,6 +194,7 @@ enum Lifecycle {
         NSLog("[app] backgrounded — exiting (KL_EXIT_ON_BACKGROUND)")
         kl_app_exit_report()
         KleptonRendering.shared.rememberRun()
+        klAlyxRememberRun()
         // Flush before exit rather than relying on it. The guest's log is a
         // file in the container (kl_app.c redirects stdout/stderr there) and it
         // is the only account of the run that survives; `exit` does flush
@@ -191,6 +236,8 @@ struct KleptonApp: App {
     // Before anything here has asked Metal for a shader (kl_app.c).
     init() {
         kl_app_shader_cache_test()
+        // Before the start window reads the picture settings.
+        if klIsAlyx() { klAlyxMigrateDials() }
         // The device's language, for a guest that takes its own from the
         // device (kl_jni_services.c reads it where that is switched on).
         if let first = Locale.preferredLanguages.first {
@@ -200,6 +247,9 @@ struct KleptonApp: App {
                 setenv("KL_DEVICE_LANG", region.map { "\(lang)_\($0)" } ?? lang, 0)
             }
         }
+        // The game's files, which the installer can put back, out of the
+        // device's backup (KleptonBackup.swift).
+        KLBackup.keepGameFilesOut()
     }
 
     var body: some Scene {
@@ -392,10 +442,29 @@ struct PlayerSettingsView: View {
             if !klIsAlyx() {
             GroupBox(klT("Picture", "Bild")) {
                 VStack(alignment: .leading, spacing: 10) {
+                    // A Vulkan game has the level as a choice (kl_fove); the
+                    // switch is the GL path's and does nothing for it.
+                    if rendering.offersVkFoveation {
+                        HStack {
+                            Text(klT("Foveated rendering", "Foveated Rendering"))
+                            Picker(klT("Foveated rendering", "Foveated Rendering"), selection: $rendering.vkFoveation) {
+                                Text(klT("Off", "Aus")).tag("off")
+                                Text(klT("Light", "Leicht")).tag("low")
+                                Text(klT("Medium", "Mittel")).tag("medium")
+                                Text(klT("Strong", "Stark")).tag("high")
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                        }
+                        Text(klT("Keeps the middle of the picture sharp and draws the edges more coarsely, so the game runs more smoothly. The stronger the level, the smaller the sharp middle and the coarser the edge.",
+                                 "Hält die Bildmitte scharf und zeichnet die Ränder gröber, damit das Spiel flüssiger läuft. Je stärker die Stufe, desto kleiner die scharfe Mitte und desto gröber der Rand."))
+                            .font(.callout).foregroundStyle(.secondary)
+                    } else {
                     Toggle(klT("Foveated rendering", "Foveated Rendering"), isOn: $rendering.foveation)
                     Text(klT("Keeps the middle of the picture sharp and draws the edges more coarsely. Games run more smoothly with it.",
                              "Hält die Bildmitte scharf und zeichnet die Ränder gröber. Spiele laufen damit flüssiger."))
                         .font(.callout).foregroundStyle(.secondary)
+                    }
                     if KleptonRendering.targetHasMSAA {
                         HStack {
                             Text(klT("Edge smoothing", "Kantenglättung"))
@@ -581,6 +650,8 @@ struct BootView: View {
             else { bootReport }
         }
         .task { await watchPresentation() }
+        // Steam Link streams over the local network; see KLLocalNetwork.
+        .task { if klTargetName() == "steamlink-vr" { KLLocalNetwork.ask() } }
     }
 
     /// Which of the two things the window can be showing, decided by what the
@@ -638,6 +709,16 @@ struct BootView: View {
                     openedSpace = true
                     let r = await openImmersiveSpace(id: Immersive.id)
                     NSLog("[cp] openImmersiveSpace (after handoff) -> \(r)")
+                    // The same rule as boot()'s path: once the picture is up the
+                    // start window has done its job. Without this the Steam Link
+                    // card ("Starting…", Settings) stayed floating in front of
+                    // the stream, because a handoff never passes through boot().
+                    if case .opened = r, Self.productStart {
+                        KLRun.shared.up = true
+                        KLRun.shared.watchKeyboard(openWindow)
+                        showSettings = false
+                        dismissWindow()
+                    }
                 }
             }
             try? await Task.sleep(for: .milliseconds(200))
@@ -834,6 +915,9 @@ struct BootView: View {
                             DisclosureGroup(klT("Controller alignment", "Ausrichtung der Controller")) { TuningView() }
                             if showMic {
                                 DisclosureGroup(klT("Microphone", "Mikrofon")) { MicView() }
+                            }
+                            if KleptonTestSwitches.available {
+                                DisclosureGroup(klT("Test", "Test")) { TestSwitchesView() }
                             }
                             DisclosureGroup(klT("Diagnostics", "Diagnose")) {
                                 VStack(alignment: .leading, spacing: 10) {
@@ -1045,6 +1129,7 @@ struct BootView: View {
         klAlyxApply()
         KleptonRendering.shared.applyEnvironment()
         KleptonDiagnostics.applyEnvironment()
+        KleptonTestSwitches.applyEnvironment()
         // On the main run loop: the thread below is inside kl_app_boot for as
         // long as there is anything to show, and a timer of its own would not
         // fire until it came back.

@@ -22,5 +22,7 @@ int  kl_opensl_audio_users(void);
 void kl_opensl_yield_device(unsigned rate);
 
 void kl_opensl_report(FILE *f);
+// One line of live audio state for the heartbeat loop of a device log.
+void kl_opensl_heartbeat(FILE *f);
 
 #endif

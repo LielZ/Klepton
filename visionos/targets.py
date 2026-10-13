@@ -234,7 +234,24 @@ TARGETS = {
         # shown twice, judder on head turns. The game's own fixed foveation
         # does not exist under MoltenVK, so resolution is the lever. 0.7 is
         # half the pixels.
-        "render_scale": 0.7,
+        # The picture since 2026-10-13: foveated rendering at "high" (kl_fove,
+        # taken over from rebelancap's fork) at an eye cap of 4608 (kl_ovrp.c)
+        # and full render scale — his settings for this game from avp-play
+        # issue 16, without the 90 Hz he also names. Until then it ran unfoveated
+        # at 70% of a 3072 cap. On the owner's headset it draws 25.7% of the
+        # 4608x3697 eye that way (2144x2048), more picture points than before
+        # and far sharper in the middle, with no frame past its deadline; peak
+        # footprint 5.6 GB with 2.6 GB free. He looked at a test copy with his
+        # own save and made it the default.
+        # The 90 Hz pin was tried and taken out: here the panel ran at 50 and at
+        # 100 Hz in turn while the game was told 90, where it is otherwise told
+        # the panel's own rate. His fork separates the pinned rate from the
+        # panel's; this one does not have that yet.
+        # picture_reset: a copy installed under the old defaults drops its
+        # stored resolution and foveation level once, so everyone gets these.
+        "render_scale": 1.0,
+        "vk_foveation": "high",
+        "picture_reset": 1,
         # In-game video on by default. A Vulkan guest's is otherwise refused
         # (kl_mediandk.c, klm_extractor_enabled), on the assumption that decoded
         # frames reach the renderer as AHardwareBuffers imported into Vulkan —
@@ -1076,7 +1093,11 @@ STORE_DEFAULTS = {
     # settings are out of reach in an encrypted pak, and on device (Vision Pro
     # M5, 2026-10-12) 4x cost no frame time that could be told from the spread
     # between runs, and about 0.2 GB at 5 GB.
-    "x3240283705987790": {"vk_msaa": 4},
+    # ...and foveated rendering at "medium" (kl_fove, taken over from rebelancap's
+    # fork, who runs this game at "high" with a smaller box): the game ran
+    # unfoveated here until then, the owner looked at a test copy with the
+    # levels on a headset and chose medium as where it starts (2026-10-13).
+    "x3240283705987790": {"vk_msaa": 4, "vk_foveation": "medium"},
     # Eye of the Temple. Foveated rendering off by default: in this game the
     # fixed sharp patch is very plainly visible and buys hardly any frame time
     # (the author on a headset, 2026-10-12), so the picture wins.
@@ -1262,6 +1283,16 @@ def resolve(name):
     # process limit is ended at its first load by the difference (AC Nexus at
     # 4x was, which is why it is told the device offers two).
     t.setdefault("vk_msaa", 0)
+    # Foveated rendering for a Vulkan guest (KL_FOVEATION, runtime/gfx/kl_fove.m):
+    # "off", "low", "medium" or "high". Off unless a game is named above, and it
+    # is named once it has been looked at on a headset: the edge of the picture
+    # is drawn visibly coarser, and whether that is worth the frame time is a
+    # judgement per game. Half-Life: Alyx is not on this path (kl_mtl_foveate).
+    t.setdefault("vk_foveation", "off")
+    # Raised when a target's picture defaults (render_scale, vk_foveation) change
+    # and installed copies should take the new ones: a copy drops its stored
+    # resolution and Vulkan foveation level once per number (KLPictureReset).
+    t.setdefault("picture_reset", 0)
     # How finely the compositor puts the finished picture on the display
     # (KL_CP_QUALITY): "light" 0.40, "standard" 0.52, "full" 1.0. Light for
     # everything whose picture is capped below what the display asks for even

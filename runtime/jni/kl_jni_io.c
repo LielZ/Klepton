@@ -532,7 +532,74 @@ static klj_val klj_AVPro_FinaliseCryptor(void *env, void *self, const klj_val *a
     return (klj_val){.j = (uint64_t)moved};
 }
 
+// Heap IntBuffer used when the guest transitions into the next story scene.
+// The backing int[] is shared, zero-initialized storage, not a direct buffer.
+typedef struct { void *array; int capacity, position, limit; } klj_intbuffer;
+static klj_intbuffer *intbuffer(void *self) {
+    klj_object *o=klj_as_object(self);
+    return o && !strcmp(o->cls,"java/nio/IntBuffer") ? o->data : NULL;
+}
+static klj_val intbuffer_allocate(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int capacity=n ? (int32_t)a[0].j : -1;
+    if(capacity<0){klj_raise("java/lang/IllegalArgumentException","negative capacity");return (klj_val){0};}
+    klj_intbuffer *b=calloc(1,sizeof *b);
+    if(!b){klj_raise("java/lang/OutOfMemoryError","IntBuffer allocation");return (klj_val){0};}
+    b->array=klj_new_array('I',NULL,capacity);b->capacity=b->limit=capacity;
+    // Retain the array beyond the allocating local frame. It may also be
+    // handed directly to guest code by array(), so its storage must be shared.
+    kl_jni_pin_object(b->array);
+    return (klj_val){.l=klj_own(klj_new_object_data("java/nio/IntBuffer",b),free)};
+}
+static klj_val intbuffer_array(void *env, void *self, const klj_val *a, int n) {
+    (void)env;(void)a;(void)n;klj_intbuffer *b=intbuffer(self);return (klj_val){.l=b ? b->array : NULL};
+}
+static klj_val intbuffer_capacity(void *env, void *self, const klj_val *a, int n) {
+    (void)env;(void)a;(void)n;klj_intbuffer *b=intbuffer(self);return (klj_val){.j=b ? b->capacity : 0};
+}
+static klj_val intbuffer_position(void *env, void *self, const klj_val *a, int n) {
+    (void)env;klj_intbuffer *b=intbuffer(self);if(!b)return (klj_val){0};
+    if(!n)return (klj_val){.j=b->position};
+    int value=(int32_t)a[0].j;
+    if(value<0 || value>b->limit){klj_raise("java/lang/IllegalArgumentException","position outside limit");return (klj_val){0};}
+    b->position=value;return (klj_val){.l=self};
+}
+static klj_val intbuffer_limit(void *env, void *self, const klj_val *a, int n) {
+    (void)env;klj_intbuffer *b=intbuffer(self);if(!b)return (klj_val){0};
+    if(!n)return (klj_val){.j=b->limit};
+    int value=(int32_t)a[0].j;
+    if(value<0 || value>b->capacity){klj_raise("java/lang/IllegalArgumentException","limit outside capacity");return (klj_val){0};}
+    b->limit=value;if(b->position>value)b->position=value;return (klj_val){.l=self};
+}
+static klj_val intbuffer_get(void *env, void *self, const klj_val *a, int n) {
+    (void)env;klj_intbuffer *b=intbuffer(self);if(!b)return (klj_val){0};int index=n ? (int32_t)a[0].j : b->position;
+    if(index<0 || index>=b->limit){klj_raise(n ? "java/lang/IndexOutOfBoundsException" : "java/nio/BufferUnderflowException","IntBuffer get");return (klj_val){0};}
+    int32_t value=((int32_t *)klj_arr(b->array)->data)[index];if(!n)b->position++;
+    return (klj_val){.j=(uint64_t)(int64_t)value};
+}
+static klj_val intbuffer_put(void *env, void *self, const klj_val *a, int n) {
+    (void)env;klj_intbuffer *b=intbuffer(self);if(!b)return (klj_val){0};int index=n==2 ? (int32_t)a[0].j : b->position;
+    if(index<0 || index>=b->limit){klj_raise(n==2 ? "java/lang/IndexOutOfBoundsException" : "java/nio/BufferOverflowException","IntBuffer put");return (klj_val){0};}
+    ((int32_t *)klj_arr(b->array)->data)[index]=(int32_t)a[n==2 ? 1 : 0].j;if(n!=2)b->position++;
+    return (klj_val){.l=self};
+}
+static klj_val intbuffer_rewind(void *env, void *self, const klj_val *a, int n) {
+    (void)env;(void)a;(void)n;klj_intbuffer *b=intbuffer(self);if(b)b->position=0;return (klj_val){.l=self};
+}
 const klj_binding klj_bind_io[] = {
+    {"java/nio/IntBuffer","allocate","(I)Ljava/nio/IntBuffer;",intbuffer_allocate},
+    {"java/nio/IntBuffer","array","()[I",intbuffer_array},
+    {"java/nio/IntBuffer","capacity","()I",intbuffer_capacity},
+    {"java/nio/IntBuffer","position","()I",intbuffer_position},
+    {"java/nio/IntBuffer","position","(I)Ljava/nio/Buffer;",intbuffer_position},
+    {"java/nio/IntBuffer","limit","()I",intbuffer_limit},
+    {"java/nio/IntBuffer","limit","(I)Ljava/nio/Buffer;",intbuffer_limit},
+    {"java/nio/IntBuffer","get","()I",intbuffer_get},
+    {"java/nio/IntBuffer","get","(I)I",intbuffer_get},
+    {"java/nio/IntBuffer","put","(I)Ljava/nio/IntBuffer;",intbuffer_put},
+    {"java/nio/IntBuffer","put","(II)Ljava/nio/IntBuffer;",intbuffer_put},
+    {"java/nio/IntBuffer","rewind","()Ljava/nio/Buffer;",intbuffer_rewind},
+
     {"com/renderheads/AVPro/Video/Manager", "SHA256", "([B)[B", klj_AVPro_SHA256},
     {"com/renderheads/AVPro/Video/Manager", "KeyDerivationPBKDF",
      "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;ILjava/nio/ByteBuffer;)I", klj_AVPro_KeyDerivationPBKDF},

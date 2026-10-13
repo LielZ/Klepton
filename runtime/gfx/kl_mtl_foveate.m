@@ -40,6 +40,8 @@
 //                            < 1. Unset or 0: off, nothing is installed.
 //   KL_VK_FOVEATE_INNER=<t>  the tangent out to which the rate stays 1 (default
 //                            0.30, about 17 degrees either side of straight ahead)
+//   KL_VK_FOVEATE_OUTER=<t>  the tangent at which the edge rate is reached
+//                            (default: the widest edge of the cone)
 //   KL_VK_FOVEATE_TRACE=1    say what every candidate pass looked like
 //
 // Two instruments share the hooks, because they need the same vantage point —
@@ -58,6 +60,7 @@
 #include <string.h>
 #include "kl_env.h"
 #include "kl_ovrp.h"
+#include "kl_driver.h"
 
 #if __has_feature(objc_arc)
 #define KLF_RELEASE(x) ((void)0)
@@ -73,7 +76,7 @@
 // which may be a little smaller than the attachments the pass covers.
 extern uint32_t g_klvk_scene_view_w, g_klvk_scene_view_h;
 
-static float g_edge, g_inner;
+static float g_edge, g_inner, g_outer;
 static int   g_trace, g_fov_on;
 // Recursive: the unwarp opens and ends encoders of its own while it holds this,
 // and those come back through the same two methods.
@@ -127,8 +130,15 @@ static void klf_axis(float *q, float neg, float pos, float widest, float span) {
         float t = -neg + u * (neg + pos);
         if (t < 0) t = -t;
         float r = 1.0f;
-        if (t > g_inner && widest > g_inner + 0.01f)
-            r = 1.0f - (1.0f - g_edge) * (t - g_inner) / (widest - g_inner);
+        // The rate falls from 1 at the inner tangent to the edge rate at the
+        // cone's widest edge — or, with KL_VK_FOVEATE_OUTER, already at that
+        // tangent, and stays there to the edge. A fall over the whole cone
+        // leaves a wide ring at middling rates: with 0.10 at the edge the
+        // picture was still 48% of its fragments, and its player could not
+        // tell that anything was on (2026-10-13).
+        float far = (g_outer > g_inner + 0.01f && g_outer < widest) ? g_outer : widest;
+        if (t > g_inner && far > g_inner + 0.01f)
+            r = 1.0f - (1.0f - g_edge) * (t - g_inner) / (far - g_inner);
         q[i] = r < g_edge ? g_edge : r;
     }
 }
@@ -190,7 +200,7 @@ static int klf_map_for(id<MTLDevice> dev, NSUInteger w, NSUInteger h) {
             (unsigned long)w, (unsigned long)h, (unsigned long)vw, (unsigned long)vh,
             (unsigned long)k->pw, (unsigned long)k->ph,
             100.0 * (double)(k->pw * k->ph) / (double)(w * h), (double)g_inner, (double)g_edge,
-            (double)widest, (double)tan[0][0], (double)tan[0][1], (double)tan[0][2], (double)tan[0][3]);
+            (double)((g_outer > g_inner + 0.01f && g_outer < widest) ? g_outer : widest), (double)tan[0][0], (double)tan[0][1], (double)tan[0][2], (double)tan[0][3]);
     return g_nmaps++;
 }
 
@@ -561,13 +571,111 @@ static void klf_end(id self, SEL _cmd) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// KL_MTL_GPU_TIME — the GPU time of the game's frame, the cheap way.
+//
+// Every command buffer knows when the GPU started and finished it. The ones
+// that carry the scene pass — one a frame — are given a completed handler, and
+// the mean of their spans since it was last asked for is what kl_app.c prints
+// in its [perf] line and the compositor shows in its readout. That is not the
+// whole frame (the engine's other command buffers, a millisecond or two, run
+// beside it; KL_MTL_PROFILE has the full account at the price of sampling every
+// pass), but it is the part that decides whether the frame makes a refresh.
+// On for Half-Life: Alyx; KL_MTL_GPU_TIME=0 switches it off.
+static int g_gt_on, g_ml_guard;
+static double g_gt_sum;
+static unsigned long g_gt_n;
+static char kGtKey;
+
+double kl_mtl_scene_gpu_ms(void) {
+    pthread_mutex_lock(&g_mu);
+    double ms = g_gt_n ? g_gt_sum * 1000.0 / (double)g_gt_n : -1.0;
+    g_gt_sum = 0; g_gt_n = 0;
+    pthread_mutex_unlock(&g_mu);
+    return ms;
+}
+
+// Two bins beside the running mean, for a comparison made inside one run
+// (KL_VK_METER_STORE_AB, kl_vulkan.c): whoever alternates between two ways of
+// drawing says which one is on, and each scene command buffer is counted in the
+// bin that was current when it was begun.
+static int g_gt_phase;
+static double g_gtp_sum[2];
+static unsigned long g_gtp_n[2];
+void kl_mtl_gpu_phase(int phase) {
+    pthread_mutex_lock(&g_mu);
+    g_gt_phase = phase & 1;
+    pthread_mutex_unlock(&g_mu);
+}
+// The mean of one bin in ms and how many command buffers it holds; emptied by the call.
+double kl_mtl_gpu_phase_take(int phase, unsigned long *n) {
+    pthread_mutex_lock(&g_mu);
+    phase &= 1;
+    double ms = g_gtp_n[phase] ? g_gtp_sum[phase] * 1000.0 / (double)g_gtp_n[phase] : -1.0;
+    if (n) *n = g_gtp_n[phase];
+    g_gtp_sum[phase] = 0; g_gtp_n[phase] = 0;
+    pthread_mutex_unlock(&g_mu);
+    return ms;
+}
+
+static void klg_watch(id cmd) {
+    if (objc_getAssociatedObject(cmd, &kGtKey)) return;
+    objc_setAssociatedObject(cmd, &kGtKey, @YES, OBJC_ASSOCIATION_RETAIN);
+    pthread_mutex_lock(&g_mu);
+    int phase = g_gt_phase;
+    pthread_mutex_unlock(&g_mu);
+    [(id<MTLCommandBuffer>)cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        double span = cb.GPUEndTime - cb.GPUStartTime;
+        if (!(span > 0) || span > 1.0) return;
+        pthread_mutex_lock(&g_mu);
+        g_gt_sum += span; g_gt_n++;
+        g_gtp_sum[phase] += span; g_gtp_n[phase]++;
+        pthread_mutex_unlock(&g_mu);
+    }];
+}
+
+// A memoryless attachment (KL_VK_MSAA_MEMORYLESS, kl_vulkan.c) exists inside one
+// render pass only: a pass may clear it and resolve it, and may neither load nor
+// store it. The engine's scene pass does neither with its multisampled depth.
+// Should any other pass ask for one of the two, Metal must not be handed it —
+// the action is made the legal one next to it and the case is counted and said,
+// because that pass then draws without the depth it wanted.
+static unsigned long g_ml_passes, g_ml_loads, g_ml_stores;
+static void klm_guard(MTLRenderPassAttachmentDescriptor *a) {
+    id<MTLTexture> t = a ? a.texture : nil;
+    if (!t || t.storageMode != MTLStorageModeMemoryless) return;
+    int loads = 0, stores = 0;
+    if (a.loadAction == MTLLoadActionLoad) { a.loadAction = MTLLoadActionDontCare; loads = 1; }
+    if (a.storeAction == MTLStoreActionStore) { a.storeAction = MTLStoreActionDontCare; stores = 1; }
+    else if (a.storeAction == MTLStoreActionStoreAndMultisampleResolve) {
+        a.storeAction = MTLStoreActionMultisampleResolve; stores = 1;
+    }
+    pthread_mutex_lock(&g_mu);
+    unsigned long n = ++g_ml_passes;
+    g_ml_loads += (unsigned long)loads; g_ml_stores += (unsigned long)stores;
+    unsigned long nl = g_ml_loads, ns = g_ml_stores;
+    pthread_mutex_unlock(&g_mu);
+    if ((loads && nl <= 4) || (stores && ns <= 4))
+        fprintf(stderr, "  [mtl] memoryless: a pass wanted to %s a memoryless %lux%lu attachment — refused "
+                        "(%lu load(s), %lu store(s) so far); that pass draws without it\n",
+                loads ? "LOAD" : "STORE", (unsigned long)t.width, (unsigned long)t.height, nl, ns);
+    if (n == 1 || n % 20000 == 0)
+        fprintf(stderr, "  [mtl] memoryless: %lu pass(es) with a memoryless attachment, %lu load(s) and %lu "
+                        "store(s) refused\n", n, nl, ns);
+}
+
 static id klf_begin(id self, SEL _cmd, MTLRenderPassDescriptor *d) {
+    if (d && g_ml_guard) {
+        klm_guard(d.depthAttachment);
+        klm_guard(d.stencilAttachment);
+    }
     MTLRenderPassColorAttachmentDescriptor *c = d ? d.colorAttachments[0] : nil;
     id<MTLTexture> t = c ? c.texture : nil;
     int mi = -1;
     NSUInteger w = 0, h = 0;
     int scene = t && t.sampleCount > 1 && t.width >= 1024 && t.height >= 1024;
     klp_pass(self, d, scene);
+    if (scene && g_gt_on) klg_watch(self);
     if (g_fov_on && scene && !d.rasterizationRateMap) {
         w = d.renderTargetWidth ? d.renderTargetWidth : t.width;
         h = d.renderTargetHeight ? d.renderTargetHeight : t.height;
@@ -646,9 +754,13 @@ void kl_mtl_foveate_install(void) {
     g_fov_on = g_edge > 0.02f && g_edge < 0.999f;
     g_inner = kl_env_float("KL_VK_FOVEATE_INNER", 0.30f);
     if (!(g_inner >= 0.0f)) g_inner = 0.30f;
+    g_outer = kl_env_float("KL_VK_FOVEATE_OUTER", 0.0f);
     g_trace = kl_env_on("KL_VK_FOVEATE_TRACE", 0);
     int textures = kl_env_on("KL_MTL_TEX_TRACE", 0);
-    if (!g_fov_on && !g_trace && !textures && kl_env_int("KL_MTL_PROFILE", 0) <= 0) return;
+    { const char *t = kl_driver_target_name();
+      g_gt_on = kl_env_on("KL_MTL_GPU_TIME", t && strcmp(t, "alyx") == 0); }
+    g_ml_guard = kl_env_on("KL_VK_MSAA_MEMORYLESS", 0);
+    if (!g_fov_on && !g_trace && !textures && !g_gt_on && !g_ml_guard && kl_env_int("KL_MTL_PROFILE", 0) <= 0) return;
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         klp_install(dev);
@@ -668,7 +780,7 @@ void kl_mtl_foveate_install(void) {
         if (!m) {
             fprintf(stderr, "  [fov] no command buffer class to extend — KL_VK_FOVEATE and "
                             "KL_MTL_PROFILE ignored\n");
-        } else if (g_fov_on || g_trace || g_klp_every) {
+        } else if (g_fov_on || g_trace || g_klp_every || g_gt_on || g_ml_guard) {
             g_orig_begin = method_getImplementation(m);
             class_replaceMethod(cls, @selector(renderCommandEncoderWithDescriptor:),
                                 (IMP)klf_begin, method_getTypeEncoding(m));

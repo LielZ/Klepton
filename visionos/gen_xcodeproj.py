@@ -245,6 +245,13 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # finely the picture is put on the display ("output",
                         # KLOutputDefault).
                         + f"\t\t\t\tKL_VK_MSAA_DEFAULT = {int(KLT['vk_msaa'])};\n"
+                        # ...and the level foveated rendering for a Vulkan
+                        # guest starts at (targets.py "vk_foveation",
+                        # KLVkFoveationDefault).
+                        + f"\t\t\t\tKL_VK_FOVEATION_DEFAULT = {KLT['vk_foveation']};\n"
+                        # ...and the number that drops a stored resolution and
+                        # foveation level once (targets.py "picture_reset").
+                        + f"\t\t\t\tKL_PICTURE_RESET = {int(KLT['picture_reset'])};\n"
                         + f"\t\t\t\tKL_OUTPUT_DEFAULT = {KLT['output']};\n"
                         # ...and which front the app shows: the boot report
                         # this project was developed against, or the start
@@ -341,7 +348,8 @@ SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swif
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
          "KleptonChroma.swift", "KleptonMic.swift",
          "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonGameData.swift",
-         "KleptonAlyx.swift", "KleptonText.swift", "KleptonSteamCloud.swift"]
+         "KleptonAlyx.swift", "KleptonText.swift", "KleptonSteamCloud.swift",
+         "KleptonBackup.swift"]
 # Steam's connection, sign-in and Steam Cloud (SteamCloudKit/README.md: parts of
 # Glovebox's SteamLauncherKit, MIT), compiled into the app's own module. The
 # folder is a Swift package only so that its tests run on a Mac.

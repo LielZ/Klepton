@@ -272,6 +272,15 @@ void kl_driver_init(const kl_target *t, const char *libdir, kl_slink_door door) 
     g_error[0] = 0;
     snprintf(g_libdir, sizeof g_libdir, "%s", libdir ? libdir : "");
     kl_driver_env_defaults(t);
+    if (t && !strcmp(t->name, "x2249318828413747")) {
+        // Device log: ANGLE supplies ES 3.0, while claiming 3.2 makes Unity
+        // select compute skinning. Compute shader creation then fails and
+        // kernels remain invalid. Describe the backend this title actually
+        // has so Unity can select its supported skinning/rendering path.
+        kl_egl_set_gles_version(3, 0);
+        fprintf(stderr, "  [gl] Space Channel: GLES 3.0 capability profile (ANGLE backend)\n");
+    }
+
 }
 
 kl_guest_kind kl_driver_kind(void) {
@@ -385,7 +394,10 @@ static int boot_unity(FILE *out) {
     phase("initJni");
     P(out, "\n=== UnityPlayer.initJni%s -> %s-arg call ===\n",
       ijsig ? ijsig : "<sig unrecorded>", initJni3 ? "3" : initJni2 ? "2" : "1");
-    void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+    // The shared singleton for the same reason the Context is one: this is the
+    // object UnityPlayerActivity keeps in mUnityPlayer, and the guest reads it
+    // back through that field. See kl_jni.h.
+    void *thiz = kl_jni_unity_player();
     kl_jni_local_frame_push();
     if (initJni3)
         ((void (*)(void *, void *, void *, int, void *))initJni)(
@@ -622,7 +634,8 @@ static void sample_start_if_asked(void) {
 }
 
 static int begin_unity(FILE *out) {
-    g_thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+    // The SAME player initJni ran on, not a second instance — see kl_jni.h.
+    g_thiz = kl_jni_unity_player();
     if (!g_thiz) return fail("kl_driver_boot must run first");
 
     // Index the OBB's audio banks by basename (NULL base = no UE4 loose-path

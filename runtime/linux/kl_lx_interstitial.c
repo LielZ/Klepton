@@ -155,6 +155,42 @@ static void *reader(void *arg) {
     return NULL;
 }
 
+// ---- the dominant hand ------------------------------------------------------
+//
+// The other thing xrizer has to say to the host: the hand a game named with
+// IVRInput::SetDominantHand (Alyx's "Weapon Hand" option), one byte "L" or "R"
+// written to /dev/klepton-dominant-hand each time the game sets it
+// (third-party/xrizer/xrizer-dominant-hand.py). The OpenXR runtime then drives
+// the bindings from the other controller (kl_openxr_set_dominant_hand).
+#include "../xr/kl_openxr.h"
+#define LXH_PATH "/dev/klepton-dominant-hand"
+
+int kl_lx_hand_is(const char *path) { return path && !strcmp(path, LXH_PATH); }
+
+static void *hand_reader(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    pthread_setname_np("Klepton dominant hand");
+    char c;
+    for (;;) {
+        ssize_t n = read(fd, &c, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        if (c == 'L' || c == 'R') kl_openxr_set_dominant_hand(c == 'L');
+    }
+    close(fd);
+    return NULL;
+}
+
+int kl_lx_hand_open(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+    pthread_t th;
+    int rc = pthread_create(&th, NULL, hand_reader, (void *)(intptr_t)sv[1]);
+    if (rc != 0) { close(sv[0]); close(sv[1]); errno = rc; return -1; }
+    pthread_detach(th);
+    return sv[0];
+}
+
 int kl_lx_interstitial_open(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;

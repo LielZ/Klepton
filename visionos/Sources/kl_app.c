@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -17,6 +18,7 @@
 #include "kl_egl.h"
 #include "kl_driver.h"    // the guest's own sequences, shared with build/m_boot
 #include "kl_audio.h"     // kl_audio_set_latency_ms — streamed audio needs a deeper buffer
+#include "kl_opensl.h"    // kl_opensl_heartbeat — the live audio census in the [hb] loop
 #include "kl_ovrp.h"      // kl_ovrp_set_frame_pacer — the OVRPlugin frame clock
 #include "kl_openxr.h"    // kl_openxr_set_frame_pacer — the OpenXR one
 #include "kl_slink.h"
@@ -217,6 +219,241 @@ static int missing(const char *what, const char *path) {
     return 1;
 }
 
+// --- the shader cache outlives the driver, and must not -------------------
+//
+// A GLES guest that keeps a program binary cache (UE4's `ProgramBinaryCache`,
+// Unity's shader cache) writes `glGetProgramBinary` blobs into its files
+// directory and reads them back with `glProgramBinary` on the next launch.
+// Those blobs are only valid for the driver that produced them — on Android
+// the vendor blob cache is keyed on the driver build and thrown away when it
+// changes. **Here there is no such key.** ANGLE hands the Metal shader compiler
+// through, the binaries carry the OS build they were compiled under, and
+// nothing on this platform invalidates them.
+//
+// The first launch after a visionOS update therefore reloads a cache into
+// programs that `glProgramBinary` silently refuses to link. UE4 uses them
+// anyway, every `glUseProgram` answers GL_INVALID_OPERATION, the RHI raises
+// Fatal, and the guest asks to quit hundreds of times before its game thread
+// crashes. Seen on Tetris Effect: "it crashes right after the Loading screen",
+// i.e. at the first level whose shaders came from the cache.
+//
+// The fix is the key Android has and we did not: fingerprint the driver, store
+// it beside the cache, and delete the cache when it changes. It lives here at
+// the platform level rather than per-target, because every guest that persists
+// compiled GL programs is one OS update away from the same crash.
+//
+// KL_SHADER_CACHE_GUARD=0 leaves the cache alone (to reproduce the failure).
+#define KL_CACHE_STAMP ".klepton-gl-driver"
+
+// What the guard decided, kept so kl_app_boot can repeat it into the boot log:
+// the guard runs from kl_app_configure, before the log file exists, so its own
+// line reaches only the console — and a Home View launch has none.
+static char g_cache_guard_note[512];
+
+static void rm_rf(const char *path, int depth) {
+    if (depth > 8) return;
+    DIR *d = opendir(path);
+    if (!d) { unlink(path); return; }
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[1400];
+        snprintf(p, sizeof p, "%s/%s", path, e->d_name);
+        struct stat st;
+        if (lstat(p, &st) == 0 && S_ISDIR(st.st_mode)) rm_rf(p, depth + 1);
+        else unlink(p);
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+// The directory names guests use for compiled-program caches. Matched by name
+// at any depth under the files directory, because each engine buries it
+// differently (UE4 puts ProgramBinaryCache at the root, Unity puts its cache
+// under a per-company subtree).
+//
+// Only the two that are known to hold glGetProgramBinary blobs. Upstream of
+// this list also named ShaderCache, il2cpp_cache and GPUCache; a folder is
+// deleted here on its name alone, so a name stays off the list until a guest
+// has been seen keeping GL program binaries under it.
+//
+// The other half of this guard is KleptonProgramCaches (KleptonTuning.swift),
+// which drops ProgramBinaryCache when the APP's build changes — a new ANGLE
+// refuses binaries too. This one covers what that cannot see: the OS build.
+static int is_cache_dir(const char *name) {
+    static const char *const names[] = {
+        "ProgramBinaryCache",   // UE4 FOpenGLProgramBinaryCache
+        "UnityShaderCache",
+        NULL,
+    };
+    for (int i = 0; names[i]; i++) if (!strcmp(name, names[i])) return 1;
+    return 0;
+}
+
+static int purge_caches(const char *root, int depth) {
+    if (depth > 6) return 0;
+    DIR *d = opendir(root);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[1400];
+        snprintf(p, sizeof p, "%s/%s", root, e->d_name);
+        struct stat st;
+        if (lstat(p, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (is_cache_dir(e->d_name)) {
+            fprintf(stderr, "  [klepton] shader cache: dropping %s "
+                            "(compiled under a different GL driver)\n", p);
+            rm_rf(p, 0);
+            n++;
+        } else {
+            n += purge_caches(p, depth + 1);
+        }
+    }
+    closedir(d);
+    return n;
+}
+
+// The fingerprint. `kern.osversion` is the OS BUILD, which is what moves when a
+// beta lands and what the Metal compiler versions its output by; hw.model pins
+// the GPU family so a restore onto different hardware counts as a change too;
+// KL_GLFB_REWRITE_GEN is our own half of what the cache holds (the blobs are
+// compiled from the text klfb_rewrite_glsl produced).
+static void shader_cache_guard(const char *files) {
+    if (!kl_env_on("KL_SHADER_CACHE_GUARD", 1)) return;
+
+    char want[256] = "", tmp[128];
+    size_t n = sizeof tmp;
+    if (sysctlbyname("kern.osversion", tmp, &n, NULL, 0) != 0) return;
+    snprintf(want, sizeof want, "os=%s", tmp);
+    n = sizeof tmp;
+    if (sysctlbyname("hw.model", tmp, &n, NULL, 0) == 0) {
+        size_t at = strlen(want);
+        snprintf(want + at, sizeof want - at, " hw=%s", tmp);
+    }
+    {
+        size_t at = strlen(want);
+        snprintf(want + at, sizeof want - at, " glsl=%d", KL_GLFB_REWRITE_GEN);
+    }
+
+    char stamp[1200];
+    snprintf(stamp, sizeof stamp, "%s/%s", files, KL_CACHE_STAMP);
+
+    char have_s[256] = "";
+    FILE *f = fopen(stamp, "r");
+    if (f) {
+        if (!fgets(have_s, sizeof have_s, f)) have_s[0] = 0;
+        fclose(f);
+        for (char *p = have_s; *p; p++) if (*p == '\n') { *p = 0; break; }
+    }
+    if (!strcmp(have_s, want)) {          // same driver — the cache is valid
+        snprintf(g_cache_guard_note, sizeof g_cache_guard_note,
+                 "GL driver fingerprint unchanged (%s): compiled-program caches kept",
+                 want);
+        return;
+    }
+
+    // A fresh install has no stamp and no cache either, so the sweep is free;
+    // it is only ever expensive when it is also necessary.
+    int dropped = purge_caches(files, 0);
+    snprintf(g_cache_guard_note, sizeof g_cache_guard_note,
+             "GL driver fingerprint %s -> %s: %d compiled-program cache(s) dropped",
+             have_s[0] ? have_s : "(none)", want, dropped);
+    fprintf(stderr, "  [klepton] %s. A guest's glProgramBinary blobs do not "
+                    "survive an OS update, and using them is a silent unlinked "
+                    "program (KL_SHADER_CACHE_GUARD=0 keeps them).\n",
+            g_cache_guard_note);
+
+    f = fopen(stamp, "w");
+    if (f) { fprintf(f, "%s\n", want); fclose(f); }
+}
+
+// Half-Life: Alyx keeps its video settings file (hlvr/cfg/deckard/video2.txt)
+// only while the VendorID and DeviceID in it are the running GPU's; otherwise it
+// replaces the whole file with its automatic setup at boot — the lowest of
+// everything — and the detail settings the app put there (KleptonAlyx.swift)
+// are gone, with the mark that they were set still standing. The device id
+// changes with a system update (kl_vulkan_gpu_ids), so a file that was right
+// yesterday is thrown away after one. At every start, then, the file gets the
+// ids of the GPU it is about to be read on. Glovebox found this
+// (github.com/glovebox-vr/glovebox, runtime/linux/kl_alyx_app.c, MIT: measured
+// on a Mac, 2026-10-11); what is done here is its match_gpu.
+// KL_ALYX_GPU_IDS=0 leaves the file alone.
+int kl_vulkan_gpu_ids(unsigned *vendor, unsigned *device);
+static char g_alyx_ids_note[160];
+
+// The value of the first `"key"  "value"` line in a KeyValues text set to val.
+// 1 changed, 0 it was that already, -1 there is no such line.
+static int alyx_kv_set(char **text, const char *key, const char *val) {
+    char q[64];
+    snprintf(q, sizeof q, "\"%s\"", key);
+    for (char *l = *text; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL) {
+        char *k = l;
+        while (*k == ' ' || *k == '\t') k++;
+        if (strncmp(k, q, strlen(q))) continue;
+        char *eol = strchr(k, '\n');
+        char *v = strchr(k + strlen(q), '"');
+        char *e = v ? strchr(v + 1, '"') : NULL;
+        if (!e || (eol && e > eol)) return -1;
+        size_t old = (size_t)(e - v - 1), nv = strlen(val);
+        if (old == nv && !strncmp(v + 1, val, nv)) return 0;
+        size_t head = (size_t)(v + 1 - *text), tail = strlen(e);
+        char *out = malloc(head + nv + tail + 1);
+        if (!out) return -1;
+        memcpy(out, *text, head);
+        memcpy(out + head, val, nv);
+        memcpy(out + head + nv, e, tail + 1);
+        free(*text);
+        *text = out;
+        return 1;
+    }
+    return -1;
+}
+
+static void alyx_video_gpu_ids(const char *container) {
+    if (!kl_env_on("KL_ALYX_GPU_IDS", 1)) {
+        snprintf(g_alyx_ids_note, sizeof g_alyx_ids_note, "left alone (KL_ALYX_GPU_IDS=0)");
+        return;
+    }
+    char path[1200], tmp[1300];
+    snprintf(path, sizeof path, "%s/lx/game/hlvr/cfg/deckard/video2.txt", container);
+    FILE *f = fopen(path, "rb");
+    if (!f) { snprintf(g_alyx_ids_note, sizeof g_alyx_ids_note, "no file yet"); return; }
+    enum { kMax = 1 << 18 };            // the file is 2 KB
+    char *text = malloc(kMax + 1);
+    size_t n = text ? fread(text, 1, kMax, f) : 0;
+    int whole = text && feof(f);
+    fclose(f);
+    if (!whole) { free(text); snprintf(g_alyx_ids_note, sizeof g_alyx_ids_note, "not read"); return; }
+    text[n] = 0;
+    unsigned id[2];
+    if (!kl_vulkan_gpu_ids(&id[0], &id[1])) {
+        free(text);
+        snprintf(g_alyx_ids_note, sizeof g_alyx_ids_note, "GPU ids not known, file left alone");
+        return;
+    }
+    static const char *const keys[] = { "VendorID", "DeviceID" };
+    int changed = 0, missing = 0;
+    for (int i = 0; i < 2; i++) {
+        char want[24];
+        snprintf(want, sizeof want, "%u", id[i]);
+        int r = alyx_kv_set(&text, keys[i], want);
+        if (r < 0) missing++; else changed += r;
+    }
+    const char *what = missing ? "the file has no id lines, left alone" : changed ? "put into the file" : "the file has them";
+    if (changed && !missing) {
+        snprintf(tmp, sizeof tmp, "%s.klnew", path);
+        FILE *out = fopen(tmp, "wb");
+        size_t len = strlen(text);
+        int bad = !out || fwrite(text, 1, len, out) != len;
+        if (out && fclose(out) != 0) bad = 1;
+        if (bad || rename(tmp, path) != 0) { unlink(tmp); what = "NOT WRITTEN"; }
+    }
+    free(text);
+    snprintf(g_alyx_ids_note, sizeof g_alyx_ids_note, "GPU ids %u/%u (%#x): %s", id[0], id[1], id[1], what);
+}
+
 int kl_app_configure(const char *resources, const char *container) {
     if (!resources || !container) return missing("path", "(null)");
 
@@ -330,6 +567,9 @@ int kl_app_configure(const char *resources, const char *container) {
     if (!folder_fed && !have(g_apk))
         return missing("staged APK (run stage_assets.sh)", g_apk);
     mkdir(g_files, 0755);
+    // Before any guest code runs, and before the guest's own file layer can
+    // hand it a stale blob. See shader_cache_guard.
+    shader_cache_guard(g_files);
 
     if (kl_app_target_is_steamlink()) {
         // Which front door this launch opens. The SHELL is the default because
@@ -487,6 +727,29 @@ int kl_app_configure(const char *resources, const char *container) {
     // way to attach, so the watchdog is the only thing that says WHERE a run
     // stopped — and a device is slower to reach its first frame than the host.
     kl_driver_set_alarm(kl_env_int("KL_ALARM", 120));
+    // After kl_driver_init, which puts the MoltenVK settings into the
+    // environment: reading the GPU's ids makes MoltenVK's first instance.
+    if (!strcmp(g_target->name, "alyx")) alyx_video_gpu_ids(container);
+
+    // The two PCM captures (kl_audio.h, KL_AUDIO_DUMP / KL_AAUDIO_DUMP) are off
+    // unless set. A bare filename resolves against the data container, which is
+    // the one directory `devicectl device copy from` can read back — see
+    // visionos/pull_audio.sh:
+    //
+    //   KL_AUDIO_DUMP=klepton-audio-out.wav KL_AAUDIO_DUMP=klepton-audio-guest.wav
+    //
+    // These two name a FILE, not a directory, so they get the container prefix
+    // without the mkdir the loop above does — an mkdir here would create a
+    // directory exactly where the file needs to be written.
+    static const char *const cap_files[] = { "KL_AUDIO_DUMP", "KL_AAUDIO_DUMP" };
+    for (size_t i = 0; i < sizeof cap_files / sizeof *cap_files; i++) {
+        const char *v = getenv(cap_files[i]);
+        if (!v || !*v || *v == '/') continue;
+        char abs[1200];
+        snprintf(abs, sizeof abs, "%s/%s", container, v);
+        setenv(cap_files[i], abs, 1);
+        printf("[app] %s is relative — resolved to %s\n", cap_files[i], abs);
+    }
 
     // ...and the app uses it by default. KL_GLFB stays opt-IN for the host,
     // where the null driver is a legitimate answer — `make check` and every
@@ -532,6 +795,16 @@ static int open_log(void) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         setvbuf(stderr, NULL, _IOLBF, 0);
         return 0;
+    }
+    // The run before this one keeps its log, once, as klepton-boot.prev.log: a
+    // player whose game froze or quit starts it again before anyone asks for
+    // the log, and that start would otherwise be all that is left. (After
+    // Glovebox, github.com/glovebox-vr/glovebox, MIT.)
+    size_t n = strlen(g_log);
+    if (n > 4 && strcmp(g_log + n - 4, ".log") == 0) {
+        char prev[sizeof g_log + 8];
+        snprintf(prev, sizeof prev, "%.*s.prev.log", (int)(n - 4), g_log);
+        (void)rename(g_log, prev);
     }
     if (!freopen(g_log, "w", stdout)) return 1;
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -591,6 +864,93 @@ static long long kl_phys_footprint(void) {
     return (long long)info.phys_footprint;
 }
 
+// ---- how the game runs, in numbers ------------------------------------------
+//
+// Three counters that cost an increment each: the frames the game started
+// (guest_pace_wait), the poses the compositor offered it (kl_app_guest_publish —
+// one per display refresh the app was given), and the GPU time of the command
+// buffers that carry the game's scene pass (kl_mtl_foveate.m). The heartbeat
+// turns them into rates once a second, for the readout in the headset
+// (kl_app_perf, KleptonCompositor's stats card), and once a minute into a
+// [perf] line in the log: a short test run says little about a session, and
+// what the system does to an app that has been warm for twenty minutes — halve
+// its display rate, most of all — is not visible in the first two.
+static _Atomic unsigned long long g_perf_frames, g_perf_publishes;
+static _Atomic int g_perf_thermal = -1;
+static struct { float game_fps, display_hz, gpu_ms; } g_perf_now;
+static pthread_mutex_t g_perf_mu = PTHREAD_MUTEX_INITIALIZER;
+double kl_mtl_scene_gpu_ms(void);     // kl_mtl_foveate.m: mean since the last call, <0 for none
+
+void kl_app_note_thermal(int state) { g_perf_thermal = state; }
+
+int kl_app_perf(float *game_fps, float *display_hz, float *gpu_ms, int *thermal) {
+    pthread_mutex_lock(&g_perf_mu);
+    if (game_fps) *game_fps = g_perf_now.game_fps;
+    if (display_hz) *display_hz = g_perf_now.display_hz;
+    if (gpu_ms) *gpu_ms = g_perf_now.gpu_ms;
+    pthread_mutex_unlock(&g_perf_mu);
+    if (thermal) *thermal = g_perf_thermal;
+    return g_perf_frames > 0;
+}
+
+// The least memory the app had left before its limit while the game drew, in
+// MB; -1 where the system does not say or the game never drew. The start
+// window shows it beside the texture budget, which is what spends it.
+static _Atomic long long g_perf_min_avail = -1;
+long long kl_app_min_avail_mb(void) { return g_perf_min_avail; }
+
+static double perf_seconds(void) {
+    struct timespec m;
+    clock_gettime(CLOCK_MONOTONIC, &m);
+    return (double)m.tv_sec + (double)m.tv_nsec * 1e-9;
+}
+
+// Called four times a second from the heartbeat.
+static void perf_tick(void) {
+    static double t_sec, t_min, t_first;
+    static unsigned long long f_sec, p_sec, f_min, p_min;
+    static double gpu_sum; static int gpu_n;
+    static int on = -1, every;
+    if (on < 0) {
+        on = kl_env_on("KL_PERF_LOG", 1);
+        // KL_PERF_LOG_EVERY=<seconds>: a minute is the right grain for a
+        // session and too coarse for a trial of three — the second minute is
+        // then the only one that is all play.
+        every = kl_env_int("KL_PERF_LOG_EVERY", 60);
+        if (every < 5) every = 5;
+    }
+    unsigned long long f = g_perf_frames, pub = g_perf_publishes;
+    if (!f) return;                                    // nothing of the game yet
+    double t = perf_seconds();
+    if (!t_first) { t_first = t_sec = t_min = t; f_sec = f_min = f; p_sec = p_min = pub; return; }
+    if (t - t_sec >= 1.0) {
+        double dt = t - t_sec, g = kl_mtl_scene_gpu_ms();
+        pthread_mutex_lock(&g_perf_mu);
+        g_perf_now.game_fps = (float)((double)(f - f_sec) / dt);
+        g_perf_now.display_hz = (float)((double)(pub - p_sec) / dt);
+        if (g >= 0) g_perf_now.gpu_ms = (float)g;
+        pthread_mutex_unlock(&g_perf_mu);
+        if (g >= 0) { gpu_sum += g; gpu_n++; }
+        long long left = kl_avail_memory();
+        if (left > 0 && (g_perf_min_avail < 0 || (left >> 20) < g_perf_min_avail)) g_perf_min_avail = left >> 20;
+        t_sec = t; f_sec = f; p_sec = pub;
+    }
+    if (t - t_min >= (double)every) {
+        double dt = t - t_min;
+        // A minute in which the app was offered no pose at all (the immersive
+        // space was down, the headset off) is not a measurement of the game.
+        if (on && pub != p_min) {
+            char gpu[32] = "";
+            if (gpu_n) snprintf(gpu, sizeof gpu, ", GPU %.1f ms a frame", gpu_sum / gpu_n);
+            fprintf(stderr, "[perf] %5.2f min: game %.1f fps, display %.1f Hz%s, thermal %d, "
+                            "memory %lld MB used / %lld MB left\n",
+                    (t - t_first) / 60.0, (double)(f - f_min) / dt, (double)(pub - p_min) / dt, gpu,
+                    (int)g_perf_thermal, kl_phys_footprint() >> 20, kl_avail_memory() >> 20);
+        }
+        t_min = t; f_min = f; p_min = pub; gpu_sum = 0; gpu_n = 0;
+    }
+}
+
 static void *heartbeat(void *arg) {
     (void)arg;
     // Polled faster than it prints, so a phase change is reported when it
@@ -606,12 +966,25 @@ static void *heartbeat(void *arg) {
             clock_gettime(CLOCK_REALTIME, &ts);
             struct tm tm;
             localtime_r(&ts.tv_sec, &tm);
-            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM avail=%lldM\n",
+            // The x18 refusal count rides the heartbeat because the failure it
+            // predicts cannot report itself: a refused site that writes x18
+            // leaves the shadow stale, and the fault that follows can be a
+            // silent SIGKILL. Printed only when non-zero.
+            unsigned x18ref = kl_x18_refusals();
+            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM avail=%lldM",
                     tm.tm_hour, tm.tm_min, tm.tm_sec, phase,
                     kl_phys_footprint() >> 20, kl_avail_memory() >> 20);
+            if (x18ref) fprintf(stderr, "  x18-REFUSED=%u", x18ref);
+            fprintf(stderr, "\n");
             fflush(stderr);
             last_phase = phase;
         }
+        // Every 10 s, a quarter as often as the memory line: whether the guest
+        // is feeding the audio stream and whether what it feeds is silence. The
+        // end-of-run report never prints on a headset (the app is killed, not
+        // exited), so this is the only audio census a device log carries.
+        if (ticks % 40 == 0) { kl_opensl_heartbeat(stderr); fflush(stderr); }
+        perf_tick();
         ticks++;
         struct timespec iv = { 0, 250000000 };  // nanosleep: usleep is EINVAL at >= 1e6
         nanosleep(&iv, NULL);
@@ -854,6 +1227,9 @@ int kl_app_boot(void) {
 
     if (!*g_libdir) return fail("kl_app_configure was not called");
     if (open_log()) return fail("could not open the log file");
+    // shader_cache_guard ran in kl_app_configure, before the log existed.
+    if (g_cache_guard_note[0])
+        fprintf(stderr, "  [klepton] shader cache guard: %s\n", g_cache_guard_note);
 
     // Every thread that runs guest code must seed bionic's stack-guard canary
     // into TSD slot 5 first, and this is the thread the whole boot runs on.
@@ -878,6 +1254,9 @@ int kl_app_boot(void) {
 
     printf("=== Klepton on visionOS ===\n");
     printf("  target    : %s\n", g_target->name);
+    if (g_alyx_ids_note[0]) printf("  video file: %s\n", g_alyx_ids_note);
+    { const char *chosen = getenv("KL_APP_SETTINGS");      // what the start window's dials were at (KleptonAlyx.swift)
+      if (chosen && *chosen) printf("  settings  : %s\n", chosen); }
     if (g_shader_test_note[0]) printf("  shader test: %s\n", g_shader_test_note);
     // The front door, with the reason. It is chosen from the ENVIRONMENT in
     // kl_app_configure — which runs before the log file is open, so it cannot
@@ -1166,13 +1545,72 @@ static int guest_fresh_pose(void) {
     }
     return v;
 }
+// KL_GUEST_PACE_DIV=<n>: the guest starts a frame on every nth pose it is
+// offered, while it is offered them at a panel's full rate. A game whose frame
+// takes a little longer than one refresh otherwise lands on the next refresh
+// most of the time and on the one after that every so often — motion that
+// stutters at no fixed rate (Half-Life: Alyx, 2026-10-13: 12.5 ms of GPU a
+// frame against the panel's 10, 70 frames a second) — and it keeps the graphics
+// chip busy without pause until the system halves the app's display rate for
+// heat. Every second refresh is an even 50 (or 45, or 60) a second with the
+// chip idle for part of each frame. Glovebox runs the game this way
+// (KL_GUEST_PACE_HZ there).
+//
+// "While at the full rate" is the part that matters. The system halves an
+// app's rate when it sees fit — at once, in a session that starts warm — and
+// then the poses themselves come every second refresh: dividing those again
+// makes a quarter. And the rate cannot be taken from a measurement at the
+// start: the first version of this did (the compositor's "display … Hz
+// measured"), was told 50 in a 120 Hz space the system was showing at 60, and
+// paced the game to 20 frames a second (headset, 2026-10-13).
+//
+// So the rate is read where it is true, from the poses as they arrive: the
+// median of the last sixteen gaps between them. Above 77 a second (a gap under
+// 13 ms — every panel rate there is, 90 to 120) a frame starts on the first
+// pose that comes n gaps, less a quarter of one, after the last frame started;
+// at or below it the app is being shown at half rate already and every pose
+// starts a frame, which is the same number of frames a second as before.
+enum { kPubGaps = 16 };
+static uint32_t g_pub_gap_ns[kPubGaps];        // under g_guest.mu
+static unsigned g_pub_gap_at;
+static uint64_t guest_pose_gap_ns(void) {      // under g_guest.mu; 0 until there are enough
+    uint32_t v[kPubGaps];
+    int n = 0;
+    for (int i = 0; i < kPubGaps; i++) if (g_pub_gap_ns[i]) v[n++] = g_pub_gap_ns[i];
+    if (n < kPubGaps) return 0;
+    for (int i = 1; i < n; i++) { uint32_t x = v[i]; int j = i; while (j > 0 && v[j - 1] > x) { v[j] = v[j - 1]; j--; } v[j] = x; }
+    return v[n / 2];
+}
+void kl_app_set_panel_hz(float hz) { (void)hz; }   // kept for the compositor's call; the rate is read from the poses
+static int guest_pace_div(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = kl_env_int("KL_GUEST_PACE_DIV", 1);
+        if (v < 1) v = 1;
+        if (v > 4) v = 4;
+        if (v > 1) fprintf(stderr, "[guest] paced to every %d. refresh of the panel (KL_GUEST_PACE_DIV)\n", v);
+    }
+    return v;
+}
 static void guest_pace_wait(void) {
+    static uint64_t last_turn_ns;                 // the pose the last frame started on (frame thread only)
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += 1;
+    int div = guest_pace_div();
     pthread_mutex_lock(&g_guest.mu);
-    while (!g_guest.stop && g_guest.published == g_guest.consumed)
-        if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) break;
+    for (;;) {
+        int timed_out = 0;
+        while (!g_guest.stop && g_guest.published == g_guest.consumed)
+            if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) { timed_out = 1; break; }
+        if (div <= 1 || timed_out || g_guest.stop || !last_turn_ns) break;
+        uint64_t gap = guest_pose_gap_ns();
+        if (!gap || gap >= 13000000ull) break;      // not known yet, or shown at half rate already
+        if (g_guest.published_ns - last_turn_ns >= (uint64_t)div * gap - gap / 4) break;
+        g_guest.consumed = g_guest.published;      // too soon after the last frame: let this pose go by
+    }
+    last_turn_ns = g_guest.published_ns;
+    g_perf_frames++;
     // Coalesce, do not queue: everything published since the last frame is one
     // turn. A guest that is behind then skips frames — which reprojection covers
     // — rather than being owed a backlog it can never work off.
@@ -1380,9 +1818,13 @@ int kl_app_guest_start(void) {
 }
 
 void kl_app_guest_publish(void) {
+    g_perf_publishes++;
     pthread_mutex_lock(&g_guest.mu);
     g_guest.published++;
-    g_guest.published_ns = guest_now_ns();
+    { uint64_t now = guest_now_ns(), gap = g_guest.published_ns ? now - g_guest.published_ns : 0;
+      // A gap of a quarter second or more is a pause, not a rate.
+      if (gap && gap < 250000000ull) g_pub_gap_ns[g_pub_gap_at++ % kPubGaps] = (uint32_t)gap;
+      g_guest.published_ns = now; }
     pthread_cond_signal(&g_guest.cv);
     pthread_mutex_unlock(&g_guest.mu);
 }

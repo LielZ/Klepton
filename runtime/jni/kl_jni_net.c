@@ -327,27 +327,56 @@ static klj_val klj_EOS_GetSalesMarketIdentifier(void *env, void *self, const klj
 // every field of an AudioDeviceInfo — id, type, sample rates, channel masks —
 // would have to be invented to fill even one entry.
 //
-// Empty is not a silent zero of the trap-6d kind. Unity uses this list to notice
-// device *changes* (headphones, Bluetooth) and to pick a non-default output; with
-// nothing to choose from it stays on the default path, which is the OpenSL device
-// that already works. If something later needs a populated list, the trace will
-// name the AudioDeviceInfo getter it calls rather than leaving us to guess.
+// This was answered as an EMPTY array, on the reasoning that we do not enumerate
+// host audio hardware and every field of an AudioDeviceInfo would have to be
+// invented. Batman: Arkham Shadow (UE4 + Meta XR Audio for Wwise) shows what that
+// costs: it resolves getChannelCounts, getProductName, getSampleRates and
+// isSource, gets the empty list, and then
+//
+//     I/MetaXRAudioWwise: ERROR: OculusEndpointSink failed to get default device
+//                         info: Unspecified error occured
+//
+// and the game is silent. Meta's XR Audio Wwise sink picks its output by walking
+// this list; an empty walk leaves it with no default device, so
+// OculusEndpointSink::Init bails — and because the sink registered itself before
+// it failed, every later retry reports "Attempting to initialize another
+// instance ... Aborting initialization." With no sink there is no output to
+// hear, whatever the soundbanks do.
+//
+// So one entry, describing what the guest is told it is running on everywhere
+// else (Build.MODEL, ovrp_GetSystemProductName): the built-in stereo speakers at
+// the sample rate AudioManager already reports through OUTPUT_SAMPLE_RATE. This
+// is the same correction as InputDevice.getDeviceIds() — an empty list is not
+// the conservative answer when the caller's next move is to pick from it; it is
+// a confidently wrong one. On a Quest the speakers really are an enumerable
+// output device, so reporting one is the truthful answer, not an invented one.
+#define KLJ_AUDIO_DEV_ID       1
+#define KLJ_AUDIO_TYPE_SPEAKER 2      // AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+
 static klj_val klj_AudioManager_getDevices(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     // Pistol Whip's Wwise/Unity route monitor treats an empty output census as
     // device loss and keeps re-evaluating its sink. Klepton really does have
     // one stable default output here: the CoreAudio route kl_audio owns. Keep
     // that compatibility answer local to the measured title.
+    //
+    // rebelancap's fork answers one output to every guest (the note above:
+    // Meta's XR Audio sink for Wwise walks this list). Taken over as a switch,
+    // KL_AUDIO_ONE_OUTPUT=1, off: the games listed here were heard with the
+    // empty list.
     extern const char *kl_driver_target_name(void);
     const char *target = kl_driver_target_name();
-    if (target && strcmp(target, "x2104963472963790") == 0) {
+    static int one = -1;
+    if (one < 0) one = kl_env_on("KL_AUDIO_ONE_OUTPUT",
+                                 target && strcmp(target, "x2104963472963790") == 0);
+    if (one) {
         static void *devices;
         if (!devices) {
             devices = klj_new_array('L', "android/media/AudioDeviceInfo", 1);
             ((void **)klj_arr(devices)->data)[0] =
                 klj_new_object_data("android/media/AudioDeviceInfo", (void *)(intptr_t)1);
         }
-        KLJ_LOG("AudioManager.getDevices() -> built-in speaker (Pistol Whip route fix)");
+        KLJ_LOG("AudioManager.getDevices() -> built-in speaker (one stable output)");
         return (klj_val){.l = devices};
     }
     KLJ_LOG("AudioManager.getDevices() -> empty (host devices are not enumerated)");
@@ -409,7 +438,7 @@ static klj_val klj_AudioDeviceInfo_emptyInts(void *e, void *s, const klj_val *a,
 static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *route;
-    if (!route) { route = kl_jni_new_object("android/media/MediaRouter$RouteInfo"); kl_jni_pin_object(route); }
+    if (!route) route = klj_host_cache(kl_jni_new_object("android/media/MediaRouter$RouteInfo"));
     return (klj_val){.l = route};
 }
 
@@ -419,10 +448,10 @@ static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj
 // which is exactly how this presented under KL_PERMISSIVE, as a SIGABRT with no
 // JNI call named because the permissive zero *was* the answer.
 //
-// The value is synthetic and constant: Android's own android_id is a per-device,
-// per-app-signing-key random 64-bit value, so any 16-hex-digit string is a
-// well-formed one. Stable across runs because callers cache it and compare.
-#define KLJ_ANDROID_ID "4b6c6570746f6e01"      /* "Klepton\1" as hex */
+// The value is synthetic and constant, and it lives in kl_jni_int.h as
+// KLJ_ANDROID_ID rather than here, because UE asks the same question through a
+// different door (GameActivity.AndroidThunkJava_GetAndroidId, kl_jni_ue4.c) and
+// the two must not answer differently.
 
 static klj_val klj_Context_getContentResolver(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -432,7 +461,7 @@ static klj_val klj_Context_getContentResolver(void *env, void *self, const klj_v
     // asks again as it signs in, and stopped on "GetObjectClass on an untagged
     // pointer" (Mac host, 2026-10-13).
     static void *resolver;
-    if (!resolver) { resolver = kl_jni_new_object("android/content/ContentResolver"); kl_jni_pin_object(resolver); }
+    if (!resolver) resolver = klj_host_cache(kl_jni_new_object("android/content/ContentResolver"));
     return (klj_val){.l = resolver};
 }
 
@@ -446,6 +475,34 @@ static klj_val klj_Settings_Secure_getString(void *env, void *self, const klj_va
     KLJ_LOG("Settings.Secure.getString(\"%s\") -> null (not a setting we serve)",
             key ? key : "(null)");
     return (klj_val){.l = NULL};
+}
+
+// Settings.Global and Settings.System are the other two tables behind the same
+// ContentResolver, and a guest that misses a key in one asks the next: Unity's
+// own device-name lookup walks Global then Secure. So all three share this
+// implementation rather than deciding separately — a "device_name" that is null
+// in one table and a string in another is the group-answer mistake, and here it
+// would surface as a device that renames itself depending on which door was
+// used.
+//
+// The typed getters honour the caller's default, which is what Android does for
+// an absent key. The no-default overloads throw SettingNotFoundException on
+// Android; nothing here can throw, so they answer 0 and say so.
+static klj_val klj_Settings_getInt(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *key = n > 1 ? klj_str(a[1].l) : NULL;
+    kl_jint dflt = n > 2 ? (kl_jint)a[2].j : 0;
+    KLJ_LOG("Settings.getInt(\"%s\") -> %d (%s)", key ? key : "(null)", (int)dflt,
+            n > 2 ? "the caller's default; not a setting we serve"
+                  : "no default was offered and nothing here throws");
+    return (klj_val){.j = (uint64_t)(int64_t)dflt};
+}
+static klj_val klj_Settings_getFloat(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *key = n > 1 ? klj_str(a[1].l) : NULL;
+    double dflt = n > 2 ? a[2].d : 0.0;
+    KLJ_LOG("Settings.getFloat(\"%s\") -> %f (the caller's default)", key ? key : "(null)", dflt);
+    return (klj_val){.d = dflt};
 }
 
 // Thread.start(). This one is deliberately not a plain no-op, because a no-op
@@ -775,6 +832,18 @@ const klj_binding klj_bind_net[] = {
     {"com/unity3d/player/UnityPlayer", "applyWindowUIChanges", "(Z)V", klj_void_noop},
     {"android/content/Context", "getContentResolver", "()Landroid/content/ContentResolver;", klj_Context_getContentResolver},
     {"android/provider/Settings$Secure", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
+    // Same three tables, same answers — see klj_Settings_getInt.
+    {"android/provider/Settings$Global", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
+    {"android/provider/Settings$System", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
+#define KLJ_SETTING_TABLE(T) \
+    {"android/provider/Settings$" T, "getInt",   "(Landroid/content/ContentResolver;Ljava/lang/String;I)I", klj_Settings_getInt}, \
+    {"android/provider/Settings$" T, "getInt",   "(Landroid/content/ContentResolver;Ljava/lang/String;)I",  klj_Settings_getInt}, \
+    {"android/provider/Settings$" T, "getFloat", "(Landroid/content/ContentResolver;Ljava/lang/String;F)F", klj_Settings_getFloat}, \
+    {"android/provider/Settings$" T, "getFloat", "(Landroid/content/ContentResolver;Ljava/lang/String;)F",  klj_Settings_getFloat}
+    KLJ_SETTING_TABLE("Secure"),
+    KLJ_SETTING_TABLE("Global"),
+    KLJ_SETTING_TABLE("System"),
+#undef KLJ_SETTING_TABLE
     {"android/media/AudioManager", "getDevices", "(I)[Landroid/media/AudioDeviceInfo;", klj_AudioManager_getDevices},
     {"android/media/AudioDeviceInfo", "getId", "()I", klj_AudioDeviceInfo_getId},
     {"android/media/AudioDeviceInfo", "getType", "()I", klj_AudioDeviceInfo_getType},
@@ -832,5 +901,12 @@ const klj_binding klj_bind_net[] = {
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_KeepScreenOn", "(Z)V", klj_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetSustainedPerformanceMode", "(Z)V", klj_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_DismissSplashScreen", "()V", klj_void_noop},
+    // The other half of the connectivity LISTENER pair whose add is bound in
+    // kl_jni_ue4.c. The Java behind it registers a NetworkCallback whose only
+    // job is to call nativeNetworkChanged when the connection type changes;
+    // nothing about the host's network changes under a guest here, so a
+    // listener that registers and never fires is exactly what that Java would
+    // have produced. The engine's shutdown calls the remover (Pinball FX VR).
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_RemoveNetworkListener", "()V", klj_void_noop},
     {0}
 };

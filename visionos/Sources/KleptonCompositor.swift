@@ -1221,6 +1221,60 @@ final class KleptonCompositor {
             qy.withUnsafeMutableBufferPointer { kl_glfb_foveation_quality($0.baseAddress, zones, edge) }
             source = "synthetic, edge rate \(String(format: "%.2f", edge))"
         }
+
+        // ---- The rate floor: a rasterization rate is a mip level ----
+        //
+        // A rasterization rate map does not only thin the fragments. The
+        // fragment shader runs in PHYSICAL space, so `dFdx`/`dFdy` — and every
+        // texture LOD Metal derives from them — measure physical pixels, not
+        // screen pixels, and nothing renormalizes them. A zone rasterized at
+        // rate `r` therefore samples a mip level `log2(1/r)` HIGHER than the
+        // same surface would unfoveated: rate 0.5 is +1 level, 0.25 is +2, and
+        // this display's own peripheral rates (about 0.12 in x and 0.10 in y)
+        // are +3.1 and +3.3 levels, a tenfold over-blur.
+        //
+        // Flooring the per-zone rate bounds that at a stated number of mip
+        // levels while keeping most of the saving: the floor is the deepest
+        // over-blur we are willing to hand the guest, not an off switch for
+        // foveation. On the measured curve, 0.50 takes the worst bias from +3.3
+        // to +1.0 and the fragment count from about 29% to about 49% of the
+        // unfoveated eye (rebelancap, shinyquagsire23/Klepton pull request 21).
+        //
+        // OFF here unless KL_VRR_FLOOR is set (there it defaults to 0.50). The
+        // eye sizes this fork ships — Beat Saber 1.45 at the display's own
+        // 6890x5526, Doom 3 at 5200 — were chosen for the fragment count of the
+        // RAW curve, and a floor of 0.50 would hand those games nearly twice the
+        // fragments. A game that wants it gets it with a smaller eye, per target.
+        let rateFloor: Float = min(1.0, max(0.0, klEnvFloat("KL_VRR_FLOOR", 0)))
+        var eyeQualityX = displayEyeQualityX
+        func bias(_ q: [Float]) -> Double {
+            guard let m = q.min(), m > 0 else { return 0 }
+            return log2(1.0 / Double(m))
+        }
+        func frac(_ a: [Float], _ b: [Float]) -> Double {
+            guard !a.isEmpty, !b.isEmpty else { return 1 }
+            let ma = Double(a.reduce(0, +)) / Double(a.count)
+            let mb = Double(b.reduce(0, +)) / Double(b.count)
+            return ma * mb
+        }
+        let rawBiasX = bias(qx), rawBiasY = bias(qy), rawFrac = frac(qx, qy)
+        if rateFloor > 0.01 {
+            for i in qx.indices { qx[i] = max(qx[i], rateFloor) }
+            for i in qy.indices { qy[i] = max(qy[i], rateFloor) }
+            // ...and the curves per eye, which a layered guest is drawn through
+            // instead of the envelope (below).
+            for e in eyeQualityX.indices {
+                for i in eyeQualityX[e].indices { eyeQualityX[e][i] = max(eyeQualityX[e][i], rateFloor) }
+            }
+        }
+        NSLog("%@", "[cp] foveation LOD: rate floor "
+              + (rateFloor > 0.01 ? String(format: "%.2f", rateFloor) : "off")
+              + " — worst mip bias x +\(String(format: "%.2f", rawBiasX)) -> "
+              + "+\(String(format: "%.2f", bias(qx))), y +\(String(format: "%.2f", rawBiasY)) -> "
+              + "+\(String(format: "%.2f", bias(qy)))"
+              + "; fragments \(String(format: "%.1f", 100 * rawFrac))% -> "
+              + "\(String(format: "%.1f", 100 * frac(qx, qy)))% "
+              + "(KL_VRR_FLOOR=<0.01..1> sets the floor; envelope figures)")
         // `__sampleCount:` is the pointer-taking initializer as Swift imports
         // it; the array-taking spelling does not exist here.
         // A layer per eye, each with that eye's OWN horizontal curve, where the
@@ -1244,11 +1298,11 @@ final class KleptonCompositor {
         // other guest gets the envelope for both eyes, as until 1.1.5.
         // KL_VRR_PER_EYE=0|1 decides regardless.
         let perEyeWanted = klEnvOn("KL_VRR_PER_EYE", default: kl_glfb_rate_map_per_eye() != 0)
-        let perEye = layers == 2 && displayEyeQualityX.count == 2
-            && displayEyeQualityX[0].count == qx.count && source == "the display's own"
+        let perEye = layers == 2 && eyeQualityX.count == 2
+            && eyeQualityX[0].count == qx.count && source == "the display's own"
             && perEyeWanted
         func makeLayer(_ i: Int) -> MTLRasterizationRateLayerDescriptor {
-            let hx = perEye ? displayEyeQualityX[i] : qx
+            let hx = perEye ? eyeQualityX[i] : qx
             return hx.withUnsafeBufferPointer { hp in
                 qy.withUnsafeBufferPointer { vp in
                     MTLRasterizationRateLayerDescriptor(
@@ -1578,6 +1632,7 @@ final class KleptonCompositor {
         var presented = 0
         var iterations = 0
         var nextReport = Date()
+        var nextHapticsReport = Date().addingTimeInterval(10)
         NSLog("[cp] render loop entered (startup frame-trace on; build has fence content-gate + diag)")
         loop: while true {
             switch layerRenderer.state {
@@ -1621,10 +1676,22 @@ final class KleptonCompositor {
                       + (noFence ? " (NOFENCE)" : ""))
                 NSLog("[cp] \(cadenceSummary())")
                 NSLog("[cp] \(stageSummary())")
+                // The haptics queue's own census, every 10 s and only when it
+                // has something to say (see KleptonControllers.hapticsQueue).
+                if Date() >= nextHapticsReport {
+                    nextHapticsReport = Date().addingTimeInterval(10)
+                    if let h = controllers.hapticsSummary() { NSLog("[cp] \(h)") }
+                }
             }
         }
         NSLog("[cp] render loop ended after \(presented) presented frames, "
               + "\(iterations) iterations, state=\(String(describing: layerRenderer.state))")
+        // The crown press invalidates the layer with NO scenePhase change at
+        // all (measured on device: none fires), and the system then takes
+        // ~30-60 s to background the process — which is when Lifecycle exits.
+        // Go silent the moment the picture is gone, not when the OS gets to
+        // it; the guest may keep rendering until the join below.
+        KleptonAudio.setSilenced(true)
         // Ends the guest's loop and joins it, so its report — which is the
         // lifecycle report, and belongs to the guest's end of the run rather than
         // to this one — has been written before this returns.
@@ -2599,7 +2666,8 @@ final class KleptonCompositor {
             // rendered them at different sizes would already be failing the
             // viewport arithmetic below.
             let (gridBuf, gridVerts, gridPerEye) =
-                unwarpGrid(bind0, viewport0: vp0, viewport1: vp1, viewportOf: vpOf)
+                unwarpGrid(bind0, viewport0: vp0, viewport1: vp1, viewportOf: vpOf,
+                           topLeft: uniforms.first(where: { $0.visible != 0 })?.flip_y ?? 0 != 0)
             // ...and which block each view reads. Assigned here rather than passed
             // to kl_reproject_build above because the decision needs the eye
             // texture, which is not known until the loop that builds the uniforms
@@ -2757,7 +2825,8 @@ final class KleptonCompositor {
             // 2026-10-12, the first build with a curve per eye).
             var unwarp: (MTLBuffer?, Int, Bool)? = nil
             if foveated {
-                unwarp = unwarpGrid(bind0, viewport0: .zero, viewport1: .zero, viewportOf: .zero)
+                unwarp = unwarpGrid(bind0, viewport0: .zero, viewport1: .zero, viewportOf: .zero,
+                                    topLeft: false)
                 if unwarp?.2 != true {
                     for n in uniforms.indices { uniforms[n].grid_eye = 0 }
                 }
@@ -3028,7 +3097,111 @@ final class KleptonCompositor {
         }
         drawn += encodeLoadingCard(enc, viewIndices: viewIndices, drawable: drawable,
                                    originFromHead: originFromHead)
+        drawn += encodeStatsCard(enc, viewIndices: viewIndices, drawable: drawable,
+                                 originFromHead: originFromHead)
         return drawn
+    }
+
+    // How the game is running, as one line at the lower left of the view
+    // (KL_STATS_CARD=1): the frames the game draws a second, the rate the app
+    // is displayed at, the GPU time of the game's scene and the system's
+    // thermal state — kl_app_perf, which the heartbeat fills once a second.
+    //
+    // Light by construction: the numbers are three counters; the line is drawn
+    // into a small texture only when its text changes, at most once a second;
+    // and what a frame pays for it is one quad of a few thousand pixels in a
+    // pass that is being drawn anyway. Fixed to the head, low and to the left,
+    // where it is out of the way of what one looks at and still readable with
+    // a glance.
+    private var statsTexture: MTLTexture?
+    private var statsText = ""
+    private var statsContext: CGContext?
+    private static let statsPixels = (w: 960, h: 96)
+    private static let statsSize = SIMD2<Float>(0.40, 0.04)          // metres, at 1.2 m
+    private static let statsEnabled = klEnvOn("KL_STATS_CARD", default: false)
+
+    private func statsLine() -> String? {
+        var fps: Float = 0, hz: Float = 0, gpu: Float = 0
+        var thermal: Int32 = -1
+        guard kl_app_perf(&fps, &hz, &gpu, &thermal) != 0 else { return nil }
+        var parts = [String(format: "%.0f fps", fps), String(format: "Display %.0f Hz", hz)]
+        if gpu > 0 { parts.append(String(format: "GPU %.1f ms", gpu)) }
+        switch thermal {
+        case 0: parts.append(klT("cool", "kühl"))
+        case 1: parts.append(klT("warm", "warm"))
+        case 2: parts.append(klT("hot", "heiß"))
+        case 3: parts.append(klT("critical", "kritisch"))
+        default: break
+        }
+        return parts.joined(separator: "   ·   ")
+    }
+
+    private func drawStats(_ text: String) {
+        let w = Self.statsPixels.w, h = Self.statsPixels.h
+        if statsContext == nil {
+            statsContext = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                     space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            statsContext?.translateBy(x: 0, y: CGFloat(h)); statsContext?.scaleBy(x: 1, y: -1)
+        }
+        if statsTexture == nil {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w,
+                                                                height: h, mipmapped: false)
+            desc.usage = .shaderRead
+            statsTexture = device.makeTexture(descriptor: desc)
+        }
+        guard let ctx = statsContext, let tex = statsTexture else { return }
+        UIGraphicsPushContext(ctx)
+        UIColor(red: 0.035, green: 0.04, blue: 0.05, alpha: 1).setFill()
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        let font = UIFont.monospacedDigitSystemFont(ofSize: 44, weight: .semibold)
+        let s = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: UIColor(white: 0.95, alpha: 1)])
+        let box = s.size()
+        s.draw(at: CGPoint(x: 28, y: (CGFloat(h) - box.height) / 2))
+        UIGraphicsPopContext()
+        if let data = ctx.data {
+            tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: data, bytesPerRow: w * 4)
+        }
+    }
+
+    private func encodeStatsCard(_ enc: MTLRenderCommandEncoder,
+                                 viewIndices: [Int],
+                                 drawable: LayerRenderer.Drawable,
+                                 originFromHead: simd_float4x4) -> Int {
+        guard Self.statsEnabled, let pipe = overlayPipeline, let text = statsLine() else { return 0 }
+        if text != statsText || statsTexture == nil {
+            drawStats(text)
+            statsText = text
+        }
+        guard let tex = statsTexture else { return 0 }
+        var ov = kl_ovrp_overlay()
+        ov.shape = 0
+        ov.head_locked = 1
+        ov.tex_w = Int32(tex.width); ov.tex_h = Int32(tex.height)
+        ov.viewport.0 = (0, 0, Int32(tex.width), Int32(tex.height))
+        ov.viewport.1 = (0, 0, Int32(tex.width), Int32(tex.height))
+        // In the head's own frame: 1.2 m ahead, a little left of the middle and well below it.
+        ov.pose = (0, 0, 0, 1, -0.16, -0.36, -1.2)
+        ov.size = (Self.statsSize.x, Self.statsSize.y)
+        ov.origin_top_left = 1
+        var uniforms: [kl_overlay_uniforms] = []
+        for vi in viewIndices {
+            uniforms.append(kl_overlay_build(&ov, Int32(vi), originFromHead,
+                                             Self.headFromView(drawable.views[vi].transform,
+                                                               midpoint: eyeMidpointInDevice),
+                                             drawable.computeProjection(viewIndex: vi)))
+        }
+        guard uniforms.contains(where: { $0.visible != 0 }) else { return 0 }
+        if let depthState { enc.setDepthStencilState(depthState) }
+        enc.setRenderPipelineState(pipe)
+        enc.setFragmentTexture(tex, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        uniforms.withUnsafeBytes { buf in
+            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+        }
+        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        return 1
     }
 
     // Black behind the quads of a frame that carries no eye picture (kl_ovrp.c,
@@ -3747,7 +3920,8 @@ final class KleptonCompositor {
     private func unwarpGrid(_ source: MTLTexture?,
                             viewport0: SIMD4<Float>,
                             viewport1: SIMD4<Float>,
-                            viewportOf: SIMD2<Float>) -> (MTLBuffer?, Int, Bool) {
+                            viewportOf: SIMD2<Float>,
+                            topLeft: Bool) -> (MTLBuffer?, Int, Bool) {
         let map = kl_glfb_eye_rate_map()
         let tw = source?.width ?? 0, th = source?.height ?? 0
         // A viewport that IS the whole texture is not a crop, and keeping it as
@@ -3788,8 +3962,23 @@ final class KleptonCompositor {
                 (vp.x == 0 && vp.y == 0 && Int(vp.z) == tw && Int(vp.w) == th) { vp = .zero }
             return vp
         }
-        let vp = sanitise(viewport0)
-        let vpR = sanitise(viewport1)
+        // The rect is measured from the picture's row 0. The grid below is in
+        // the pass's own space, and for a picture whose row 0 is its TOP (a
+        // Vulkan guest) the shader mirrors v AFTER the grid — over the whole
+        // texture. A rect that does not span the texture's height therefore has
+        // to be mirrored here, or the pass reads the rows the guest did NOT
+        // write: Red Matter 2 (Unreal, dynamic resolution) drew into the top
+        // 2244 of 3944 rows and showed a strip of its picture at the top of the
+        // view over black, sinking as its resolution rose (owner, headset,
+        // 2026-10-13). kl_proj_layer_grid does the same for projection layers.
+        // A foveated Vulkan eye WITH a partial viewport is not covered by this:
+        // the rate map is asked in the mirrored coordinates.
+        func rowZeroAtTop(_ r: SIMD4<Float>) -> SIMD4<Float> {
+            guard topLeft, r.z > 0, r.w > 0, th > 0 else { return r }
+            return SIMD4<Float>(r.x, max(0, Float(th) - (r.y + r.w)), r.z, r.w)
+        }
+        let vp = rowZeroAtTop(sanitise(viewport0))
+        let vpR = rowZeroAtTop(sanitise(viewport1))
         // Two blocks only when the eyes really disagree. Equal rects — every
         // guest measured here before BONELAB's symmetric projection — take the
         // single-block path unchanged, cache key and all.
@@ -4322,6 +4511,10 @@ final class KleptonCompositor {
             NSLog(String(format: "[cp] display %.2f Hz measured over %d frames",
                          hz, chosenGaps))
             kl_ovrp_set_display_frequency(hz)
+            // The panel's own rate, for a guest that is paced to every second
+            // refresh of it (kl_app.c): the call above is ignored where the rate
+            // the guest is TOLD is fixed.
+            kl_app_set_panel_hz(hz)
         } else {
             NSLog("[cp] could not measure the display rate — the guest keeps "
                   + "\(kl_ovrp_display_frequency()) Hz")

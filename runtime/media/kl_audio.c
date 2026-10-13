@@ -37,6 +37,7 @@ static int          g_open;           // a unit exists and is initialised
 static int          g_running;        // ...and AudioOutputUnitStart succeeded
 static int          g_playing;        // the guest wants sound
 static int          g_interrupted;    // the OS took the stream
+static int          g_silenced;       // the scene took it — deliberate, see kl_audio_set_silenced
 static uint64_t     g_interrupt_ns;   // ...when, so a lost `.ended` is escapable
 static unsigned     g_interrupt_max_ms = 1500;
 // The recovery machinery lives at the bottom of the file, beside the producer
@@ -709,7 +710,8 @@ static void *watchdog_thread(void *unused) {
         // the only thing that distinguishes "still interrupted" from "the
         // notification was lost" is trying. Bounded, so a real interruption (a
         // call, another app taking the route) is not fought over.
-        if (g_interrupted && g_playing) {
+        // ...unless the silence is deliberate (the scene is off screen).
+        if (g_interrupted && g_playing && !g_silenced) {
             uint64_t since = now_ns() - g_interrupt_ns;
             if (since > (uint64_t)g_interrupt_max_ms * 1000000ull) {
                 fprintf(stderr, "  [au] interrupted for %.1f s with no resume — "
@@ -749,6 +751,18 @@ static void watchdog_start(void) {
     started = 1;
 }
 
+// The scene says the app is off screen — the Digital Crown took the immersive
+// space away. The system needs up to half a minute to background the process,
+// and until then the game kept playing to an empty room. This is the stream
+// interrupted on purpose, latching: neither the watchdog's lost-notification
+// escape nor a compositor resume gives the sound back; only the scene coming
+// back does. (From rebelancap's fork, eab213b; his sink keeps the flag in the
+// same place.)
+void kl_audio_set_silenced(int silenced) {
+    g_silenced = silenced ? 1 : 0;
+    kl_audio_interrupted(g_silenced);
+}
+
 // The app is back on screen. Whatever this file believes about its own state,
 // rebuild — and this is deliberately NOT conditional on the heartbeat.
 //
@@ -759,6 +773,9 @@ static void watchdog_start(void) {
 // missed, the heartbeat is late and cannot.
 void kl_audio_resume(void) {
     if (!g_open) return;
+    // A deliberate scene silence outranks this: the crown press also pauses the
+    // compositor, and its way back must not hand the music back with it.
+    if (g_silenced) return;
     int was = g_interrupted;
     g_interrupted = 0;
     g_interrupt_ns = now_ns();

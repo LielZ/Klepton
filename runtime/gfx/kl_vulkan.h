@@ -87,6 +87,11 @@ void kl_vulkan_set_force_samples_default(int samples);
 // instance exists and reports a valid LUID; returns 0 (out untouched) otherwise —
 // a GLES guest, where the adapter id must stay empty.
 int kl_vulkan_display_luid(uint8_t out[8]);
+// The GPU's Vulkan vendor and device ids, from a throwaway instance (usable
+// before the guest makes its own, but not before kl_driver_init has put the
+// MoltenVK settings into the environment): 1 and both filled, or 0 without
+// MoltenVK. For Half-Life: Alyx's video settings file (kl_app.c).
+int kl_vulkan_gpu_ids(unsigned *vendor, unsigned *device);
 
 // The same GPU as the VkPhysicalDevice the guest's most recent instance
 // enumerates, or NULL when there has been no Vulkan instance. For the OVRPlugin
@@ -260,5 +265,11 @@ void *kl_vulkan_xr_image_mtl(unsigned long long image);
 void kl_vulkan_xr_image_capture(unsigned long long image, unsigned w, unsigned h,
                                 long long vk_format, unsigned array_layer,
                                 unsigned frame, int eye, int layer);
+
+// t_fove: the foveated-intermediate refusal when an indirect draw recorded in a
+// SECONDARY command buffer is played inside its multiview pass (MoltenVK splits
+// such a pass). Fake handles, no device needed. Returns failed checks, -1 when
+// foveation is off or there are no MoltenVK headers.
+int kl_vulkan_fove_indirect_selftest(void);
 
 #endif

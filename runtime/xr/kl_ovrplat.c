@@ -1944,7 +1944,8 @@ static int klplat_user_listed(const char *t) {
     // no user its OnlineSubsystem never comes up, the entitlement reply it asked
     // for is never popped, and it draws its black start room behind a full fade
     // for as long as it is left running (seen on a Mac host, 2026-10-11).
-    static const char *on[] = { "zix", "intotheradius", "redmatter2", "vampire", "twd2",
+    static const char *on[] = { "zix", "intotheradius", "x5817243991680545",
+                                "redmatter2", "vampire", "twd2",
                                 "walkabout", "moss", "x5812519008825194", "x6963344583787383",
                                 "x2897337400373711", "x3635172946605196", "x3484270071659289",
                                 // Sniper Elite VR: with no user its Init scene
@@ -1975,7 +1976,15 @@ static int klplat_user_listed(const char *t) {
                                 // 2026-10-13). With the user: "PlayerData loaded
                                 // successfully", "Startup finished!" (Mac host).
                                 // Its user proof stays the error it is.
-                                "x3634830803298285" };
+                                "x3634830803298285",
+                                // In Death: Unchained (UE4): with no user it
+                                // stays in its sky with the ghost gloves, one
+                                // unchanging picture and no music, for as long
+                                // as it is left (on device and Mac host,
+                                // 2026-10-13). With the user its music starts,
+                                // it asks for its leaderboards and the pointer
+                                // appears.
+                                "x2334376869949242" };
     // Beat Saber from 1.45 on (Unity 6; kl_guest_beatsaber_openxr): its start
     // asks for the user FIRST and goes no further without one — no entitlement
     // request, no scene, one draw a frame of black and silence (on device,

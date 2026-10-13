@@ -116,6 +116,21 @@ void kl_glfb_gl_census(FILE *f);
 // black" and "the guest never drew into the eye texture" are the same symptom
 // and completely different work.
 void kl_glfb_draw_census(FILE *f);
+// glProgramBinary loads, and how many the driver refused to link. A rejected
+// binary is an unlinked program the guest will use anyway.
+void kl_glfb_program_binary_census(FILE *f);
+
+// The generation of klfb_rewrite_glsl's OUTPUT, which belongs to a guest's
+// shader cache exactly as much as the driver's build does. A guest's
+// ProgramBinaryCache stores the compiled form of the GLSL WE handed ANGLE, not
+// the GLSL the guest wrote, so a change to any rewrite rule leaves every cached
+// blob a compiled copy of the old text. It is folded into kl_app.c's
+// shader_cache_guard fingerprint beside the OS build, so bumping it drops the
+// caches once per install, on every target. BUMP IT whenever
+// klfb_rewrite_glsl emits different text.
+//
+//   1  the rewrite rules up to and including the per-stage int precision
+#define KL_GLFB_REWRITE_GEN 1
 
 // The eye-texture seam, texture identity out. kl_ovrp's SetupEyeTexture2 calls
 // this with the GL texture name Unity handed down; the capture finds "the
@@ -144,7 +159,15 @@ void kl_glfb_set_live_eye_image(int eye, uint32_t tex, int32_t w, int32_t h, int
 // that keep an eye texture's storage alive — the EGLImage and the GL texture —
 // so the provider's own release on reallocation can actually reclaim it. A
 // no-op for a slot that was never bound; out-of-range says so and does nothing.
+// Also drops the stage attribution of that texture and the eye-FBO map slots
+// that pointed at it, so a re-created swapchain's FBOs always find room.
 void kl_glfb_release_eye_texture(int eye, int stage);
+
+// The stage-association state in one `[eyemap]` line: the registered eye
+// texture names, eye-FBO map slots in use, and how often a release gave slots
+// back, the map was full, or the colour-table fallback answered. Silent for a
+// guest that never registered a GL eye texture.
+void kl_glfb_eye_map_census(FILE *f);
 
 // Which swapchain stage the guest most recently RENDERED into, or -1 if that
 // has not been observed.
@@ -500,6 +523,7 @@ void  kl_glfb_image_destroy(void *image);
 // which is where the guest's glBindTexture(GL_TEXTURE_EXTERNAL_OES, ...) landed
 // after klfb_detarget. This is what glEGLImageTargetTexture2DOES becomes.
 int   kl_glfb_image_bind(void *image);
+int   kl_glfb_image_bind_texture(void *image, uint32_t texture);
 
 // Is this handle one of ours? Asked of pointers the guest chose, so it is a
 // registry lookup and not a magic-word peek through a foreign pointer.

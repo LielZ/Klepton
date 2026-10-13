@@ -26,5 +26,15 @@ The game app's Steam connection (`visionos/SteamCloudKit`, sign-in and Steam Clo
 parts of Glovebox's `SteamLauncherKit` (MIT, `visionos/SteamCloudKit/LICENSE-Glovebox.txt`); what was taken
 and what was changed is in `visionos/SteamCloudKit/README.md`.
 
+The rewrite of Half-Life: Alyx's eye shaders that ends the colour flashes in NPC eyes (`runtime/gfx/kl_vk_eyefix.c`)
+is Glovebox's `klvk_eye_envguard` (MIT, same licence file), widened from one shader module to the six that have the
+fault; the file says what was changed.
+
+Four smaller things follow Glovebox as well (MIT, same licence file), each named where it is: the game's files
+kept out of the device backup (`visionos/Sources/KleptonBackup.swift`), the GPU ids put into Half-Life: Alyx's
+video settings file at every start (`kl_vulkan_gpu_ids` in `runtime/gfx/kl_vulkan.c`, `alyx_video_gpu_ids` in
+`visionos/Sources/kl_app.c`), the previous run's log kept as `klepton-boot.prev.log` (`kl_app.c`), and a left
+dominant hand driving the bindings from the other controller (`runtime/xr/kl_openxr.c`).
+
 The patch against the ANGLE source is complete in `angle-patches/klepton.patch`.
 Game content and libraries translated from it are never part of a package.

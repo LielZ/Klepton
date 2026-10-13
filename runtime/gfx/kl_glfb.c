@@ -489,6 +489,19 @@ int kl_glfb_init(void) {
         for (size_t i = 0; i < sizeof want / sizeof want[0]; i++)
             fprintf(stderr, " %s=%s", want[i] + 3, strstr(ext, want[i]) ? "yes" : "NO");
         fprintf(stderr, "\n");
+
+        // ...and the extensions the description may REPEAT rather than assert
+        // (kl_egl.c): adopted only if this string names them, and only where
+        // KL_GL_BACKEND_EXT asks for it — so the line is printed only then.
+        kl_gl_cap_adopt_backend_extensions(ext);
+        int adopted = kl_gl_cap_adopted_extension_count();
+        if (adopted || kl_env_on("KL_GL_BACKEND_EXT", 0)) {
+            fprintf(stderr, "  [glfb] backend extensions adopted: %d%s", adopted,
+                    adopted ? " —" : " (none of the candidates are present)");
+            for (int i = 0; i < adopted; i++)
+                fprintf(stderr, " %s", kl_gl_cap_adopted_extension(i));
+            fprintf(stderr, "\n");
+        }
     }
 
     // Release it. EGL binds a context to one thread at a time and *refuses* to
@@ -1538,9 +1551,72 @@ static int klfb_rename_varying(char *buf, char *p, int is_frag) {
     return 1;
 }
 
+// ESSL's default INT precision is per-STAGE, and a uniform declared in both
+// stages without one is therefore two different types.
+//
+// The spec: a vertex shader defaults `int` to highp, a fragment shader defaults
+// it to mediump. A uniform (or a struct member) that states no precision picks
+// up its stage's default, and a strict linker then refuses the program because
+// the two declarations disagree. ANGLE is strict; Quest drivers are not, which
+// is why a Quest title can ship shaders that do not link here. The Simpsons
+// Hit & Run VR port is the case that found it — six lit programs failed with
+//
+//   Precisions of uniform 'lights' member 'lights.enabled' differ between
+//   VERTEX and FRAGMENT shaders.
+//
+// against `struct LightParams { int enabled; vec4 position; ... }`, and the
+// engine then dereferenced the null program it got back for one of them on the
+// first level load.
+//
+// The repair states the vertex stage's default OUT LOUD in both stages, which
+// is a no-op in the vertex shader (it already defaults to highp int) and a
+// PROMOTION in the fragment shader (mediump -> highp). Nothing is narrowed, so
+// no value that fitted before stops fitting; pinning both to mediump instead
+// would demote vertex-stage loop counters and index arithmetic.
+//
+// Placement is directly after the source's FIRST precision statement, which is
+// guaranteed to follow #version and #extension. A source that states an int
+// precision already has no mismatch to fix, and a source with no precision
+// statement at all is left alone. KL_GLFB_NO_INT_PRECISION=1 disables it.
+static int klfb_rewrite_int_precision(char *buf, size_t cap) {
+    static int off = -1;
+    if (off < 0) off = kl_env_on("KL_GLFB_NO_INT_PRECISION", 0);
+    if (off) return 0;
+
+    static const char *const q[] = { "precision highp int;", "precision mediump int;",
+                                     "precision lowp int;" };
+    for (unsigned i = 0; i < sizeof q / sizeof q[0]; i++)
+        if (strstr(buf, q[i])) return 0;
+
+    char *p = strstr(buf, "precision ");
+    if (!p) return 0;
+    char *semi = strchr(p, ';');
+    if (!semi) return 0;
+    char *at = semi + 1;                       // insert directly after it
+
+    static const char ins[] = "\nprecision highp int;";
+    size_t n = sizeof ins - 1;
+    if (strlen(buf) + n + 1 > cap) return 0;   // no slack: leave the text alone
+    memmove(at + n, at, strlen(at) + 1);
+    memcpy(at, ins, n);
+    return 1;
+}
+
 static char *klfb_rewrite_glsl(char *buf, size_t cap, uint32_t shader) {
     int changed = 0;
     klfb_pin_reset(shader);
+    // First, because it inserts a line and the rules below either shrink or
+    // preserve length.
+    if (klfb_rewrite_int_precision(buf, cap)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] `precision highp int;` stated in shaders that "
+                            "left it to the stage default — ESSL defaults int to "
+                            "highp in a vertex shader and mediump in a fragment "
+                            "one, so a uniform declared in both is two types and "
+                            "the link fails (KL_GLFB_NO_INT_PRECISION=1 disables)\n");
+        changed = 1;
+    }
     if (strncmp(buf, "#version 3", 10) == 0 &&
         buf[10] >= '0' && buf[10] <= '9' && buf[11] >= '0' && buf[11] <= '9' &&
         (buf[10] > '0' || buf[11] > '0') && strncmp(buf + 12, " es", 3) == 0) {
@@ -2597,6 +2673,78 @@ static void klfb_CompileShader(uint32_t shader) {
     }
     pthread_mutex_unlock(&g_compile_lock);
 }
+// ----------------------------------------------------- the OTHER way to link
+//
+// glLinkProgram reports a failed link (below); glProgramBinary was passed
+// straight through, so a program loaded from a cached binary that FAILS to link
+// left no line anywhere. The guest then uses it, every glUseProgram answers
+// GL_INVALID_OPERATION ("program has not been successfully linked" — the same
+// error as "not a program object", so it reads like a name bug), and UE4 turns
+// its RHI's Fatal into a ForceQuit storm and, eventually, a crash.
+//
+// That is exactly what a stale ProgramBinaryCache does on the first launch
+// after an OS update; kl_app.c's shader_cache_guard is the cure, and this is
+// the alarm that names it in one line.
+//
+// KL_GLFB_PROGRAM_BINARY=0 refuses the binary path outright: the program is
+// left unlinked, which is precisely what the spec says a rejected binary looks
+// like, so a guest that checks GL_LINK_STATUS falls back to its shader source.
+static void (*g_real_ProgramBinary)(uint32_t, uint32_t, const void *, int32_t);
+static _Atomic unsigned g_pb_loads, g_pb_failed, g_pb_refused;
+static void klfb_ProgramBinary(uint32_t program, uint32_t format,
+                               const void *binary, int32_t length) {
+    static int allow = -1;
+    if (allow < 0) allow = kl_env_on("KL_GLFB_PROGRAM_BINARY", 1);
+    g_pb_loads++;
+    if (!allow) {
+        if (g_pb_refused++ == 0)
+            fprintf(stderr, "  [glfb] glProgramBinary REFUSED "
+                            "(KL_GLFB_PROGRAM_BINARY=0) — every cached program "
+                            "is left unlinked so the guest recompiles from "
+                            "source\n");
+        return;
+    }
+    if (!g_real_ProgramBinary) return;
+    g_real_ProgramBinary(program, format, binary, length);
+
+    static void (*r_GetProgramiv)(uint32_t, uint32_t, int32_t *);
+    static void (*r_GetProgramInfoLog)(uint32_t, int32_t, int32_t *, char *);
+    if (!r_GetProgramiv) r_GetProgramiv = asym("glGetProgramiv");
+    if (!r_GetProgramiv) return;
+    int32_t ok = 1;
+    r_GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &ok);
+    if (ok) return;
+
+    unsigned nth = ++g_pb_failed;
+    if (nth <= 4)
+        fprintf(stderr, "  [glfb] glProgramBinary(%u) REJECTED — format 0x%x, "
+                        "%d bytes, program left UNLINKED (failure #%u). A "
+                        "compiled-program cache does not survive a driver "
+                        "change; see kl_app.c shader_cache_guard.\n",
+                program, format, length, nth);
+    else if (nth == 5)
+        fprintf(stderr, "  [glfb] glProgramBinary: further rejections counted, "
+                        "not printed\n");
+    // The info log is the driver's own reason and is usually empty for a
+    // format mismatch, but it costs nothing to ask on the first one.
+    if (nth == 1) {
+        if (!r_GetProgramInfoLog) r_GetProgramInfoLog = asym("glGetProgramInfoLog");
+        char log[1024]; log[0] = 0;
+        if (r_GetProgramInfoLog) r_GetProgramInfoLog(program, sizeof log, NULL, log);
+        if (log[0]) fprintf(stderr, "  [glfb]   info log: %s\n", log);
+    }
+}
+
+void kl_glfb_program_binary_census(FILE *f) {
+    unsigned n = g_pb_loads, bad = g_pb_failed, ref = g_pb_refused;
+    if (!n) return;
+    fprintf(f, "  [glfb] glProgramBinary: %u load(s), %u REJECTED, %u refused "
+               "by KL_GLFB_PROGRAM_BINARY=0\n", n, bad, ref);
+    if (bad)
+        fprintf(f, "  [glfb]   a rejected binary is an UNLINKED program — every "
+                   "glUseProgram on it is GL_INVALID_OPERATION\n");
+}
+
 static void klfb_LinkProgram(uint32_t program) {
     if (!g_real_LinkProgram) return;
     pthread_mutex_lock(&g_compile_lock);
@@ -2957,9 +3105,13 @@ KLFB_GENDEL(Buffers,      KLC_BUF)
 KLFB_GENDEL(VertexArrays, KLC_VAO)
 // glGenFramebuffers already has a thunk (the FBO trace); only the delete half
 // is new, and the gen half calls klfb_census_made itself.
+static void klfb_forget_fbo(uint32_t fbo);           // with the stage map below
 static void (*g_real_DeleteFramebuffers)(int32_t, const uint32_t *);
 static void klfb_DeleteFramebuffers(int32_t n, const uint32_t *ids) {
     klfb_census_killed(KLC_FBO, n);
+    // Drop the stage attribution with the object. GL recycles names, so an
+    // entry kept past the delete answers for whatever inherits the name next.
+    for (int32_t i = 0; ids && i < n; i++) klfb_forget_fbo(ids[i]);
     if (g_real_DeleteFramebuffers) g_real_DeleteFramebuffers(n, ids);
 }
 
@@ -4177,6 +4329,158 @@ static void klfb_FramebufferTextureLayer(uint32_t target, uint32_t attachment,
 #define GL_TEXTURE_SWIZZLE_R 0x8E42
 #define GL_TEXTURE_SWIZZLE_A 0x8E45
 
+// ---- KL_GLFB_NOMIP: sample level 0 only ------------------------------------
+//
+// KL_GLFB_NOMIP=1 demotes every MIPMAP min filter to its non-mipmapped base
+// (LINEAR_MIPMAP_* -> LINEAR, NEAREST_MIPMAP_* -> NEAREST), on textures and on
+// sampler objects both, so no sample in the run can come from anywhere but
+// level 0.
+//
+// It exists for a title that reads a mip level it should not. Tetris Effect's
+// well backdrop on this path is a fine particle field drawn as one magnifying
+// quad; something drives its LOD far above 0, and at its top levels the texture
+// has collapsed to its own average — a flat dark-blue fill over the scene. With
+// level 0 forced the backdrop renders as it does on a Quest, and the steady-
+// state frame time was unchanged on device. Why a magnifying draw consults the
+// minification chain at all is not settled, which is why this is a knob and not
+// a rule: forcing level 0 everywhere costs minification aliasing and texture
+// bandwidth across the whole title. Default off.
+static int klfb_nomip(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GLFB_NOMIP", 0);
+    return on;
+}
+static int klfb_nomip_filter(uint32_t pname, int32_t param) {
+    static unsigned said;
+    if (pname != 0x2801 /* TEXTURE_MIN_FILTER */ || !klfb_nomip()) return param;
+    int32_t out = param;
+    if (param == 0x2700 || param == 0x2702) out = 0x2600;      // NEAREST_MIPMAP_*
+    if (param == 0x2701 || param == 0x2703) out = 0x2601;      // LINEAR_MIPMAP_*
+    if (out != param && said++ < 3)
+        fprintf(stderr, "  [glfb] NOMIP: min filter 0x%04x -> 0x%04x (level 0 only; "
+                        "KL_GLFB_NOMIP=0 restores the guest's choice)\n",
+                (unsigned)param, (unsigned)out);
+    return out;
+}
+
+// The other spellings of the min-filter write. They forward unchanged unless
+// KL_GLFB_NOMIP is on.
+static void (*g_real_TexParameterf)(uint32_t, uint32_t, float);
+static void klfb_TexParameterf(uint32_t target, uint32_t pname, float param) {
+    if (pname == 0x2801) param = (float)klfb_nomip_filter(pname, (int32_t)param);
+    if (g_real_TexParameterf) g_real_TexParameterf(target, pname, param);
+}
+static void (*g_real_SamplerParameteri)(uint32_t, uint32_t, int32_t);
+static void klfb_SamplerParameteri(uint32_t sampler, uint32_t pname, int32_t param) {
+    param = klfb_nomip_filter(pname, param);
+    if (g_real_SamplerParameteri) g_real_SamplerParameteri(sampler, pname, param);
+}
+static void (*g_real_SamplerParameterf)(uint32_t, uint32_t, float);
+static void klfb_SamplerParameterf(uint32_t sampler, uint32_t pname, float param) {
+    if (pname == 0x2801) param = (float)klfb_nomip_filter(pname, (int32_t)param);
+    if (g_real_SamplerParameterf) g_real_SamplerParameterf(sampler, pname, param);
+}
+
+// ---- depth textures sampled with LINEAR, which ES leaves UNDEFINED ---------
+//
+// A depth texture is not filterable unless the driver says so. ES 3.0 §3.8.13:
+// a texture whose internal format is DEPTH_COMPONENT* is incomplete for
+// sampling if its minification or magnification filter is anything but NEAREST
+// **and** its compare mode is NONE — and an incomplete texture samples as
+// (0,0,0,1). Hardware PCF (compare mode COMPARE_REF_TO_TEXTURE) is the one case
+// where LINEAR is legal, because the filtering then happens on the comparison
+// rather than on the depth value.
+//
+// Quest drivers sample it anyway; Metal does not. The failure is silent — no GL
+// error, no incomplete-framebuffer status, no link error: the shadow lookup
+// returns 0.0, every `depth > shadowSample` test passes, and the whole world is
+// in shadow. The Simpsons Hit & Run VR port is the case that found it: its
+// cascades are depth-only targets sampled with "manual bilinear PCF" (four
+// texels, lerped in the shader), which needs NEAREST; the LINEAR filter left on
+// the texture is a leftover, not a filtering choice, and the level rendered
+// black.
+//
+// So: for a texture this runtime knows to be depth-formatted, a LINEAR filter
+// written while the compare mode is NONE is rewritten to NEAREST, and the swap
+// is UNDONE if the guest later turns compare mode on (the order of the two
+// writes is the guest's business, and a hardware-PCF texture is entitled to its
+// LINEAR). Reported once per texture either way.
+//
+// KL_GLFB_DEPTH_LINEAR=1 leaves the guest's write alone — and in this fork that
+// is still the default (KL_GLFB_DEPTH_LINEAR=0 turns the rewrite on). Both Beat
+// Saber builds write LINEAR to a depth texture with compare mode NONE at start
+// (seen on the Mac, 2026-10-13), so the rewrite changes what a verified game
+// samples in a level, which only a headset shows. On once it has been seen there.
+#define KLFB_MAX_DEPTHTEX 32
+static struct {
+    uint32_t name;
+    int      cmp;                  // compare mode is COMPARE_REF_TO_TEXTURE
+    int      want_min, want_mag;   // what the guest asked for
+    int      forced;               // we rewrote at least one filter for it
+    int      said;
+} g_dtex[KLFB_MAX_DEPTHTEX];
+static unsigned g_ndtex;
+
+static int klfb_fmt_is_depth(uint32_t f) {
+    return f == 0x81A5 /* DEPTH_COMPONENT16 */ || f == 0x81A6 /* DEPTH_COMPONENT24 */ ||
+           f == 0x81A7 /* DEPTH_COMPONENT32 */ || f == 0x8CAC /* DEPTH_COMPONENT32F */ ||
+           f == 0x88F0 /* DEPTH24_STENCIL8 */  || f == 0x8CAD /* DEPTH32F_STENCIL8 */ ||
+           f == 0x1902 /* DEPTH_COMPONENT */;
+}
+
+static unsigned klfb_dtex_slot(uint32_t name) {
+    for (unsigned i = 0; i < g_ndtex; i++) if (g_dtex[i].name == name) return i;
+    if (g_ndtex >= KLFB_MAX_DEPTHTEX) return (unsigned)-1;
+    g_dtex[g_ndtex].name = name;
+    g_dtex[g_ndtex].want_min = g_dtex[g_ndtex].want_mag = 0x2600 /* NEAREST */;
+    return g_ndtex++;
+}
+
+// Returns the parameter to actually pass. `name` is the bound texture.
+static int32_t klfb_depth_filter_fix(uint32_t name, uint32_t pname, int32_t param) {
+    static int off = -1;
+    if (off < 0) off = kl_env_on("KL_GLFB_DEPTH_LINEAR", 1);
+    if (off || !name) return param;
+    if (pname != 0x884C /* TEXTURE_COMPARE_MODE */ &&
+        pname != 0x2801 /* MIN_FILTER */ && pname != 0x2800 /* MAG_FILTER */)
+        return param;
+    uint32_t fmt = 0;
+    if (!klfb_tex_info(name, &fmt, NULL, NULL) || !klfb_fmt_is_depth(fmt)) return param;
+    unsigned i = klfb_dtex_slot(name);
+    if (i == (unsigned)-1) return param;
+
+    if (pname == 0x884C /* TEXTURE_COMPARE_MODE */) {
+        int now_cmp = (param == 0x884E /* COMPARE_REF_TO_TEXTURE */);
+        if (now_cmp && !g_dtex[i].cmp && g_dtex[i].forced) {
+            // The guest wants hardware PCF after all: give the filters back.
+            if (g_real_TexParameteri) {
+                g_real_TexParameteri(0x0DE1, 0x2801 /* MIN_FILTER */, g_dtex[i].want_min);
+                g_real_TexParameteri(0x0DE1, 0x2800 /* MAG_FILTER */, g_dtex[i].want_mag);
+            }
+            fprintf(stderr, "  [glfb] depth tex %u went into COMPARE_REF_TO_TEXTURE — "
+                            "its LINEAR filters are legal now and have been restored\n",
+                    name);
+            g_dtex[i].forced = 0;
+        }
+        g_dtex[i].cmp = now_cmp;
+        return param;
+    }
+    if (pname == 0x2801) g_dtex[i].want_min = param; else g_dtex[i].want_mag = param;
+    // NEAREST and NEAREST_MIPMAP_NEAREST are the two complete choices; anything
+    // else filters, and filtering a depth texture with compare mode NONE is the
+    // undefined case.
+    if (g_dtex[i].cmp) return param;
+    if (param == 0x2600 /* NEAREST */ || param == 0x2700 /* NEAREST_MIPMAP_NEAREST */)
+        return param;
+    if (!g_dtex[i].said++)
+        fprintf(stderr, "  [glfb] depth tex %u (fmt 0x%x) asked for filter 0x%x with "
+                        "compare mode NONE — ES leaves that sample UNDEFINED and Metal "
+                        "returns 0. Forced to NEAREST (KL_GLFB_DEPTH_LINEAR=1 restores "
+                        "the guest's write)\n", name, fmt, param);
+    g_dtex[i].forced = 1;
+    return 0x2600 /* NEAREST */;
+}
+
 static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     if (klfb_trace_tex())
         fprintf(stderr, "  [glfb] #%u glTexParameteri target=0x%04x pname=0x%04x "
@@ -4195,6 +4499,15 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     // filtering and wrap on GL_TEXTURE_EXTERNAL_OES right after binding it, and
     // those calls have to land on the same object the bind did.
     if (target == 0x8D65 /* TEXTURE_EXTERNAL_OES */) target = 0x0DE1;
+    param = klfb_nomip_filter(pname, param);
+    // The depth-texture completeness rule, which needs to know WHICH texture
+    // is bound rather than only what was asked for.
+    if (target == 0x0DE1 /* TEXTURE_2D */ && a_glGetIntegerv &&
+        (pname == 0x2801 || pname == 0x2800 || pname == 0x884C)) {
+        int32_t bound = 0;
+        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &bound);
+        if (bound > 0) param = klfb_depth_filter_fix((uint32_t)bound, pname, param);
+    }
     if (g_real_TexParameteri) g_real_TexParameteri(target, pname, param);
     if (kl_env_on("KL_GLFB_ERRPROBE", 0) && a_glGetError) {
         uint32_t e = a_glGetError();
@@ -4452,6 +4765,7 @@ static uint32_t g_eye_tex[2];
 // stage, with nothing to infer.
 #define KLFB_MAX_STAGES 4
 static uint32_t g_eye_tex_stage[2][KLFB_MAX_STAGES];
+static int      g_eye_ever;   // an eye texture was registered at some point
 
 void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex) {
     if (eye < 0 || eye > 1 || !tex) return;
@@ -4472,6 +4786,7 @@ void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex) {
         for (int s = 0; s < KLFB_MAX_STAGES; s++)
             if (g_eye_tex_stage[e][s] == tex) g_eye_tex_stage[e][s] = 0;
     g_eye_tex_stage[eye][stage] = tex;
+    g_eye_ever = 1;
 }
 
 // Which of an eye's images the guest most recently PRESENTED.
@@ -4541,9 +4856,45 @@ static int klfb_stage_of_tex(uint32_t tex) {
     return -1;
 }
 
+// How often the sixteen-slot map could not answer and the colour table did,
+// how often an eye FBO found no free slot, and how many slots a released eye
+// texture gave back. Printed by kl_glfb_eye_map_census.
+static uint64_t g_stage_via_color;
+static uint64_t g_map_full;
+static uint64_t g_map_freed;
+static uint64_t g_forget_refused;
+
 static int klfb_stage_of_fbo(uint32_t fbo) {
+    // A hit that RESOLVES wins; a hit that resolves to -1 does not end the
+    // search. The narrow map's row can name a texture that has since stopped
+    // being an eye texture while the colour table has the FBO's current
+    // attachment, and returning the stale -1 there loses a frame that was
+    // drawn into a perfectly good eye stage.
     for (int i = 0; i < KLFB_FBO_MAP; i++)
-        if (g_fbo_stage[i].fbo == fbo) return klfb_stage_of_tex(g_fbo_stage[i].tex);
+        if (g_fbo_stage[i].fbo == fbo) {
+            int s = klfb_stage_of_tex(g_fbo_stage[i].tex);
+            if (s >= 0) return s;
+            break;
+        }
+    // The fallback. g_fbo_stage is the narrower of two tables filled from the
+    // SAME two call sites: klfb_note_fbo_color takes every framebuffer into 48
+    // slots, klfb_map_fbo only those whose colour attachment is a registered
+    // eye texture AT THE MOMENT OF ATTACHMENT, into 16. A guest that re-creates
+    // its eye swapchain gives the narrow one two ways to miss: an attachment
+    // made before the texture is registered is refused a slot, and sixteen
+    // slots do not go far once several generations of eye FBOs have each taken
+    // one. The texture is the identity either way — klfb_stage_of_tex is still
+    // the only authority on what a name means — so consulting the wider table
+    // can only add resolutions the narrow one should have had.
+    for (unsigned i = 0; i < g_nfbo_color; i++)
+        if (g_fbo_color[i].fbo == fbo) {
+            int s = klfb_stage_of_tex(g_fbo_color[i].tex);
+            if (s >= 0 && __atomic_fetch_add(&g_stage_via_color, 1, __ATOMIC_RELAXED) == 0)
+                fprintf(stderr, "  [glfb] fb %u resolved to eye stage %d through the "
+                                "colour table — the sixteen-slot eye-FBO map did not "
+                                "have it (counted in the eyemap census)\n", fbo, s);
+            return s;
+        }
     return -1;
 }
 
@@ -4558,6 +4909,93 @@ static void klfb_map_fbo(uint32_t fbo, uint32_t tex) {
     for (int i = 0; i < KLFB_FBO_MAP; i++)
         if (!g_fbo_stage[i].fbo) { g_fbo_stage[i].fbo = fbo;
                                    g_fbo_stage[i].tex = tex; return; }
+    // Full. Not fatal — klfb_stage_of_fbo falls back to g_fbo_color — but
+    // counted, because it is how a re-created swapchain used to lose every
+    // frame it drew.
+    if (__atomic_fetch_add(&g_map_full, 1, __ATOMIC_RELAXED) == 0)
+        fprintf(stderr, "  [glfb] eye-FBO map full (%d slots) at fb %u — the stage "
+                        "lookup falls back to the colour table\n", KLFB_FBO_MAP, fbo);
+}
+
+// Forgetting, which is the half that was missing.
+//
+// kl_glfb_note_eye_texture drops a stale (eye, stage) when a NAME is
+// re-registered, but nothing dropped one when the storage was DESTROYED, and
+// nothing ever gave back an FBO slot. Between ovrp_DestroyEyeTexture and the
+// next ovrp_SetupEyeTexture2 there is a window six textures wide on a Unity
+// swapchain reconfigure; in it, klfb_stage_of_tex still answers for names that
+// no longer mean anything, and GL hands those names straight back out. And the
+// sixteen FBO slots are filled once per swapchain generation and never
+// reclaimed, so the map saturates after a few reconfigures and stops recording
+// the eye FBOs it exists for.
+//
+// That second half is a visible bug, not just a skewed count. Beat Saber
+// re-creates its eye swapchain at boot and twice more at its main menu
+// (3072x2464 <-> 3686x2957, ~25-35 s in). After the last one the new eye FBOs
+// find no slot, every frame they draw is booked as "drew into no eye stage",
+// klovrp_end_frame_impl drops its record, and the stages stop being filed: the
+// `[cp] stages` serial freezes for two of three stages while the guest keeps
+// rendering, and the compositor warps a picture that keeps getting older — the
+// room shows at the edges on a quick head turn.
+static void klfb_forget_fbo(uint32_t fbo) {
+    if (!fbo) return;
+    for (int i = 0; i < KLFB_FBO_MAP; i++)
+        if (g_fbo_stage[i].fbo == fbo) { g_fbo_stage[i].fbo = 0;
+                                         g_fbo_stage[i].tex = 0; }
+}
+
+// Frees every slot whose attachment is `tex`; returns how many.
+static int klfb_forget_fbo_tex(uint32_t tex) {
+    int n = 0;
+    if (!tex) return 0;
+    for (int i = 0; i < KLFB_FBO_MAP; i++)
+        if (g_fbo_stage[i].tex == tex) { g_fbo_stage[i].fbo = 0;
+                                         g_fbo_stage[i].tex = 0; n++; }
+    __atomic_fetch_add(&g_map_freed, (uint64_t)n, __ATOMIC_RELAXED);
+    return n;
+}
+
+// `released` is the GL name whose storage is going away, or 0 when the caller
+// cannot say. The registration is only dropped when it still names THAT
+// texture: the "replaced with no teardown" backstop in
+// kl_glfb_bind_eye_mtl_texture releases the slot's OLD texture after the new
+// name has already been registered, and clearing unconditionally there would
+// wipe the registration made one line earlier — every frame after it would be
+// unattributable. The ordinary ovrp_DestroyEyeTexture path releases while the
+// slot still holds the old name, where the guard agrees and the clear happens.
+// Returns how many FBO slots the release gave back.
+static int klfb_forget_eye_stage(int eye, int stage, uint32_t released) {
+    if ((unsigned)eye > 1 || (unsigned)stage >= KLFB_MAX_STAGES) return 0;
+    uint32_t tex = g_eye_tex_stage[eye][stage];
+    if (released && tex && tex != released) {
+        __atomic_fetch_add(&g_forget_refused, 1, __ATOMIC_RELAXED);
+        // The FBO rows for the DEAD name are still stale, though, and leaving
+        // them saturates the sixteen slots one generation at a time.
+        return klfb_forget_fbo_tex(released);
+    }
+    g_eye_tex_stage[eye][stage] = 0;
+    // An FBO whose attachment just died is unattributable, not stage-something:
+    // klfb_stage_of_fbo would resolve it through a texture with no stage and
+    // answer -1 anyway, so freeing the slot loses nothing and un-saturates the
+    // map for the swapchain generation that follows.
+    return klfb_forget_fbo_tex(tex);
+}
+
+// The association state, for the exit report and kl_ovrp's periodic report.
+// One line: registered names, slots in use, and the counters above.
+void kl_glfb_eye_map_census(FILE *f) {
+    if (!g_eye_ever) return;     // a guest with no GL eye textures has no map
+    int used = 0;
+    for (int i = 0; i < KLFB_FBO_MAP; i++) used += g_fbo_stage[i].fbo != 0;
+    fprintf(f, "  [eyemap] eye0[%u %u %u] eye1[%u %u %u] | fbo map %d/%d slots | "
+               "%llu freed by releases, %llu full refusals, %llu colour-table "
+               "lookups, %llu releases kept a re-registered slot\n",
+            g_eye_tex_stage[0][0], g_eye_tex_stage[0][1], g_eye_tex_stage[0][2],
+            g_eye_tex_stage[1][0], g_eye_tex_stage[1][1], g_eye_tex_stage[1][2],
+            used, KLFB_FBO_MAP,
+            (unsigned long long)g_map_freed, (unsigned long long)g_map_full,
+            (unsigned long long)g_stage_via_color,
+            (unsigned long long)g_forget_refused);
 }
 
 // --- The observation window -------------------------------------------------
@@ -5156,8 +5594,14 @@ void kl_glfb_release_eye_texture(int eye, int stage) {
             g_eye_mtl[e][stage].slice == g_eye_mtl[eye][stage].slice)
             g_eye_mtl[e][stage] = (typeof(g_eye_mtl[0][0])){0};
     g_eye_mtl[eye][stage] = (typeof(g_eye_mtl[0][0])){0};
+    // ...and the stage attribution that named it — guarded, see
+    // klfb_forget_eye_stage.
+    int freed = klfb_forget_eye_stage(eye, stage, gl_tex);
     fprintf(stderr, "  [glfb] eye=%d stage=%d released (GL texture %u, image %p)\n",
             eye, stage, gl_tex, img);
+    if (freed)
+        fprintf(stderr, "  [glfb] eye=%d stage=%d: %d eye-FBO map slot(s) given back "
+                        "with GL texture %u\n", eye, stage, freed, gl_tex);
 }
 
 // ---------------------------------------------------------------------------
@@ -5747,6 +6191,11 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
     a_glGetIntegerv(0x85B5 /* VERTEX_ARRAY_BINDING */, &s_vao);
     a_glGetIntegerv(0x8894 /* ARRAY_BUFFER_BINDING */, &s_vbo);
     a_glGetIntegerv(0x84E0 /* ACTIVE_TEXTURE */, &s_at);
+    // TEXTURE_BINDING_2D is per UNIT, and the restore below puts it back on
+    // unit 0 — so unit 0 is where it has to be READ. Saving the binding of
+    // whichever unit the guest had selected and restoring it onto unit 0
+    // overwrites unit 0 with another unit's texture, once per eye per frame.
+    r_ActiveTexture(0x84C0 /* TEXTURE0 */);
     a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &s_tex2d);
     a_glGetIntegerv(0x0BA2 /* VIEWPORT */, s_vp);
     a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &s_draw_fb);
@@ -5763,6 +6212,7 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
     r_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, dst_tex, 0);
     if (r_CheckFbStatus && r_CheckFbStatus(0x8CA9) != 0x8CD5) {
         r_BindFramebuffer2(0x8CA9, (uint32_t)s_draw_fb);
+        if (s_at != 0x84C0) r_ActiveTexture((uint32_t)s_at);  // switched above
         return 1;   // let the caller blit instead
     }
 
@@ -7032,6 +7482,18 @@ int kl_glfb_image_bind(void *image) {
     return 1;
 }
 
+// SurfaceTexture names its texture explicitly; preserve the caller's binding.
+int kl_glfb_image_bind_texture(void *image, uint32_t texture) {
+    void (*bind)(uint32_t, uint32_t) = asym("glBindTexture");
+    if (!texture || !bind || !a_glGetIntegerv) return 0;
+    int32_t previous = 0;
+    a_glGetIntegerv(GL_TEXTURE_BINDING_2D_, &previous);
+    bind(GL_TEXTURE_2D_IMG_, texture);
+    int ok = kl_glfb_image_bind(image);
+    bind(GL_TEXTURE_2D_IMG_, (uint32_t)previous);
+    return ok;
+}
+
 void kl_glfb_image_destroy(void *image) {
     klfb_image *im = image;
     if (!kl_glfb_is_image(im)) return;
@@ -7977,9 +8439,15 @@ static int klfb_cimg_on(void) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
         on = !g_angle_copy_image &&
+             // Tetris Effect: Connected (x3386618894743567) is the fourth: its
+             // scenery turned plain purple when looked at — the streamer gives
+             // what is in view more mips, the copy of the resident ones failed —
+             // and green and textured again when it left the view and the
+             // texture shrank back (owner, headset, 2026-10-13).
              kl_env_on("KL_GLFB_COPYIMAGE_EMU", t && (strcmp(t, "x2897337400373711") == 0 ||
                                                       strcmp(t, "x3484270071659289") == 0 ||
-                                                      strcmp(t, "x6963344583787383") == 0));
+                                                      strcmp(t, "x6963344583787383") == 0 ||
+                                                      strcmp(t, "x3386618894743567") == 0));
         if (on) fprintf(stderr, "  [glfb] glCopyImageSubData emulated (compressed "
                                 "uploads shadowed on the CPU)\n");
     }
@@ -10319,6 +10787,12 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glBindBufferRange", (void *)klfb_BindBufferRange, (void **)&g_real_BindBufferRange},
     {"glDispatchCompute", (void *)klfb_DispatchCompute, (void **)&g_res_sink},
     {"glMemoryBarrier",   (void *)klfb_MemoryBarrier,   (void **)&g_res_sink},
+    // the other way a program gets linked, and the only one that was silent
+    {"glProgramBinary", (void *)klfb_ProgramBinary, (void **)&g_real_ProgramBinary},
+    // the min-filter writes KL_GLFB_NOMIP can demote (glTexParameteri has its own row)
+    {"glTexParameterf", (void *)klfb_TexParameterf, (void **)&g_real_TexParameterf},
+    {"glSamplerParameteri", (void *)klfb_SamplerParameteri, (void **)&g_real_SamplerParameteri},
+    {"glSamplerParameterf", (void *)klfb_SamplerParameterf, (void **)&g_real_SamplerParameterf},
     // the texture storage census — which format the AGX abort follows
     {"glTexStorage2D", (void *)klfb_TexStorage2D, (void **)&g_real_TexStorage2D},
     {"glTexStorage3D", (void *)klfb_TexStorage3D, (void **)&g_real_TexStorage3D},
@@ -10421,20 +10895,55 @@ static int glfb_state_pname(uint32_t p) {
     case 0x8A28:                // UNIFORM_BUFFER_BINDING
     case 0x88ED: case 0x88EF:   // PIXEL_PACK / PIXEL_UNPACK_BUFFER_BINDING
     case 0x8F36: case 0x8F37:   // COPY_READ / COPY_WRITE_BUFFER_BINDING
+    // The rest of the save/restore set a guest brackets a pass with. A zero
+    // here is not a missing answer but a WRONG one, and it does its damage on
+    // the restore: GL_ZERO is a valid blend factor, so a guest that saves
+    // BLEND_SRC/DST_RGB around a quad and puts them back gets
+    // glBlendFunc(GL_ZERO, GL_ZERO), and everything it draws afterwards blends
+    // to black (the Simpsons Hit & Run VR port's HUD minimap). The equations
+    // and the depth/cull enums are the same family. All are ES 3.0 state that
+    // ANGLE's context accepts.
+    case 0x80C8: case 0x80C9:   // BLEND_DST_RGB, BLEND_SRC_RGB
+    case 0x80CA: case 0x80CB:   // BLEND_DST_ALPHA, BLEND_SRC_ALPHA
+    case 0x0BE0: case 0x0BE1:   // BLEND_DST, BLEND_SRC (ES 1.x names, same state)
+    case 0x8009: case 0x883D:   // BLEND_EQUATION_RGB, BLEND_EQUATION_ALPHA
+    case 0x0B74: case 0x0B45:   // DEPTH_FUNC, CULL_FACE_MODE
+    case 0x0B71: case 0x0BE2:   // DEPTH_TEST, BLEND (as integers)
         return 1;
     }
     return 0;
 }
 
+// The pnames that stop being ours the moment an extension is adopted from the
+// backend. Each is a question ABOUT that extension, so the driver that answered
+// "I have it" is the only thing that can answer "and here is what it costs".
+// Our tables say 0 to all three, and a guest reading a maximum anisotropy of 0
+// turns anisotropy straight back off.
+static int glfb_backend_ext_pname(uint32_t pname) {
+    if (kl_gl_cap_adopted_extension_count() == 0) return 0;
+    return pname == 0x84FF /* MAX_TEXTURE_MAX_ANISOTROPY_EXT */
+        || pname == 0x86A2 /* NUM_COMPRESSED_TEXTURE_FORMATS */
+        || pname == 0x86A3 /* COMPRESSED_TEXTURE_FORMATS     */;
+}
+
 static void klfb_GetIntegerv(uint32_t pname, int32_t *params) {
-    if (glfb_state_pname(pname)) {
+    if (glfb_state_pname(pname) || glfb_backend_ext_pname(pname)) {
         if (g_real_GetIntegerv) g_real_GetIntegerv(pname, params);
         return;
     }
     if (kl_gl_cap_integerv(pname, params)) return;
     // Same contract as the null driver: named, not guessed — and crucially
     // no GL error set, which forwarding to the ES 3.0 context would do.
-    fprintf(stderr, "  [glfb] glGetIntegerv: unhandled pname 0x%x (kept ours)\n", pname);
+    //
+    // Said ONCE per pname: a guest that asks every draw asks a hundred thousand
+    // times a session, and an unthrottled line here buries the rest of the log.
+    static uint32_t said[64]; static int said_n;
+    int seen = 0;
+    for (int i = 0; i < said_n; i++) if (said[i] == pname) { seen = 1; break; }
+    if (!seen) {
+        { int n = said_n; if (n < (int)(sizeof said / sizeof said[0])) { said[n] = pname; said_n = n + 1; } }
+        fprintf(stderr, "  [glfb] glGetIntegerv: unhandled pname 0x%x (kept ours; said once)\n", pname);
+    }
     if (params) params[0] = 0;
 }
 static void klfb_GetFloatv(uint32_t pname, float *data) {

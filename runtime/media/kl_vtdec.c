@@ -84,7 +84,7 @@ struct kl_vtdec {
     klvt_frame ring[KLVT_RING];
     int ring_head, ring_count;
 
-    unsigned n_submitted, n_decoded, n_dropped, n_failed;
+    unsigned n_submitted, n_decoded, n_dropped, n_failed, n_taken;
     // Parameter-set bookkeeping. Separated because they answer different
     // questions: how often the host re-describes the stream (n_set_change),
     // how often that description is genuinely new (n_fmt_built), and how often
@@ -577,6 +577,7 @@ int kl_vtdec_submit(kl_vtdec *d, const uint8_t *annexb, size_t len,
     pthread_mutex_unlock(&d->lock);
 
     if (st != noErr) {
+        pthread_mutex_lock(&d->lock); d->n_failed++; pthread_mutex_unlock(&d->lock);
         fprintf(stderr, "  [vtdec] decode submit failed: OSStatus %d\n", (int)st);
         return -1;
     }
@@ -593,6 +594,7 @@ CVPixelBufferRef kl_vtdec_pull(kl_vtdec *d, int64_t *pts_us_out) {
         d->ring[d->ring_head].pb = NULL;
         d->ring_head = (d->ring_head + 1) % KLVT_RING;
         d->ring_count--;
+        d->n_taken++;
     }
     pthread_mutex_unlock(&d->lock);
     return pb;                  // the caller now owns the retain taken in klvt_output
@@ -607,8 +609,27 @@ void kl_vtdec_flush(kl_vtdec *d) {
         d->ring[d->ring_head].pb = NULL;
         d->ring_head = (d->ring_head + 1) % KLVT_RING;
         d->ring_count--;
+        d->n_taken++;
     }
     pthread_mutex_unlock(&d->lock);
+}
+
+void kl_vtdec_flush_playback(kl_vtdec *d) {
+    if (!d) return;
+    if (d->sess) {
+        VTDecompressionSessionFinishDelayedFrames(d->sess);
+        VTDecompressionSessionWaitForAsynchronousFrames(d->sess);
+    }
+    kl_vtdec_flush(d);
+}
+
+unsigned kl_vtdec_pending(const kl_vtdec *d) {
+    if (!d) return 0;
+    pthread_mutex_lock((pthread_mutex_t *)&d->lock);
+    unsigned retired=d->n_taken+d->n_dropped+d->n_failed;
+    unsigned pending=d->n_submitted>retired ? d->n_submitted-retired : 0;
+    pthread_mutex_unlock((pthread_mutex_t *)&d->lock);
+    return pending;
 }
 
 void kl_vtdec_stats(const kl_vtdec *d, unsigned *submitted, unsigned *decoded,

@@ -122,8 +122,8 @@ enum AlyxQuality: Int, CaseIterable, Identifiable {
         }
     }
     static var note: String {
-        klT("How many pixels the game draws. Larger is sharper and slower; “Maximum” can run out of memory in big scenes.",
-            "Wie viele Bildpunkte das Spiel zeichnet. Größer ist schärfer und langsamer; „Maximal“ kann in großen Szenen den Speicher sprengen.")
+        klT("How many pixels the game draws. Larger is sharper, slower and takes more memory.",
+            "Wie viele Bildpunkte das Spiel zeichnet. Größer ist schärfer, langsamer und braucht mehr Speicher.")
     }
 
     /// The render target scale for this choice, as the table spells it: the
@@ -172,7 +172,7 @@ enum AlyxQuality: Int, CaseIterable, Identifiable {
         // `object(forKey:)` rather than `integer(forKey:)`: a key that was never
         // written reads as 0, which is Smooth, not the default.
         guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
-              let q = AlyxQuality(rawValue: n) else { return .balanced }
+              let q = AlyxQuality(rawValue: n) else { return AlyxPreset.balanced.dials.quality }
         return q
     }
 }
@@ -181,10 +181,10 @@ enum AlyxEdges: Int, CaseIterable, Identifiable {
     case two = 2, four = 4
 
     static let storageKey = "alyx.msaa"
-    /// Four, as the game ships and as the pipeline list that is compiled
-    /// before the game starts was recorded: of its 3,030 graphics pipelines
-    /// 1,585 are for four samples and 552 for two.
-    static let standard = AlyxEdges.four
+    /// What a fresh install runs with: the Balanced preset's (AlyxPreset). The
+    /// pipeline list that is compiled before the game starts holds both — of
+    /// its graphics pipelines 1,585 are for four samples and 552 for two.
+    static var standard: AlyxEdges { AlyxPreset.balanced.dials.edges }
     var id: Int { rawValue }
 
     var title: String { self == .two ? "2x" : "4x" }
@@ -209,7 +209,7 @@ enum AlyxView: Int, CaseIterable, Identifiable {
     case full, trimmed
 
     static let storageKey = "alyx.view"
-    static let standard = AlyxView.trimmed
+    static var standard: AlyxView { AlyxPreset.balanced.dials.view }
     /// As the settings window lists them: the lightest first, the costliest last.
     static let ordered: [AlyxView] = [.trimmed, .full]
     var id: Int { rawValue }
@@ -230,43 +230,52 @@ enum AlyxView: Int, CaseIterable, Identifiable {
 }
 
 enum AlyxFoveation: Int, CaseIterable, Identifiable {
-    case off, on, strong
+    case off, on, strong, strongest
 
     static let storageKey = "alyx.foveation"
-    /// What a fresh install runs with: the Balanced preset's (AlyxPreset),
-    /// about half the pixels shaded.
-    static let standard = AlyxFoveation.strong
+    /// What a fresh install runs with: the Balanced preset's (AlyxPreset).
+    static var standard: AlyxFoveation { AlyxPreset.balanced.dials.foveation }
     /// As the settings window lists them: the lightest first, the costliest last.
-    static let ordered: [AlyxFoveation] = [.strong, .on, .off]
+    static let ordered: [AlyxFoveation] = [.strongest, .strong, .on, .off]
     var id: Int { rawValue }
 
     var title: String {
         switch self {
-        case .off:    return "Off"
-        case .on:     return "Mild"
-        case .strong: return "Strong"
+        case .off:       return "Off"
+        case .on:        return "Mild"
+        case .strong:    return "Strong"
+        case .strongest: return "Strongest"
         }
     }
 
     var name: String {
         switch self {
-        case .off:    return klT("Off", "Aus")
-        case .on:     return klT("Mild", "Leicht")
-        case .strong: return klT("Strong", "Stark")
+        case .off:       return klT("Off", "Aus")
+        case .on:        return klT("Mild", "Leicht")
+        case .strong:    return klT("Strong", "Stark")
+        case .strongest: return klT("Strongest", "Sehr stark")
         }
     }
     static var note: String {
-        klT("Keeps the middle of the picture sharp and draws its edge more coarsely. “Strong” saves the most; the edge then looks softer when you look at it.",
-            "Hält die Bildmitte scharf und zeichnet den Rand gröber. „Stark“ spart am meisten; der Rand wirkt dann weicher, wenn man hinsieht.")
+        klT("Keeps the middle of the picture sharp and draws its edge more coarsely. “Strongest” saves the most – about three quarters of the work – and the edge then looks soft when you look at it.",
+            "Hält die Bildmitte scharf und zeichnet den Rand gröber. „Sehr stark“ spart am meisten – rund drei Viertel der Arbeit –, der Rand wirkt dann weich, wenn man hinsieht.")
     }
 
     /// KL_VK_FOVEATE and KL_VK_FOVEATE_INNER: the rate at the widest edge of
     /// the cone, and the tangent out to which the rate stays 1.
-    var knobs: (edge: String, inner: String)? {
+    var knobs: (edge: String, inner: String, outer: String?)? {
         switch self {
         case .off:    return nil
-        case .on:     return ("0.3", "0.30")
-        case .strong: return ("0.15", "0.20")
+        case .on:     return ("0.3", "0.30", nil)
+        case .strong: return ("0.15", "0.20", nil)
+        // 2026-10-13. The first version of this step only lowered
+        // the two numbers (0.10 at the edge, sharp to tan 0.14) and shaded 48%
+        // of the scene pass's fragments where "Strong" shades 54% — "ich habe
+        // auch bei sehr hohem Foveated rendering nicht das gefühl dass es an
+        // ist". What makes a step is where the fall ENDS: here the lowest rate
+        // is reached at tan 0.70, 35 degrees from straight ahead, instead of at
+        // the edge of view at 52, and everything beyond is drawn at it.
+        case .strongest: return ("0.15", "0.14", "0.70")
         }
     }
 
@@ -289,7 +298,7 @@ enum AlyxOutput: Int, CaseIterable, Identifiable {
 
     static let storageKey = "alyx.output"
     /// What a fresh install runs with (`standard` is one of the cases here).
-    static let initial = AlyxOutput.light
+    static var initial: AlyxOutput { AlyxPreset.balanced.dials.output }
     /// As the settings window lists them: the lightest first, the costliest last.
     static let ordered: [AlyxOutput] = [.light, .standard, .full]
     var id: Int { rawValue }
@@ -327,6 +336,162 @@ enum AlyxOutput: Int, CaseIterable, Identifiable {
               let v = AlyxOutput(rawValue: n) else { return initial }
         return v
     }
+}
+
+/// The performance trials of 2026-10-13, and what became of them: the cadence,
+/// the effects and the texture budget are dials of the presets (AlyxPreset), the
+/// readout and the depth samples are switches under "More", and the automatic
+/// picture size and the exposure meter's copy are a launch's to name.
+///
+/// What the two runs of that day measured, in a level at "Balanced": the game
+/// is bound by the graphics chip, a frame takes 10.9-12 ms against the panel's
+/// 10, so a new picture lands on the next refresh most of the time and on the
+/// one after it every so often; the system called the device "fair" after 40
+/// seconds and halved the app's display rate a little later.
+///
+/// - Cadence: every refresh (as before), or every second one — an even 50
+///   pictures a second with the chip idle for part of each (KL_GUEST_PACE_DIV,
+///   kl_app.c). Glovebox runs the game the second way.
+/// - Automatic picture size: the engine's own controller is switched on again
+///   and walks a ladder that ends at the chosen size, to fit the frame time it
+///   is told — one refresh, or two with the half cadence. The targets are
+///   allocated for the top of the ladder, which is the chosen size, so this
+///   costs no memory. (The controller was switched off because with Valve's
+///   ladder and a budget of one refresh it sat at the bottom; that is still
+///   what a budget of one refresh buys here — a small picture at the full rate.)
+/// - Fewer effects: bloom and ambient occlusion off, the two things in the
+///   ladder's table that are passes of their own.
+/// - Readout: frames a second, display rate, GPU time and thermal state as a
+///   line at the lower left of the view (KleptonCompositor's stats card).
+enum AlyxCadence: Int, CaseIterable, Identifiable {
+    case every = 1, second = 2
+
+    static let storageKey = "alyx.cadence"
+    var id: Int { rawValue }
+
+    var name: String {
+        self == .every ? klT("Every refresh", "Jedes Bild") : klT("Every second refresh", "Jedes zweite Bild")
+    }
+    static var note: String {
+        klT("“Every second refresh” draws an even 50 pictures a second and leaves the graphics chip time to cool; “Every refresh” draws as many as it manages, which is uneven when a picture takes a little too long.",
+            "„Jedes zweite Bild“ zeichnet gleichmäßig 50 Bilder pro Sekunde und lässt dem Grafikchip Zeit zum Abkühlen; „Jedes Bild“ zeichnet so viele, wie es schafft – ungleichmäßig, wenn ein Bild etwas zu lange braucht.")
+    }
+
+    static var stored: AlyxCadence {
+        if let e = getenv("KL_ALYX_CADENCE"), let v = AlyxCadence(rawValue: Int(atoi(e))) { return v }
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let v = AlyxCadence(rawValue: n) else { return AlyxPreset.balanced.dials.cadence }
+        return v
+    }
+}
+/// The texture budget, chosen instead of derived (2026-10-13: "Kannst
+/// du doch noch die Texturauflösung wählbar machen? … so dass ich auch zB den
+/// wert aus dem Glovebox projekt mal testen kann").
+///
+/// Two numbers decide how sharp surfaces are. The POOL (+r_texture_pool_size,
+/// MB) is how much the texture streamer may hold at once; when it is full the
+/// engine drops the finest levels of the textures it needs least. The CAP
+/// (r_texture_stream_max_resolution) is the finest any one texture is loaded
+/// at. "Automatic" is what the picture size leaves of a fixed sum
+/// (AlyxQuality.texturePoolMB: 1536 MB at the smallest picture, 768 at the
+/// largest) — set when a level's textures grew until the app was ended at its
+/// 8.2 GB. Glovebox runs 2560 MB with a cap of 2048 beside a smaller picture
+/// (2784x2208, 4x) and says a cap of 4096 needs about 3.3 GB of pool.
+///
+/// What a larger pool costs is the memory left before that limit, one for one.
+/// The least a run had left is kept at its end (klAlyxRememberRun) and shown
+/// with the choice: the two runs of that day at the two largest pictures had
+/// 1.75 and 1.9 GB left after a minute each — a minute, not a session.
+enum AlyxTexturePool: Int, CaseIterable, Identifiable {
+    case automatic = 0, mb1024 = 1024, mb1536 = 1536, mb2048 = 2048, mb2560 = 2560, mb3072 = 3072
+
+    static let storageKey = "alyx.texturePool"
+    var id: Int { rawValue }
+    var name: String { self == .automatic ? klT("Automatic", "Automatisch") : "\(rawValue)" }
+
+    static var stored: AlyxTexturePool {
+        if let e = getenv("KL_ALYX_TEXTURE_POOL"), let v = AlyxTexturePool(rawValue: Int(atoi(e))) { return v }
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let v = AlyxTexturePool(rawValue: n) else { return AlyxPreset.balanced.dials.texturePool }
+        return v
+    }
+    /// The pool in MB for this choice beside that picture size.
+    func megabytes(for quality: AlyxQuality) -> Int { self == .automatic ? quality.texturePoolMB : rawValue }
+}
+enum AlyxTextureCap: Int, CaseIterable, Identifiable {
+    case k1 = 1024, k2 = 2048, k4 = 4096
+
+    static let storageKey = "alyx.textureCap"
+    static var standard: AlyxTextureCap { AlyxPreset.balanced.dials.textureCap }
+    var id: Int { rawValue }
+    var name: String { "\(rawValue)" }
+
+    static var stored: AlyxTextureCap {
+        if let e = getenv("KL_ALYX_TEXTURE_CAP"), let v = AlyxTextureCap(rawValue: Int(atoi(e))) { return v }
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let v = AlyxTextureCap(rawValue: n) else { return standard }
+        return v
+    }
+}
+/// What the last run left of the app's memory at its tightest, and the pool it ran with.
+let klAlyxLastLeftKey = "alyx.lastRun.leastMemoryLeftMB"
+let klAlyxLastPoolKey = "alyx.lastRun.texturePoolMB"
+private var klAlyxPoolThisRun = 0
+func klAlyxRememberRun() {
+    guard klIsAlyx(), klAlyxPoolThisRun > 0 else { return }
+    let left = Int(kl_app_min_avail_mb())
+    guard left > 0 else { return }
+    UserDefaults.standard.set(left, forKey: klAlyxLastLeftKey)
+    UserDefaults.standard.set(klAlyxPoolThisRun, forKey: klAlyxLastPoolKey)
+    UserDefaults.standard.synchronize()
+}
+/// The cap in the game's own video settings file as well: the game reads it
+/// from there at its start, and a line that says otherwise would outrank the
+/// launch argument where the file is applied after it.
+private func klAlyxSetVideoValue(_ key: String, _ value: String) {
+    guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+    let file = docs.appendingPathComponent("lx/game/hlvr/cfg/deckard/video2.txt")
+    guard let data = try? Data(contentsOf: file), let text = String(data: data, encoding: .utf8) else { return }
+    var lines = text.components(separatedBy: "\n")
+    guard let at = lines.firstIndex(where: { $0.contains("\"setting.\(key)\"") }) else { return }
+    let cr = lines[at].hasSuffix("\r") ? "\r" : ""
+    let new = "\t\"setting.\(key)\"\t\t\"\(value)\"" + cr
+    guard lines[at] != new else { return }
+    lines[at] = new
+    try? lines.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+}
+
+/// Bloom and ambient occlusion, the two effects in the fidelity table that are
+/// render passes of their own: all, or without the two.
+enum AlyxEffects: Int, CaseIterable, Identifiable {
+    case fewer = 0, all = 1
+
+    static let storageKey = "alyx.effects"
+    var id: Int { rawValue }
+    var name: String { self == .all ? klT("All", "Alle") : klT("Fewer", "Weniger") }
+    static var note: String {
+        klT("“Fewer” leaves out the glow around bright lights (bloom) and the soft shadows in corners (ambient occlusion); the picture is a little plainer and the graphics chip has less to do.",
+            "„Weniger“ lässt den Lichtschein um helle Lichter (Bloom) und die weichen Schatten in Ecken (Umgebungsverdeckung) weg; das Bild ist etwas schlichter und der Grafikchip hat weniger zu tun.")
+    }
+
+    static var stored: AlyxEffects {
+        if let e = getenv("KL_ALYX_FEWER_EFFECTS") { return atoi(e) != 0 ? .fewer : .all }
+        guard let n = UserDefaults.standard.object(forKey: storageKey) as? Int,
+              let v = AlyxEffects(rawValue: n) else { return AlyxPreset.balanced.dials.effects }
+        return v
+    }
+}
+let klAlyxStatsKey = "alyx.stats"
+/// Two more, in the Vulkan layer (runtime/gfx/kl_vulkan.c has both stories):
+/// the scene pass's multisampled depth in tile memory instead of real memory
+/// (KL_VK_MSAA_MEMORYLESS, about 165 MB at "Balanced"), and the copy of the
+/// scene's colour samples that the exposure meter reads written every eighth
+/// frame instead of every frame (KL_VK_METER_STORE_EVERY, about 330 MB a frame).
+let klAlyxLeanDepthKey = "alyx.leanDepth"
+private func klAlyxSwitch(_ key: String?, env: String, standard: Bool) -> Bool {
+    if let e = getenv(env) { return atoi(e) != 0 }
+    guard let key, let v = UserDefaults.standard.object(forKey: key) as? Bool else { return standard }
+    return v
 }
 
 /// How fast the player moves with the stick ("continuous" movement): the
@@ -472,7 +637,7 @@ private func klAlyxSetVoicePath(_ wanted: Bool) -> Bool {
 /// game's directory is not there yet (nothing staged), which is a start that
 /// fails for that reason and not this one.
 @discardableResult
-private func klAlyxWriteLadder(scale: String, samples: Int) -> Bool {
+private func klAlyxWriteLadder(scale: String, samples: Int, ladder: Bool = false, effects: Bool = true) -> Bool {
     guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
     else { return false }
     let dir = docs.appendingPathComponent("lx/game/hlvr")
@@ -497,8 +662,14 @@ private func klAlyxWriteLadder(scale: String, samples: Int) -> Bool {
           + "vr_single_light_fast_path_sun_cascade_0_texels_per_world,"
           + "vr_single_light_fast_path_sun_cascade_1_texels_per_world,"
           + (spot ? "" : "sc_disable_spotlight_shadows,") + "\n"
+    // One scale in every row — or, for the engine's own controller, a ladder
+    // from the smallest picture up to that scale. Its top is what the targets
+    // are allocated for either way.
+    let top = Double(scale) ?? 1.0, bottom = min(0.78, top)
+    let fx = effects ? "1,1" : "0,0"
     for level in 0...8 {
-        t += "\(level),\(level == 5 ? "1" : ""),\(samples),\(scale),,,,1,1,0,3,0,\(spot ? "" : "1,")\n"
+        let rung = ladder ? String(format: "%.2f", bottom + (top - bottom) * Double(level) / 8.0) : scale
+        t += "\(level),\(level == 5 ? "1" : ""),\(samples),\(rung),,,,\(fx),0,3,0,\(spot ? "" : "1,")\n"
     }
     t += "end,,,,,,,,,,,,\(spot ? "" : ",")\n"
     do {
@@ -529,7 +700,25 @@ private func klAlyxWriteLadder(scale: String, samples: Int) -> Bool {
 /// it is written whole, without the mark — the game may replace it at that
 /// first start, and the next one then finds a file to put the values into.
 /// KL_ALYX_DETAIL=0 leaves the file alone.
+///
+/// The game keeps the file only while the GPU ids at its head are the running
+/// GPU's; kl_app.c puts them there at every start (alyx_video_gpu_ids), so the
+/// file written whole here is the one the game reads at its first start, and a
+/// system update does not cost the values.
+///
+/// A value added later is a set of its own with its own mark, put in once
+/// where the first set was put in long ago. The second set is the texture
+/// streamer's floor: when the texture pool is full the engine scales every
+/// texture request down, to no less than this. The game's own 0.8 softens all
+/// textures and sharpens them again each time the pool fills, which reads as
+/// pop-in; at 1.0 it drops the least needed mip levels instead (Glovebox's
+/// measurement on a Mac, 2026-10-12: 16.4 pop-ins a minute against 22.9, and
+/// its setting since 0.1.5). Not yet compared on a headset here.
 private let klAlyxDetailKey = "alyx.detailSettings"
+private let klAlyxDetail2Key = "alyx.detailSettings.2"
+private let klAlyxDetail2: [(String, String)] = [
+    ("r_texture_stream_resolution_bias_min", "1.000000"),
+]
 private let klAlyxDetail: [(String, String)] = [
     ("r_particle_max_detail_level", "1"), ("r_particle_max_draw_distance", "10000"),
     ("cl_particle_fallback_base", "1"), ("vr_enable_cached_lights", "1"),
@@ -586,14 +775,16 @@ private let klAlyxVideoFile = """
 \t"setting.vr_hidden_pixels_use_depth"\t\t"1"
 \t"setting.r_texturefilteringquality"\t\t"4"
 \t"setting.r_texture_stream_max_resolution"\t\t"2048"
-\t"setting.r_texture_stream_resolution_bias_min"\t\t"0.8"
+\t"setting.r_texture_stream_resolution_bias_min"\t\t"1.000000"
 \t"setting.vr_perf_mode_override2"\t\t"2"
 }
 
 """
 private func klAlyxApplyDetail() -> String {
     if let e = getenv("KL_ALYX_DETAIL"), atoi(e) == 0 { return "left alone (KL_ALYX_DETAIL=0)" }
-    if UserDefaults.standard.bool(forKey: klAlyxDetailKey) { return "the game's own (set once before)" }
+    let sets = [(klAlyxDetailKey, klAlyxDetail), (klAlyxDetail2Key, klAlyxDetail2)]
+        .filter { !UserDefaults.standard.bool(forKey: $0.0) }
+    if sets.isEmpty { return "the game's own (set once before)" }
     guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
     else { return "not set (no Documents)" }
     let game = docs.appendingPathComponent("lx/game/hlvr")
@@ -606,9 +797,10 @@ private func klAlyxApplyDetail() -> String {
             return "written whole (the game had no file yet)"
         } catch { return "NOT written: \(error.localizedDescription)" }
     }
+    let values = sets.flatMap { $0.1 }
     var lines = text.components(separatedBy: "\n")
     var set = 0, missing: [String] = []
-    for (key, value) in klAlyxDetail {
+    for (key, value) in values {
         guard let at = lines.firstIndex(where: { $0.contains("\"setting.\(key)\"") }) else { missing.append(key); continue }
         let cr = lines[at].hasSuffix("\r") ? "\r" : ""
         let new = "\t\"setting.\(key)\"\t\t\"\(value)\"" + cr
@@ -618,15 +810,15 @@ private func klAlyxApplyDetail() -> String {
     if !missing.isEmpty, let close = lines.lastIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "}" }) {
         let cr = lines[close].hasSuffix("\r") ? "\r" : ""
         for key in missing.reversed() {
-            let value = klAlyxDetail.first { $0.0 == key }!.1
+            let value = values.first { $0.0 == key }!.1
             lines.insert("\t\"setting.\(key)\"\t\t\"\(value)\"" + cr, at: close)
             set += 1
         }
     }
     do {
         if set > 0 { try lines.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8) }
-        UserDefaults.standard.set(true, forKey: klAlyxDetailKey)
-        return "\(set) of \(klAlyxDetail.count) value(s) put into the game's file"
+        for (key, _) in sets { UserDefaults.standard.set(true, forKey: key) }
+        return "\(set) of \(values.count) value(s) put into the game's file"
     } catch { return "NOT written: \(error.localizedDescription)" }
 }
 
@@ -666,9 +858,11 @@ private func klThermalName(_ s: ProcessInfo.ThermalState) -> String {
 func klWatchThermalState() {
     guard klThermalObserver == nil else { return }
     NSLog("[app] thermal state: \(klThermalName(ProcessInfo.processInfo.thermalState))")
+    kl_app_note_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
     klThermalObserver = NotificationCenter.default.addObserver(
         forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: nil) { _ in
         NSLog("[app] thermal state -> \(klThermalName(ProcessInfo.processInfo.thermalState))")
+        kl_app_note_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
     }
 }
 
@@ -685,9 +879,21 @@ func klAlyxLoadingScreens() -> Bool {
     UserDefaults.standard.object(forKey: klAlyxLoadingKey) as? Bool ?? true
 }
 
+/// The texture streamer's floor (klAlyxDetail2) and a pool that stays the size
+/// it was given, as launch arguments beside the video settings file: the file
+/// is the player's to change in the game's Options, where Textures Low and
+/// Medium set 0.5 and 0.8 again; the arguments are this start's. The pool's
+/// size is this app's own (AlyxQuality.texturePoolMB) — Glovebox's 2560 MB
+/// belongs to its smaller picture. KL_ALYX_TEX_FLOOR=0 leaves both out.
+private func klAlyxTextureFloorArguments() -> String {
+    if let e = getenv("KL_ALYX_TEX_FLOOR"), atoi(e) == 0 { return "" }
+    return " +r_texture_stream_resolution_bias_min 1.0 +r_texture_budget_dynamic 0"
+}
+
 func klAlyxApply() {
     guard klIsAlyx() else { return }
     klWatchThermalState()
+    klAlyxMigrateDials()
     let q = AlyxQuality.stored
     // The game's loading screen, where it waits for the trigger once a level
     // is ready. Off, the game is told to go on by itself.
@@ -697,12 +903,36 @@ func klAlyxApply() {
     let language = AlyxLanguage.stored
     let voices = language.voiceArchive != nil && AlyxLanguage.voicesWanted
     let voicePath = klAlyxSetVoicePath(voices)
+    // The texture budget (see AlyxTexturePool).
+    let poolMB = AlyxTexturePool.stored.megabytes(for: q)
+    let textureCap = AlyxTextureCap.stored
+    klAlyxPoolThisRun = poolMB
+    let cadence = AlyxCadence.stored
+    // Two of the trials did not earn a place in the window and are a launch's
+    // to name: the engine's own size controller only ever made the picture
+    // smaller ("geht gefühlt nur ins schlechte" — three sizes down in two
+    // minutes, none up), and storing the exposure meter's copy less often
+    // measured as nothing (KL_VK_METER_STORE_AB, ±1 ms either way).
+    let autoSize = klAlyxSwitch(nil, env: "KL_ALYX_AUTO_SIZE", standard: false)
+    let fewerEffects = AlyxEffects.stored == .fewer
+    if cadence != .every { setenv("KL_GUEST_PACE_DIV", "\(cadence.rawValue)", 0) }
+    // The frame time the engine's controller is to fit: one refresh of the
+    // mixed space's 100 Hz, or two. Without the controller the engine keeps the
+    // 60 it was told before (kl_driver.c), which only describes the display.
+    if autoSize { setenv("KL_DISPLAY_HZ", cadence == .every ? "100" : "50", 0) }
+    if klAlyxSwitch(klAlyxStatsKey, env: "KL_ALYX_STATS", standard: false) { setenv("KL_STATS_CARD", "1", 0) }
+    let leanDepth = klAlyxSwitch(klAlyxLeanDepthKey, env: "KL_ALYX_LEAN_DEPTH", standard: true)
+    let leanMeter = klAlyxSwitch(nil, env: "KL_ALYX_LEAN_METER", standard: false)
+    if leanDepth { setenv("KL_VK_MSAA_MEMORYLESS", "1", 0) }
+    if leanMeter { setenv("KL_VK_METER_STORE_EVERY", "8", 0) }
     setenv("KL_LX_ARGS_EXTRA",
-           "+vr_fidelity_level_auto 0 +vr_fidelity_level \(q.fidelityLevel) "
-           + "+r_texture_pool_size \(q.texturePoolMB)"
+           (autoSize ? "+vr_fidelity_level_auto 1 "
+                     : "+vr_fidelity_level_auto 0 +vr_fidelity_level \(q.fidelityLevel) ")
+           + "+r_texture_pool_size \(poolMB) +r_texture_stream_max_resolution \(textureCap.rawValue)"
            // Textures come in at twice the engine's pace, as in Glovebox's
            // settings: fewer moments in which a surface is still coarse.
            + " +r_texture_stream_throttle_count 6 +r_texture_stream_throttle_amount 20"
+           + klAlyxTextureFloorArguments()
            + AlyxPace.stored.arguments
            + (loading ? "" : " +hlvr_auto_dismiss_loading 1")
            + (language == .english ? "" : " -language \(language.engineName)"), 0)
@@ -716,6 +946,7 @@ func klAlyxApply() {
     if let k = fov.knobs {
         setenv("KL_VK_FOVEATE", k.edge, 0)
         setenv("KL_VK_FOVEATE_INNER", k.inner, 0)
+        if let outer = k.outer { setenv("KL_VK_FOVEATE_OUTER", outer, 0) }
     }
     let output = AlyxOutput.stored
     setenv("KL_CP_QUALITY", output.quality, 0)
@@ -723,14 +954,113 @@ func klAlyxApply() {
     setenv("KL_CP_EYE_AT_FULL", "1", 0)
     NSLog("[app] Alyx output: \(output.title) (compositor quality \(output.quality))")
     let edges = AlyxEdges.stored
-    let wrote = klAlyxWriteLadder(scale: q.scale, samples: edges.rawValue)
+    let wrote = klAlyxWriteLadder(scale: q.scale, samples: edges.rawValue, ladder: autoSize, effects: !fewerEffects)
+    NSLog("[app] Alyx: cadence \(cadence == .every ? "every refresh" : "every second refresh"), picture size \(autoSize ? "automatic up to \(q.scale)" : "fixed"), effects \(fewerEffects ? "fewer (no bloom, no ambient occlusion)" : "all"), depth samples \(leanDepth ? "in tile memory" : "in real memory"), exposure meter's copy \(leanMeter ? "every 8th frame" : "every frame")")
     NSLog("[app] Alyx detail settings: \(klAlyxApplyDetail())")
+    klAlyxSetVideoValue("r_texture_stream_max_resolution", "\(textureCap.rawValue)")
+    NSLog("[app] Alyx textures: pool \(poolMB) MB (\(AlyxTexturePool.stored == .automatic ? "automatic for this picture size" : "chosen")), finest texture \(textureCap.rawValue)")
+    // The same choices in one line for the game's own log (kl_app.c prints it
+    // at the start): NSLog goes to the system's log, which a log fetched from
+    // the headset afterwards does not contain — and a run is read by its log.
+    setenv("KL_APP_SETTINGS",
+           "picture \(q.title), edges \(edges.title), view \(view.title), foveation \(fov.title), output \(output.title); "
+           + "cadence \(cadence == .every ? "every refresh" : "every second refresh"), picture size \(autoSize ? "automatic" : "fixed"), "
+           + "effects \(fewerEffects ? "fewer" : "all"), depth \(leanDepth ? "in tile memory" : "in real memory"), "
+           + "meter's copy \(leanMeter ? "every 8th frame" : "every frame"); texture pool \(poolMB) MB, finest texture \(textureCap.rawValue)", 1)
     klAlyxMovePipelineFolder()
     NSLog("[app] Alyx picture: \(q.title), edges \(edges.title), view \(view.title), foveation \(fov.title)\(wrote ? "" : " (table NOT written)"), language \(language.title) with \(voices ? "staged" : "the game's own") voices\(voicePath ? "" : " (gameinfo.gi NOT written)") — KL_LX_ARGS_EXTRA=\(String(cString: getenv("KL_LX_ARGS_EXTRA")))")
 }
 
+/// Which Vision Pro this is, as far as the presets care: the one with the M5
+/// (model "RealityDevice17,1") or a later one, or the first, with the M2
+/// ("RealityDevice14,1"). The Balanced and Sharp presets of 2026-10-13 were
+/// found on an M5 — the largest picture at 50 pictures a second. The M2 has
+/// the same presets with the picture one size smaller (his word that evening:
+/// "Bei M2 genau so aber vielleicht mit einer stufe auflösung weniger"); nobody
+/// has run them there yet. KL_ALYX_FAST_DEVICE=0|1 overrides.
+enum AlyxDevice {
+    static let fast: Bool = {
+        if let e = getenv("KL_ALYX_FAST_DEVICE") { return atoi(e) != 0 }
+        var size = 0
+        sysctlbyname("hw.machine", nil, &size, nil, 0)
+        var raw = [CChar](repeating: 0, count: max(size, 1))
+        sysctlbyname("hw.machine", &raw, &size, nil, 0)
+        let model = String(cString: raw)                    // "RealityDevice17,1"
+        let digits = model.drop { !$0.isNumber }.prefix { $0.isNumber }
+        guard let major = Int(digits) else { return false }  // unknown: the careful set
+        return major >= 17
+    }()
+}
+
+/// Everything a preset decides.
+struct AlyxDials: Equatable {
+    var quality: AlyxQuality
+    var edges: AlyxEdges
+    var view: AlyxView
+    var foveation: AlyxFoveation
+    var output: AlyxOutput
+    var cadence: AlyxCadence
+    var effects: AlyxEffects
+    var texturePool: AlyxTexturePool
+    var textureCap: AlyxTextureCap
+}
+
+/// Carries what an installation had chosen before the presets grew from five
+/// dials to nine (2026-10-13), once. Nothing stored: nothing to do, the new
+/// Balanced applies. One of the three presets as they were, and "Custom" not
+/// chosen: the preset of that name as it is now — whoever picked "Balanced"
+/// has what somebody who never opened the page has. Anything else is somebody's
+/// own set and stays exactly what it was: the five dials are written out (so a
+/// dial left at its old default does not follow the new one), and the four new
+/// ones are what the game did before they existed.
+func klAlyxMigrateDials() {
+    let d = UserDefaults.standard
+    let versionKey = "alyx.dials.version"
+    guard d.integer(forKey: versionKey) < 2 else { return }
+    defer { d.set(2, forKey: versionKey) }
+    let five = [AlyxQuality.storageKey, AlyxEdges.storageKey, AlyxView.storageKey,
+                AlyxFoveation.storageKey, AlyxOutput.storageKey]
+    let four = [AlyxCadence.storageKey, AlyxEffects.storageKey, AlyxTexturePool.storageKey, AlyxTextureCap.storageKey]
+    // The test builds of that day wrote the effects as a switch of their own.
+    if let fewer = d.object(forKey: "alyx.fewerEffects") as? Bool, d.object(forKey: AlyxEffects.storageKey) == nil {
+        d.set((fewer ? AlyxEffects.fewer : .all).rawValue, forKey: AlyxEffects.storageKey)
+    }
+    guard (five + four).contains(where: { d.object(forKey: $0) != nil }) else { return }
+    func was(_ key: String, _ standard: Int) -> Int { d.object(forKey: key) as? Int ?? standard }
+    // The five as they were, with the defaults they had.
+    let old = [was(AlyxQuality.storageKey, AlyxQuality.balanced.rawValue), was(AlyxEdges.storageKey, AlyxEdges.four.rawValue),
+               was(AlyxView.storageKey, AlyxView.trimmed.rawValue), was(AlyxFoveation.storageKey, AlyxFoveation.strong.rawValue),
+               was(AlyxOutput.storageKey, AlyxOutput.light.rawValue)]
+    let presetsWere: [(AlyxPreset, [Int])] = [
+        (.smooth,   [AlyxQuality.smooth.rawValue, AlyxEdges.two.rawValue, AlyxView.trimmed.rawValue, AlyxFoveation.strong.rawValue, AlyxOutput.light.rawValue]),
+        (.balanced, [AlyxQuality.balanced.rawValue, AlyxEdges.four.rawValue, AlyxView.trimmed.rawValue, AlyxFoveation.strong.rawValue, AlyxOutput.light.rawValue]),
+        (.sharp,    [AlyxQuality.sharp.rawValue, AlyxEdges.four.rawValue, AlyxView.full.rawValue, AlyxFoveation.on.rawValue, AlyxOutput.full.rawValue])]
+    let untouchedFour = !four.contains(where: { d.object(forKey: $0) != nil })
+    var now: AlyxDials
+    if untouchedFour, !d.bool(forKey: "alyx.custom"), let p = presetsWere.first(where: { $0.1 == old })?.0 {
+        now = p.dials
+    } else {
+        now = AlyxDials(quality: AlyxQuality(rawValue: old[0]) ?? .balanced, edges: AlyxEdges(rawValue: old[1]) ?? .four,
+                        view: AlyxView(rawValue: old[2]) ?? .trimmed, foveation: AlyxFoveation(rawValue: old[3]) ?? .strong,
+                        output: AlyxOutput(rawValue: old[4]) ?? .light,
+                        cadence: AlyxCadence(rawValue: was(AlyxCadence.storageKey, AlyxCadence.every.rawValue)) ?? .every,
+                        effects: AlyxEffects(rawValue: was(AlyxEffects.storageKey, AlyxEffects.all.rawValue)) ?? .all,
+                        texturePool: AlyxTexturePool(rawValue: was(AlyxTexturePool.storageKey, 0)) ?? .automatic,
+                        textureCap: AlyxTextureCap(rawValue: was(AlyxTextureCap.storageKey, 2048)) ?? .k2)
+    }
+    d.set(now.quality.rawValue, forKey: AlyxQuality.storageKey)
+    d.set(now.edges.rawValue, forKey: AlyxEdges.storageKey)
+    d.set(now.view.rawValue, forKey: AlyxView.storageKey)
+    d.set(now.foveation.rawValue, forKey: AlyxFoveation.storageKey)
+    d.set(now.output.rawValue, forKey: AlyxOutput.storageKey)
+    d.set(now.cadence.rawValue, forKey: AlyxCadence.storageKey)
+    d.set(now.effects.rawValue, forKey: AlyxEffects.storageKey)
+    d.set(now.texturePool.rawValue, forKey: AlyxTexturePool.storageKey)
+    d.set(now.textureCap.rawValue, forKey: AlyxTextureCap.storageKey)
+}
+
 /// The three ways to play that most people choose between, each a set of the
-/// five dials below. A set of dials that is none of them is "Custom".
+/// dials below. A set of dials that is none of them is "Custom".
 enum AlyxPreset: Int, CaseIterable, Identifiable {
     case smooth, balanced, sharp
     var id: Int { rawValue }
@@ -749,38 +1079,90 @@ enum AlyxPreset: Int, CaseIterable, Identifiable {
             return klT("The highest frame rate: the smallest picture and simpler edge smoothing.",
                        "Die höchste Bildrate: das kleinste Bild und einfachere Kantenglättung.")
         case .balanced:
-            return klT("A sharp centre at a steady frame rate. What a new installation starts with.",
-                       "Scharfe Bildmitte bei ruhiger Bildrate. Damit startet eine neue Installation.")
+            return klT("A large picture with a sharp centre and detailed textures at an even 50 pictures a second; the edge of view is drawn more coarsely and two effects are left out. What a new installation starts with.",
+                       "Ein großes Bild mit scharfer Mitte und feinen Texturen bei gleichmäßigen 50 Bildern pro Sekunde; der Rand des Blickfelds wird gröber gezeichnet und zwei Effekte fallen weg. Damit startet eine neue Installation.")
         case .sharp:
-            return klT("A large picture, sharp to its edge and across the whole field of view. Hands and objects move less smoothly; looking around stays smooth.",
-                       "Ein großes Bild, scharf bis zum Rand und über das ganze Sichtfeld. Hände und Gegenstände bewegen sich weniger flüssig; das Umsehen bleibt flüssig.")
+            return klT("The same large picture, sharp almost to its edge, with all effects and the finest output onto the display. The headset gets warmer and the frame rate holds less well over a long session.",
+                       "Dasselbe große Bild, scharf bis fast zum Rand, mit allen Effekten und der feinsten Ausgabe aufs Display. Das Headset wird wärmer und die Bildrate hält über eine lange Sitzung weniger gut.")
         }
     }
 
-    var dials: (quality: AlyxQuality, edges: AlyxEdges, view: AlyxView, foveation: AlyxFoveation, output: AlyxOutput) {
+    var dials: AlyxDials {
         switch self {
-        // Balanced is what its first player settled on after trying the rest
-        // (Vision Pro M5, 2026-10-11: the game held the compositor's 16.7 ms
-        // a frame with it), and what every dial's own default is.
-        case .smooth:   return (.smooth, .two, .trimmed, .strong, .light)
-        case .balanced: return (.balanced, .four, .trimmed, .strong, .light)
-        case .sharp:    return (.sharp, .four, .full, .on, .full)
+        case .smooth:
+            return AlyxDials(quality: .smooth, edges: .two, view: .trimmed, foveation: .strong, output: .light,
+                             cadence: .every, effects: .all, texturePool: .automatic, textureCap: .k2)
+        // Balanced is what the game's first player settled on, on an M5, over an
+        // afternoon of trials (2026-10-13; his words: "Ich würd das nun gerne so
+        // als neuen Standard einbauen"): the largest picture with half the
+        // edge-smoothing samples, a quarter of its fragments shaded (the
+        // strongest foveation: 26% in the headset's log), every second refresh,
+        // no bloom and no ambient occlusion, and Glovebox's texture budget. With
+        // it the graphics chip needed 10-12 ms for a frame that has 20. Before
+        // the foveation step was steepened the same picture took 16-20 ms and
+        // the headset went to a critical thermal state within four minutes; a
+        // session with the steeper step has NOT been measured yet.
+        // Sharp is his as well: the same without the three things that
+        // save the most — all effects, mild foveation, full output.
+        case .balanced:
+            return AlyxDials(quality: Self.large, edges: .two, view: .trimmed, foveation: .strongest, output: .light,
+                             cadence: .second, effects: .fewer, texturePool: .mb2560, textureCap: .k2)
+        case .sharp:
+            return AlyxDials(quality: Self.large, edges: .two, view: .trimmed, foveation: .on, output: .full,
+                             cadence: .second, effects: .all, texturePool: .mb2560, textureCap: .k2)
         }
     }
+
+    /// The picture of Balanced and Sharp: the largest on the M5, one size
+    /// below it on the M2 (AlyxDevice).
+    private static var large: AlyxQuality { AlyxDevice.fast ? .maximum : .sharp }
 }
 
 struct AlyxPanel: View {
-    @AppStorage(AlyxQuality.storageKey) private var quality = AlyxQuality.balanced.rawValue
-    @AppStorage(AlyxEdges.storageKey) private var edges = AlyxEdges.standard.rawValue
-    @AppStorage(AlyxView.storageKey) private var view = AlyxView.standard.rawValue
-    @AppStorage(AlyxFoveation.storageKey) private var foveation = AlyxFoveation.standard.rawValue
-    @AppStorage(AlyxOutput.storageKey) private var output = AlyxOutput.initial.rawValue
+    @AppStorage(AlyxQuality.storageKey) private var quality = AlyxPreset.balanced.dials.quality.rawValue
+    @AppStorage(AlyxEdges.storageKey) private var edges = AlyxPreset.balanced.dials.edges.rawValue
+    @AppStorage(AlyxView.storageKey) private var view = AlyxPreset.balanced.dials.view.rawValue
+    @AppStorage(AlyxFoveation.storageKey) private var foveation = AlyxPreset.balanced.dials.foveation.rawValue
+    @AppStorage(AlyxOutput.storageKey) private var output = AlyxPreset.balanced.dials.output.rawValue
+    @AppStorage(AlyxCadence.storageKey) private var cadence = AlyxPreset.balanced.dials.cadence.rawValue
+    @AppStorage(AlyxEffects.storageKey) private var effects = AlyxPreset.balanced.dials.effects.rawValue
+    @AppStorage(AlyxTexturePool.storageKey) private var texturePool = AlyxPreset.balanced.dials.texturePool.rawValue
+    @AppStorage(AlyxTextureCap.storageKey) private var textureCap = AlyxPreset.balanced.dials.textureCap.rawValue
     /// "Custom" was chosen: the dials are shown even while they happen to be a preset's.
     @AppStorage("alyx.custom") private var customChosen = false
     @AppStorage(klAlyxLoadingKey) private var loadingScreens = true
     @AppStorage(AlyxPace.storageKey) private var pace = AlyxPace.game.rawValue
     @AppStorage(AlyxLanguage.storageKey) private var language = AlyxLanguage.standard.rawValue
     @AppStorage(AlyxLanguage.voicesKey) private var voices = true
+    @AppStorage(klAlyxStatsKey) private var stats = false
+    @AppStorage(klAlyxLeanDepthKey) private var leanDepth = true
+    @AppStorage(klAlyxLastLeftKey) private var lastLeft = 0
+    @AppStorage(klAlyxLastPoolKey) private var lastPool = 0
+
+    /// What "Automatic" means beside the chosen picture size, what Glovebox
+    /// uses, and what the last run had left — the three things to choose by.
+    private var texturePoolNote: String {
+        let q = AlyxQuality(rawValue: quality) ?? .balanced
+        let chosen = AlyxTexturePool(rawValue: texturePool) ?? .automatic
+        var s = klT("How much memory the game may fill with textures, in MB; more keeps distant surfaces finer. “Automatic” is the careful amount for the picture size “\(q.name)”: \(q.texturePoolMB) MB. 2560 MB is what Glovebox uses.",
+                    "Wie viel Speicher das Spiel mit Texturen füllen darf, in MB; mehr hält entfernte Flächen feiner. „Automatisch“ ist der vorsichtige Wert für die Bildgröße „\(q.name)“: \(q.texturePoolMB) MB. 2560 MB nutzt Glovebox.")
+        if lastLeft > 0, lastPool > 0 {
+            let now = chosen.megabytes(for: q)
+            let then = lastLeft - (now - lastPool)
+            s += " " + klT("The last run (\(lastPool) MB) had at least \(lastLeft) MB of memory left.",
+                           "Im letzten Lauf (\(lastPool) MB) blieben mindestens \(lastLeft) MB Speicher frei.")
+            if now != lastPool {
+                s += " " + (then >= 600
+                    ? klT("With \(now) MB about \(then) MB would be left.", "Mit \(now) MB blieben etwa \(then) MB.")
+                    : klT("With \(now) MB only about \(max(then, 0)) MB would be left – the system may end the game.",
+                          "Mit \(now) MB blieben nur etwa \(max(then, 0)) MB – das System kann das Spiel dann beenden."))
+            }
+        } else {
+            s += " " + klT("Every step up takes that much from the memory left; with too little the system ends the game.",
+                           "Jeder Schritt nach oben nimmt so viel vom freien Speicher; bei zu wenig beendet das System das Spiel.")
+        }
+        return s
+    }
     /// True once a run has started: the values were read at its start, so the
     /// controls then describe the NEXT launch and say so.
     let started: Bool
@@ -793,6 +1175,8 @@ struct AlyxPanel: View {
             let d = $0.dials
             return d.quality.rawValue == quality && d.edges.rawValue == edges && d.view.rawValue == view
                 && d.foveation.rawValue == foveation && d.output.rawValue == output
+                && d.cadence.rawValue == cadence && d.effects.rawValue == effects
+                && d.texturePool.rawValue == texturePool && d.textureCap.rawValue == textureCap
         }
     }
 
@@ -804,6 +1188,8 @@ struct AlyxPanel: View {
                 let d = p.dials
                 quality = d.quality.rawValue; edges = d.edges.rawValue; view = d.view.rawValue
                 foveation = d.foveation.rawValue; output = d.output.rawValue
+                cadence = d.cadence.rawValue; effects = d.effects.rawValue
+                texturePool = d.texturePool.rawValue; textureCap = d.textureCap.rawValue
                 customChosen = false
             })
     }
@@ -858,9 +1244,32 @@ struct AlyxPanel: View {
                              name: { $0.name }, tag: { $0.rawValue }, note: AlyxFoveation.note)
                         dial(klT("Display output", "Ausgabe aufs Display"), $output, AlyxOutput.ordered,
                              name: { $0.name }, tag: { $0.rawValue }, note: AlyxOutput.note)
+                        dial(klT("Frame cadence", "Bildtakt"), $cadence, [AlyxCadence.second, .every],
+                             name: { $0.name }, tag: { $0.rawValue }, note: AlyxCadence.note)
+                        dial(klT("Effects", "Effekte"), $effects, AlyxEffects.allCases,
+                             name: { $0.name }, tag: { $0.rawValue }, note: AlyxEffects.note)
+                        dial(klT("Texture memory", "Texturspeicher"), $texturePool, AlyxTexturePool.allCases,
+                             name: { $0.name }, tag: { $0.rawValue }, note: texturePoolNote)
+                        dial(klT("Finest texture", "Feinste Textur"), $textureCap, AlyxTextureCap.allCases,
+                             name: { $0.name }, tag: { $0.rawValue },
+                             note: klT("The finest any single texture is loaded at, in pixels along its edge. 4096 only pays with a large texture memory (about 3.3 GB) and has run the headset out of memory; 1024 is coarser and frees memory.",
+                                       "Wie fein eine einzelne Textur höchstens geladen wird, in Bildpunkten Kantenlänge. 4096 lohnt nur mit sehr großem Texturspeicher (rund 3,3 GB) und hat dem Headset schon den Speicher ausgehen lassen; 1024 ist gröber und spart Speicher."))
                     } else if let p = matching {
                         Text(p.note).font(.callout).foregroundStyle(.secondary)
                     }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox(klT("More", "Weiteres")) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle(klT("Show frame rate", "Bildrate einblenden"), isOn: $stats)
+                    Text(klT("One line at the lower left of the view: pictures a second, display rate, graphics time and temperature.",
+                             "Eine Zeile unten links im Blickfeld: Bilder pro Sekunde, Display-Takt, Grafikzeit und Temperatur."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Toggle(klT("Keep depth samples out of memory", "Tiefenwerte nicht im Speicher halten"), isOn: $leanDepth)
+                    Text(klT("Saves about 90 to 170 MB of memory, depending on the picture. If parts of the picture are missing or flicker, switch it off.",
+                             "Spart je nach Bild rund 90 bis 170 MB Speicher. Fehlen Bildteile oder flackert etwas, ausschalten."))
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }

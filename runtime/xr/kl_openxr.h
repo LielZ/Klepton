@@ -116,6 +116,11 @@ int kl_openxr_input_selftest(FILE *f);
 // should make the guest render against the last pose, not wedge it.
 void kl_openxr_set_frame_pacer(void (*wait)(void));
 
+// The dominant hand a SteamVR game set (IVRInput::SetDominantHand, through
+// xrizer): with the left, every binding that is not a pose is driven by the
+// other controller and reported as that controller's hand. Right is the start.
+void kl_openxr_set_dominant_hand(int left);
+
 // Capture the TOPMOST projection layer instead of the base one (layer 0).
 //
 // The compositor shows exactly one projection layer (kl_glfb draws one quad per

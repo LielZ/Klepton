@@ -114,6 +114,10 @@ int  kl_lx_audio_open(void);                                     // fd, or -1 wi
 // arrive at /dev/klepton-interstitial (kl_lx_interstitial.c).
 int  kl_lx_interstitial_is(const char *path);
 int  kl_lx_interstitial_open(void);                              // fd, or -1 with errno
+// The dominant hand a SteamVR game sets, from xrizer: one byte "L" or "R" at
+// /dev/klepton-dominant-hand (kl_lx_interstitial.c).
+int  kl_lx_hand_is(const char *path);
+int  kl_lx_hand_open(void);                                      // fd, or -1 with errno
 // Opt-in diagnostics that interpose on the guest's libc (kl_lx_diag.c).
 void kl_lx_diag_init(void);
 

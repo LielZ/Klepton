@@ -78,6 +78,8 @@ CVPixelBufferRef kl_vtdec_pull(kl_vtdec *d, int64_t *pts_us_out);
 // Drop everything in flight and everything decoded, and tell VideoToolbox to
 // forget its inter-frame state. What AMediaCodec_flush means.
 void kl_vtdec_flush(kl_vtdec *d);
+void kl_vtdec_flush_playback(kl_vtdec *d); // wait for file frames before clearing
+unsigned kl_vtdec_pending(const kl_vtdec *d); // submitted frames not yet pulled/discarded
 
 // How many frames have been submitted, decoded and dropped since creation, and
 // the current frame size. For the fault reporter and for `make hevc`.

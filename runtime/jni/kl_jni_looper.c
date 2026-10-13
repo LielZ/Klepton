@@ -23,6 +23,7 @@
 #include "kl_env.h"
 #include "kl_ovrp.h"
 #include "kl_avdec.h"
+#include "kl_mediandk.h"
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_va.h"
@@ -428,6 +429,8 @@ static klj_val klj_Handler_obtainMessage(void *env, void *self, const klj_val *a
     klj_message *m = calloc(1, sizeof *m);
     if (!m) return (klj_val){.l = NULL};
     m->what   = n > 0 ? (int32_t)a[0].j : 0;
+    m->arg1   = n > 1 ? (int32_t)a[1].j : 0;
+    m->arg2   = n > 2 ? (int32_t)a[2].j : 0;
     m->target = self;                       // sendToTarget() needs to find it back
     void *obj = klj_new_object_data("android/os/Message", m);
     // Pinned because it is queued and outlives the frame that made it — and
@@ -451,9 +454,9 @@ static klj_val klj_Handler_obtainMessage(void *env, void *self, const klj_val *a
     klj_field_store(obj, klj_want(klj_class_object("android/os/Message"), "what", "I", 'f'),
                     (klj_val){.j = (uint64_t)(int64_t)m->what});
     klj_field_store(obj, klj_want(klj_class_object("android/os/Message"), "arg1", "I", 'f'),
-                    (klj_val){.j = 0});
+                    (klj_val){.j = (uint64_t)(int64_t)m->arg1});
     klj_field_store(obj, klj_want(klj_class_object("android/os/Message"), "arg2", "I", 'f'),
-                    (klj_val){.j = 0});
+                    (klj_val){.j = (uint64_t)(int64_t)m->arg2});
     KLJ_LOG("Handler.obtainMessage(what=%d)", m->what);
     return (klj_val){.l = obj};
 }
@@ -834,7 +837,128 @@ static klj_val klj_Process_myTid(void *env, void *self, const klj_val *a, int n)
     return (klj_val){.j = (uint32_t)tid};
 }
 
+// Unity's GLES VideoPlayer consumes MediaCodec frames via SurfaceTexture.
+typedef struct { void *reader, *listener, *object; pthread_mutex_t lock; } klj_surface_texture;
+static klj_surface_texture *surface_texture(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o && !strcmp(o->cls, "android/graphics/SurfaceTexture") ? o->data : NULL;
+}
+static void surface_frame(void *ctx, void *reader) {
+    (void)reader;
+    klj_surface_texture *st = ctx;
+    pthread_mutex_lock(&st->lock);
+    void *listener = st->listener;
+    pthread_mutex_unlock(&st->lock);
+    if (!listener) return;
+    void *env = kl_jni_env();
+    klj_PushLocalFrame(env, 8);
+    void *args = klj_new_array('L', "java/lang/Object", 1);
+    ((void **)klj_arr(args)->data)[0] = st->object;
+    klj_proxy_invoke(listener, "android/graphics/SurfaceTexture$OnFrameAvailableListener",
+                     "onFrameAvailable", "(Landroid/graphics/SurfaceTexture;)V", args);
+    klj_PopLocalFrame(env, NULL);
+}
+static klj_val surface_texture_init(void *env, void *cls, const klj_val *a, int n) {
+    (void)env; (void)cls;
+    klj_surface_texture *st = calloc(1, sizeof *st);
+    if (!st) return (klj_val){0};
+    st->reader = kl_mediandk_texture_new(n ? (unsigned)a[0].j : 0);
+    if (!st->reader) { free(st); return (klj_val){0}; }
+    pthread_mutex_init(&st->lock, NULL);
+    st->object = klj_new_object_data("android/graphics/SurfaceTexture", st);
+    kl_jni_pin_object(st->object); // retained by producer callbacks until release
+    return (klj_val){.l=st->object};
+}
+static klj_val surface_init(void *env, void *cls, const klj_val *a, int n) {
+    (void)env; (void)cls;
+    void *texture = n ? a[0].l : NULL;
+    return (klj_val){.l=klj_new_object_data("android/view/Surface", texture)};
+}
+void *kl_jni_surface_window(void *surface) {
+    klj_object *o = klj_as_object(surface);
+    klj_surface_texture *st = o && !strcmp(o->cls, "android/view/Surface") ? surface_texture(o->data) : NULL;
+    return st && st->reader ? kl_mediandk_texture_window(st->reader) : NULL;
+}
+static klj_val surface_listener(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_surface_texture *st = surface_texture(self);
+    if (!st || !st->reader) return (klj_val){0};
+    void *listener = n ? a[0].l : NULL;
+    if (listener) kl_jni_pin_object(listener);
+    pthread_mutex_lock(&st->lock);
+    st->listener = listener;
+    pthread_mutex_unlock(&st->lock);
+    kl_mediandk_texture_listener(st->reader, st, listener ? surface_frame : NULL);
+    return (klj_val){0};
+}
+static klj_val surface_update(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_surface_texture *st=surface_texture(self);
+    if (st && st->reader) kl_mediandk_texture_update(st->reader);
+    return (klj_val){0};
+}
+static klj_val surface_timestamp(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_surface_texture *st=surface_texture(self);
+    return (klj_val){.j=st && st->reader ? kl_mediandk_texture_timestamp(st->reader) : 0};
+}
+static klj_val surface_matrix(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_array *ar=n ? klj_arr(a[0].l) : NULL;
+    if (!ar || ar->kind!='F' || ar->len<16) { klj_raise("java/lang/IllegalArgumentException", "matrix needs 16 floats"); return (klj_val){0}; }
+    float *m=ar->data; memset(m,0,16*sizeof *m);
+    m[0]=m[10]=m[15]=1; m[5]=-1; m[13]=1;
+    return (klj_val){0};
+}
+static klj_val surface_size(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_surface_texture *st=surface_texture(self);
+    if (st && st->reader && n==2) kl_mediandk_texture_size(st->reader,a[0].j,a[1].j);
+    return (klj_val){0};
+}
+static klj_val surface_attach(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_surface_texture *st=surface_texture(self);
+    if (st && st->reader && n) kl_mediandk_texture_attach(st->reader,a[0].j);
+    return (klj_val){0};
+}
+static klj_val surface_detach(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_surface_texture *st=surface_texture(self);
+    if (st && st->reader) kl_mediandk_texture_detach(st->reader);
+    return (klj_val){0};
+}
+static klj_val surface_released(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_surface_texture *st=surface_texture(self);
+    return (klj_val){.j=!st || !st->reader};
+}
+static klj_val surface_release(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_surface_texture *st=surface_texture(self);
+    if (st && st->reader) { kl_mediandk_texture_delete(st->reader); st->reader=NULL; st->listener=NULL; }
+    return (klj_val){0};
+}
+static klj_val surface_wrapper_release(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o=klj_as_object(self); if (o) o->data=NULL;
+    return (klj_val){0};
+}
+
 const klj_binding klj_bind_looper[] = {
+    {"android/graphics/SurfaceTexture", "<init>", "(I)V", surface_texture_init},
+    {"android/view/Surface", "<init>", "(Landroid/graphics/SurfaceTexture;)V", surface_init},
+    {"android/view/Surface", "release", "()V", surface_wrapper_release},
+    {"android/graphics/SurfaceTexture", "setOnFrameAvailableListener", "(Landroid/graphics/SurfaceTexture$OnFrameAvailableListener;)V", surface_listener},
+    {"android/graphics/SurfaceTexture", "updateTexImage", "()V", surface_update},
+    {"android/graphics/SurfaceTexture", "getTimestamp", "()J", surface_timestamp},
+    {"android/graphics/SurfaceTexture", "getTransformMatrix", "([F)V", surface_matrix},
+    {"android/graphics/SurfaceTexture", "setDefaultBufferSize", "(II)V", surface_size},
+    {"android/graphics/SurfaceTexture", "attachToGLContext", "(I)V", surface_attach},
+    {"android/graphics/SurfaceTexture", "detachFromGLContext", "()V", surface_detach},
+    {"android/graphics/SurfaceTexture", "isReleased", "()Z", surface_released},
+    {"android/graphics/SurfaceTexture", "release", "()V", surface_release},
+
     {"android/app/Activity",   "runOnUiThread", "(Ljava/lang/Runnable;)V", klj_Activity_runOnUiThread},
 
     {"org/libsdl/app/SDLAudioManager", "unregisterAudioDeviceCallback", "()V",
@@ -857,6 +981,8 @@ const klj_binding klj_bind_looper[] = {
     // HandlerThread gets a real thread of its own, because the guest blocks
     // waiting on it. See the looper section above.
     {"android/os/Handler", "obtainMessage", "(I)Landroid/os/Message;", klj_Handler_obtainMessage},
+    // Unity video preparation posts a message with two integer arguments.
+    {"android/os/Handler", "obtainMessage", "(III)Landroid/os/Message;", klj_Handler_obtainMessage},
     {"android/os/Message", "sendToTarget", "()V", klj_Message_sendToTarget},
     {"android/os/Message", "getTarget", "()Landroid/os/Handler;", klj_Message_getTarget},
     {"android/os/Handler", "getLooper", "()Landroid/os/Looper;", klj_Handler_getLooper},

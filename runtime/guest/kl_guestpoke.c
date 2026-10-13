@@ -196,6 +196,16 @@ static int addr_mapped(const void *p, size_t len) {
 struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; int use;
                       const char *target; };
 static const struct poke_cap_row k_poke_caps[] = {
+    // Space Channel 5 VR 1.0.5 / Unity 2021.3.24f1, measured from its ELF:
+    // 7c06c0 queries MAX_COMBINED_TEXTURE_IMAGE_UNITS, then 7c06dc clamps
+    // to 32 and 7c06e0 writes field ec. SetTexture at 7a3a14 rejects against
+    // that field; getter 2932ec loads the singleton at 1393240.
+    // Its 12-byte texture cache starts at 28 and ends before active-unit field
+    // 330: 64 slots. Use the existing conservative 64 default, not all 96
+    // ANGLE combined units. Additional instruction/count guards below keep
+    // this store confined to this measured binary and the expected field.
+    { "2021.3.24f1", 0x1393240, 0xec, 1, "x2249318828413747" },
+
     // Unity 2019.4.36f1 — Eye of the Temple 1.528 (2026-10-10). 1.28 million
     // "Invalid texture unit!" in 45 seconds at the cap of 32, and every texture
     // in the game black. Measured by the recipe above against this build's
@@ -370,6 +380,19 @@ void kl_guest_poke_texture_unit_cap(void) {
     kl_image *u = kl_find_image("libunity.so");
     if (!u) return;
     uint8_t *ub = (uint8_t *)kl_base(u);
+    if (row->target && !strcmp(row->target, "x2249318828413747")) {
+        static const uint32_t getter[] = {0x90008808, 0xf9412100, 0xd65f03c0};
+        static const uint32_t limit[] = {0xb940ec08, 0x6b16011f, 0x54000629};
+        if (kl_span(u) < 0x7a3a20 ||
+            memcmp(ub + 0x2932ec, getter, sizeof getter) ||
+            memcmp(ub + 0x7a3a14, limit, sizeof limit)) {
+            if (first) fprintf(stderr, "  [poke] Space Channel texture cap: SKIPPED (binary guard mismatch)\n");
+            return;
+        }
+        if (!pv) poke_n = 64;
+        if (poke_n > 64) poke_n = 64; // the measured engine cache has 64 slots
+    }
+
     if ((size_t)POKE_SINGLETON + sizeof(void *) > kl_span(u)) {
         if (first) fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — libunity is %zu bytes, "
                         "shorter than the %#x offset.\n", kl_span(u), POKE_SINGLETON);
@@ -387,6 +410,11 @@ void kl_guest_poke_texture_unit_cap(void) {
         return;
     }
     int32_t cur = *(int32_t *)(singleton + POKE_FIELD);
+    if (row->target && !strcmp(row->target, "x2249318828413747") && cur != 32 && cur != 64) {
+        if (first) fprintf(stderr, "  [poke] Space Channel texture cap: SKIPPED (unexpected count %d)\n", cur);
+        return;
+    }
+
     if (cur <= 0 || cur > 4096) {
         if (first) fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — +%#x reads %d, which is "
                         "not a texture-unit count.\n", POKE_FIELD, cur);
