@@ -199,6 +199,11 @@ import os as _os
 TEST_ON = ",".join(n for n in re.split(r"[,\s]+", os.environ.get("KLEPTON_TEST_ON", ""))
                    if re.fullmatch(r"KL_[A-Z0-9_]{1,60}", n))
 
+# Typed wire values only: never interpolate arbitrary installer input into a project.
+CONTROLLER_MODE = os.environ.get("KLEPTON_CONTROLLER_MODE", "standard")
+if CONTROLLER_MODE not in ("standard", "surreal"):
+    raise ValueError("KLEPTON_CONTROLLER_MODE must be standard or surreal")
+
 # Compile-time launcher opt-in (also drives LAUNCHER_COND + the display name below).
 _launcher_on = _os.environ.get("KL_CUSTOM_LAUNCHER", "").strip().lower() in ("1", "true", "yes", "on")
 # NB: the bundle id is deliberately NOT switched by the launcher flag. It is a SIGNING
@@ -308,6 +313,7 @@ _usage_settings = "".join(
     '\t\t\t\tINFOPLIST_KEY_%s = "%s";\n' % (k, v.replace("\\", "\\\\").replace('"', '\\"'))
     for k, v in USAGE_DESCRIPTIONS.items())
 ASSETCATALOG_SETTING += _usage_settings
+ASSETCATALOG_SETTING += f'\t\t\t\tKL_CONTROLLER_MODE_DEFAULT = "{CONTROLLER_MODE}";\n'
 
 # Trim the asset catalog to THIS target. The shared Assets.xcassets holds one icon
 # stack per target (~26), and actool compiles ALL of them into the app's Assets.car
@@ -363,7 +369,10 @@ SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swif
          "KleptonChroma.swift", "KleptonMic.swift",
          "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonGameData.swift",
          "KleptonAlyx.swift", "KleptonText.swift", "KleptonSteamCloud.swift",
-         "KleptonBackup.swift", "KleptonMetrics.swift", "KleptonPinch.swift"]
+         "KleptonBackup.swift", "KleptonMetrics.swift", "KleptonPinch.swift",
+         "KleptonControllerInput.swift", "KleptonControllerMode.swift",
+         "KleptonSurrealInput.swift", "KleptonSurrealBackend.swift", "KleptonSurrealView.swift",
+         "KleptonSurrealAim.swift", "KleptonSurrealAimView.swift"]
 # Steam's connection, sign-in and Steam Cloud (SteamCloudKit/README.md: parts of
 # Glovebox's SteamLauncherKit, MIT), compiled into the app's own module. The
 # folder is a Swift package only so that its tests run on a Mac.
