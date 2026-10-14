@@ -192,6 +192,14 @@ enum Lifecycle {
             return
         }
         NSLog("[app] backgrounded — exiting (KL_EXIT_ON_BACKGROUND)")
+        leave()
+    }
+
+    /// The end of the process, and what is written down before it. Being
+    /// backgrounded comes here, and so does a game that quit by itself
+    /// (`kl_app_guest_asked_quit`, from the compositor): the same leaving,
+    /// whoever asked for it. On the main thread.
+    static func leave() -> Never {
         kl_app_exit_report()
         KleptonRendering.shared.rememberRun()
         klAlyxRememberRun()

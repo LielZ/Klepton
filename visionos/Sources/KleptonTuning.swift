@@ -474,6 +474,29 @@ enum KleptonTestSwitches {
         var key: String { "klepton.test." + env + (also.isEmpty ? "" : "." + value) }
     }
 
+    /// The switches this installation has on from the start: named by whoever
+    /// installed it (KLEPTON_TEST_ON at build time, KLTestOn in Info.plist) —
+    /// AVP Play does, for someone who wants a change that is built in but off
+    /// in all games at once ("as if the old way were gone") without a visit to
+    /// each. A switch named here is on until it is turned off in this window,
+    /// and that choice then stays.
+    static let onFromInstall: Set<String> = Set(
+        ((Bundle.main.object(forInfoDictionaryKey: "KLTestOn") as? String) ?? "")
+            .split(separator: ",").map(String.init))
+
+    /// Whether a switch is on: what was chosen in the window, else what the
+    /// installation started with.
+    static func isOn(_ e: Entry) -> Bool {
+        (UserDefaults.standard.object(forKey: e.key) as? Bool) ?? onFromInstall.contains(e.env)
+    }
+    /// Stores a choice — only where it differs from what the installation
+    /// starts with, so that a switch put back follows the installation again
+    /// when a later one starts it differently.
+    static func set(_ e: Entry, on: Bool) {
+        if on == onFromInstall.contains(e.env) { UserDefaults.standard.removeObject(forKey: e.key) }
+        else { UserDefaults.standard.set(on, forKey: e.key) }
+    }
+
     /// KL_TEST_SWITCHES=0 on the launch line hides the group and ignores what
     /// it stored, for a run that must not depend on a leftover choice.
     static var available: Bool { klEnvOn("KL_TEST_SWITCHES", default: true) }
@@ -490,16 +513,21 @@ enum KleptonTestSwitches {
                              "Foveation: keine Zone unter halber Auflösung"),
                   note: klT("GL games with foveated rendering. The edge of the picture gets sharper textures and costs about 70% more fragments; watch the frame rate.",
                             "GL-Spiele mit Foveated Rendering. Der Bildrand bekommt schärfere Texturen und kostet etwa 70 % mehr Bildpunkte; auf die Bildrate achten.")),
+            Entry(env: "KL_OVRP_ONE_POSE", value: "1",
+                  title: klT("Head pose: one per frame of the game",
+                             "Kopfpose: eine pro Frame des Spiels"),
+                  note: klT("Games that talk to Meta's own interface, such as Moss or Tetris Effect. The game gets one head pose for a whole frame instead of a newer one several times within it. Does nothing in games that come through OpenXR (Half-Life: Alyx, Steam Link, Doom 3, Walkabout, Beat Saber 1.45). Turn the head quickly in a level and compare: does the picture stay steadier, or does it lag?",
+                            "Spiele, die über Metas eigene Schnittstelle laufen, etwa Moss oder Tetris Effect. Das Spiel bekommt für einen ganzen Frame eine Kopfpose statt mehrmals darin eine neuere. Bewirkt nichts in Spielen, die über OpenXR kommen (Half-Life: Alyx, Steam Link, Doom 3, Walkabout, Beat Saber 1.45). Im Level den Kopf schnell drehen und vergleichen: steht das Bild ruhiger, oder hängt es nach?")),
             Entry(env: "KL_OVRP_EYE_DESC_CAP", value: "1",
                   title: klT("Resolution: the game's own scale stays under the limit",
                              "Auflösung: der eigene Faktor des Spiels bleibt unter der Obergrenze"),
                   note: klT("Unity and Unreal games that enlarge the picture themselves. Moss asks for 1.5 times the resolution in a level and falls to 45 frames a second; with this it is drawn at the size it is offered. Watch the frame rate and the sharpness.",
                             "Unity- und Unreal-Spiele, die das Bild selbst vergrößern. Moss verlangt im Level die 1,5-fache Auflösung und fällt auf 45 Bilder pro Sekunde; hiermit wird es in der angebotenen Größe gezeichnet. Auf Bildrate und Schärfe achten.")),
             Entry(env: "KL_STATS_CARD", value: "1",
-                  title: klT("Show the frame rate in the headset",
-                             "Bildrate im Headset einblenden"),
-                  note: klT("A line at the lower left of the view: the frames the game draws a second and the rate the display runs at, refreshed once a second. Half-Life: Alyx has this as a setting of its own.",
-                            "Eine Zeile unten links im Blickfeld: die Bilder, die das Spiel pro Sekunde zeichnet, und die Rate, mit der das Display läuft, einmal pro Sekunde aufgefrischt. Half-Life: Alyx hat dafür eine eigene Einstellung.")),
+                  title: klT("Show performance in the headset from the start",
+                             "Leistungsanzeige im Headset von Anfang an einblenden"),
+                  note: klT("A small panel just above the middle of the view, like the performance overlay of a Quest: frames a second, pictures that had to be shown twice, GPU and CPU load, memory, heat and picture size, with the last minute as graphs. In every game, holding Create and Options on the controllers together for a second shows it and hides it again; this switch only decides whether it is there when the game starts. Half-Life: Alyx has this as a setting of its own.",
+                            "Eine kleine Tafel knapp über der Blickmitte, wie die Leistungsanzeige einer Quest: Bilder pro Sekunde, Bilder, die doppelt gezeigt werden mussten, Auslastung von GPU und CPU, Speicher, Wärme und Bildgröße, dazu die letzte Minute als Verlauf. In jedem Spiel blendet Create und Options an den Controllern, eine Sekunde lang zusammen gehalten, sie ein und wieder aus; dieser Schalter bestimmt nur, ob sie beim Start des Spiels schon zu sehen ist. Half-Life: Alyx hat dafür eine eigene Einstellung.")),
             Entry(env: "KL_VK_ANISO", value: "16",
                   title: klT("Textures: 16x anisotropic filtering",
                              "Texturen: 16-fache anisotrope Filterung"),
@@ -552,6 +580,11 @@ enum KleptonTestSwitches {
                              "Ton: dem Spiel wird ein Tonausgang gezeigt statt keinem"),
                   note: klT("For a game that stays silent: some sound engines pick their output from the list of devices and give up on an empty one.",
                             "Für ein Spiel, das stumm bleibt: manche Sound-Engines wählen ihren Ausgang aus der Geräteliste und geben bei einer leeren auf.")),
+            Entry(env: "KL_AUDIO_SINK2", value: "1",
+                  title: klT("Sound: the new audio path",
+                             "Ton: die neue Audio-Implementierung"),
+                  note: klT("Every game with sound. Everything between the game's sound interface and the output is a second implementation, from rebelancap's fork: every sample format is converted properly, one of the game's sound outputs owns the device (the first one that is heard, instead of two being mixed), and the pauses between a sound engine's blocks are waited out instead of played as gaps. Listen for crackle, dropouts, sound that lags behind the picture, and whether music, voices and effects are all there. The switch for the old buffer size does nothing with it. Steam Link plays through two outputs at once; with this on only one of them is heard at a time.",
+                            "Jedes Spiel mit Ton. Alles zwischen der Tonschnittstelle des Spiels und der Ausgabe ist eine zweite Implementierung aus rebelancaps Fork: jedes Sample-Format wird richtig umgewandelt, einer der Tonausgänge des Spiels besitzt das Gerät (der erste, der zu hören ist, statt dass zwei gemischt werden), und die Pausen zwischen den Blöcken einer Sound-Engine werden abgewartet statt als Lücken gespielt. Auf Knistern, Aussetzer, nachhängenden Ton achten und darauf, ob Musik, Stimmen und Effekte alle da sind. Der Schalter für die alte Puffergröße bewirkt damit nichts. Steam Link spielt über zwei Ausgänge zugleich; hiermit ist immer nur einer davon zu hören.")),
             Entry(env: "KL_EGL_CREATE_CONTEXT_EXT", value: "1",
                   title: klT("EGL: name EGL_KHR_create_context",
                              "EGL: EGL_KHR_create_context nennen"),
@@ -571,11 +604,12 @@ enum KleptonTestSwitches {
         guard available else { return }
         // setenv with overwrite 0: of two switches for one variable the first
         // listed wins, and the launch line wins over both.
-        for e in entries where UserDefaults.standard.bool(forKey: e.key) {
+        for e in entries where isOn(e) {
             setenv(e.env, e.value, 0)
             for (k, v) in e.also { setenv(k, v, 0) }
             NSLog("[app] test switch: \(e.env)=\(e.value)"
-                  + e.also.map { " \($0.0)=\($0.1)" }.joined())
+                  + e.also.map { " \($0.0)=\($0.1)" }.joined()
+                  + (UserDefaults.standard.object(forKey: e.key) == nil ? " (on from the installation)" : ""))
         }
     }
 }
@@ -598,15 +632,20 @@ private struct TestSwitchRow: View {
     @State private var on: Bool
     init(entry: KleptonTestSwitches.Entry) {
         self.entry = entry
-        _on = State(initialValue: UserDefaults.standard.bool(forKey: entry.key))
+        _on = State(initialValue: KleptonTestSwitches.isOn(entry))
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Toggle(entry.title, isOn: $on)
-                .onChange(of: on) { _, v in UserDefaults.standard.set(v, forKey: entry.key) }
+                .onChange(of: on) { _, v in KleptonTestSwitches.set(entry, on: v) }
             Text(entry.note + " (" + entry.env + "=" + entry.value
                  + entry.also.map { " " + $0.0 + "=" + $0.1 }.joined() + ")")
                 .font(.caption).foregroundStyle(.secondary)
+            if KleptonTestSwitches.onFromInstall.contains(entry.env) {
+                Text(klT("On from the start in this installation: AVP Play's experimental setting asked for it.",
+                         "In dieser Installation von Anfang an eingeschaltet: Die experimentelle Einstellung von AVP Play hat es so verlangt."))
+                    .font(.caption).foregroundStyle(.orange)
+            }
         }
     }
 }

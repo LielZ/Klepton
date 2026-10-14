@@ -67,6 +67,13 @@ struct KleptonHandState {
     /// Only a Sense controller can press anything, so this is also "are the
     /// buttons meaningful".
     var fromController = false
+    /// The bits this hand's menu button (Create / Options) stands for while it
+    /// is down, and the hand's other buttons and touches without them. Kept
+    /// apart because the metrics panel may hold that one button back
+    /// (`applyPanelChord`); `buttons` and `touches` are what the guest gets.
+    var pill: UInt32 = 0
+    var otherButtons: UInt32 = 0
+    var otherTouches: UInt32 = 0
 }
 
 /// `ovrpButton` **raw** bits.
@@ -1211,6 +1218,7 @@ final class KleptonControllers {
         lock.lock()
         for i in 0...1 where !attached[i] {
             state[i].buttons = 0; state[i].touches = 0
+            state[i].pill = 0; state[i].otherButtons = 0; state[i].otherTouches = 0
             state[i].indexTrigger = 0; state[i].handTrigger = 0
             state[i].stick = .zero; state[i].fromController = false
             // Only the Sense path writes these, and it rewrites them below;
@@ -1311,7 +1319,10 @@ final class KleptonControllers {
                        || pressed("Button Options")
             let psish = pressed("Button Home") || pressed("Button PS")
                      || pressed("Button PS Button")
-            let homeish = (hand == 0 && pressed("Button Menu")) || psish
+            // The menu button's own bits, apart from the rest of the hand's:
+            // that one button can be held back for a moment or altogether,
+            // for the metrics panel (applyPanelChord).
+            var pill: UInt32 = 0
 
             var st = KleptonHandState()
             st.fromController = true
@@ -1383,8 +1394,9 @@ final class KleptonControllers {
                 if pressed("Thumbstick Button") { bits |= OVRPRawButton.lThumbstick }
                 if st.indexTrigger > 0 { bits |= OVRPRawButton.lIndexTrigger }
                 if st.handTrigger  > 0 { bits |= OVRPRawButton.lHandTrigger }
-                if menuish { bits |= OVRPRawButton.start }
-                if homeish { bits |= OVRPRawButton.back }
+                if menuish { pill |= OVRPRawButton.start }
+                if pressed("Button Menu") { pill |= OVRPRawButton.back }
+                if psish { bits |= OVRPRawButton.back }
             } else {
                 if pressed("Button A") { bits |= OVRPRawButton.a }
                 if pressed("Button B") { bits |= OVRPRawButton.b }
@@ -1417,8 +1429,8 @@ final class KleptonControllers {
                 // still has no binding to land on and Steam Link is unchanged;
                 // fill_controller_state (kl_ovrp.c) folds it into the left
                 // hand's word for a guest that polls the hands separately.
-                if menuish { bits |= OVRPRawButton.start | OVRPRawButton.back }
-                if homeish { bits |= OVRPRawButton.back }
+                if menuish { pill |= OVRPRawButton.start | OVRPRawButton.back }
+                if psish { bits |= OVRPRawButton.back }
             }
             // The guest reads stick *direction* bits as well as the axes — and
             // SNAP TURN reads only these (OVRInput.GetDown(Secondary/Primary
@@ -1460,14 +1472,45 @@ final class KleptonControllers {
             // above are additive to that, not a replacement: OVRInput treats
             // touch as a superset of press and a press that is not also a touch
             // reads as a hardware fault.
-            st.buttons = bits
-            st.touches = touch | bits
+            st.pill = pill
+            st.otherButtons = bits
+            st.otherTouches = touch
+            st.buttons = bits | pill
+            st.touches = touch | bits | pill
 
             // Buttons only. The pose is resolved in update(), where the frame's
             // presentation time is known and the anchor can be predicted to it.
             lock.lock()
             state[hand] = st
             lock.unlock()
+        }
+        applyPanelChord()
+    }
+
+    /// Create and Options held together for a second show the metrics panel
+    /// and hide it again, in every game — and the game must not open its menu
+    /// for that. So the two buttons go through kl_metrics_chord: a press
+    /// reaches the game a quarter of a second late, and not at all while both
+    /// are down. KL_STATS_CARD_BUTTONS=0 hands them to the game untouched.
+    ///
+    /// After the loop above and on every poll, not where a new input state is
+    /// read: a button that is simply held publishes nothing new, and the
+    /// waiting is a matter of time passing.
+    private var pillBits: [UInt32] = [0, 0]
+    private static let panelButtons = klEnvOn("KL_STATS_CARD_BUTTONS", default: true)
+    private func applyPanelChord() {
+        guard Self.panelButtons else { return }
+        lock.lock(); defer { lock.unlock() }
+        // A tap is passed on after the button is up again, with the bits it had.
+        for h in 0...1 where state[h].pill != 0 { pillBits[h] = state[h].pill }
+        var passL: Int32 = 0, passR: Int32 = 0
+        kl_metrics_chord(state[0].fromController && state[0].pill != 0 ? 1 : 0,
+                         state[1].fromController && state[1].pill != 0 ? 1 : 0,
+                         ProcessInfo.processInfo.systemUptime, &passL, &passR)
+        for h in 0...1 where state[h].fromController {
+            let pill = (h == 0 ? passL : passR) != 0 ? pillBits[h] : 0
+            state[h].buttons = state[h].otherButtons | pill
+            state[h].touches = state[h].otherTouches | state[h].otherButtons | pill
         }
     }
 
@@ -1575,8 +1618,16 @@ final class KleptonControllers {
     /// uses, and in one place so the two cannot drift apart. GCController does
     /// not carry chirality itself; `Accessory` does, and the two objects are
     /// not joined here.
+    ///
+    /// Two spellings of the left one. The name ended in "(L)" on every system
+    /// this was written against; the sender of fix 37 reports "(Left)" and
+    /// "(Right)" from a newer one, where "(L)" alone made BOTH controllers the
+    /// right hand: the left one's buttons were written over the right hand's
+    /// and hand 0 was cleared every poll as not attached (2026-10-14; not seen
+    /// here). A name that ends in neither is the right hand, as before.
     static func hand(of c: GCController) -> Int {
-        (c.vendorName ?? "").hasSuffix("(L)") ? 0 : 1
+        let name = c.vendorName ?? ""
+        return name.hasSuffix("(L)") || name.hasSuffix("(Left)") ? 0 : 1
     }
 
     /// Follow both hands' envelopes. Called once a frame from the compositor,
@@ -2006,6 +2057,13 @@ final class KleptonControllers {
         NSLog("[cp] pinch: L \(fmt(0)) | R \(fmt(1)) "
               + String(format: "(open %.3f closed %.3f, %d spatial events, %d unattributed)",
                        Self.pinchOpen, Self.pinchClosed, spatialEvents, spatialNoChirality))
+        if Self.discretePinch {
+            NSLog(String(format: "[cp] pinch, missing hand/skeleton/fingertips: "
+                                 + "L %d/%d/%d | R %d/%d/%d frames",
+                         pinchMissingHand[0], pinchNoSkeleton[0], pinchMissingTips[0],
+                         pinchMissingHand[1], pinchNoSkeleton[1], pinchMissingTips[1]))
+            pinchMissingHand = [0, 0]; pinchMissingTips = [0, 0]
+        }
         pinchMin = [9, 9]; pinchPeak = [0, 0]
         pinchFires = [0, 0]; pinchNoSkeleton = [0, 0]
         pinchFromSystem = [0, 0]; pinchFromDistance = [0, 0]
@@ -2016,6 +2074,133 @@ final class KleptonControllers {
 
     /// Debounced press state for the *fallback* pinch trigger, per hand.
     private var pinchHeld = [false, false]
+
+    // MARK: - The discrete pinch (one title)
+
+    /// KL_PINCH_DISCRETE — a hand's pinch as a trigger that is 0 or 1 and
+    /// nothing between, through `KleptonPinch`. For BattleGroupVR2
+    /// (x9386827918099701) alone: its trigger action is a boolean on the
+    /// trigger's VALUE, so the measured closure every other game is handed
+    /// while the fingers approach (its laser reacts to it) is a click there,
+    /// at any partial closure. Sent in by a user (fix 38, 2026-10-13), who
+    /// played it that way; nobody here has.
+    ///
+    /// Every use below is behind this one switch. With it off, which is every
+    /// other game, the code beside it is what it was.
+    private static let discretePinch: Bool = {
+        let on = klEnvOn("KL_PINCH_DISCRETE", default: klTargetName() == "x9386827918099701")
+        if on {
+            NSLog("[cp] KL_PINCH_DISCRETE — hand pinches are a 0/1 trigger: a system pinch "
+                  + "presses and releases with its gesture, the fingertip distance after "
+                  + "40 ms closed and 50 ms open again, 80 ms of missing fingertips are "
+                  + "bridged, a lost hand releases")
+        }
+        return on
+    }()
+    private var discretePinches = [KleptonPinch(), KleptonPinch()]
+    /// The system's pinch gestures by their ids, per hand. Under `lock`.
+    private var discreteSystemPinches = KleptonSystemPinches<SpatialEventCollection.Event.ID>()
+    /// Frames without the hand, and with a skeleton but without both fingertips,
+    /// per report interval (`pinchNoSkeleton` then counts the skeleton alone).
+    private var pinchMissingHand = [0, 0]
+    private var pinchMissingTips = [0, 0]
+
+    /// Whatever this hand's pinch held is let go, and the gesture it came from
+    /// is used up: an update of the same gesture cannot press again.
+    private func resetDiscretePinch(_ hand: Int) {
+        discretePinches[hand].reset()
+        pinchHeld[hand] = false
+        lock.lock()
+        discreteSystemPinches.discard(hand: hand)
+        lock.unlock()
+    }
+
+    /// `pinchTrigger`'s measurement, with "not measured" kept apart from "open":
+    /// nil without a skeleton, without both fingertips, or for a distance that
+    /// is not a number.
+    private func discretePinchValue(_ anchor: HandAnchor, hand: Int) -> Float? {
+        guard let sk = anchor.handSkeleton else { pinchNoSkeleton[hand] += 1; return nil }
+        let thumb = sk.joint(.thumbTip), index = sk.joint(.indexFingerTip)
+        guard thumb.isTracked && index.isTracked else {
+            pinchMissingTips[hand] += 1; return nil
+        }
+        let o = anchor.originFromAnchorTransform
+        let a = (o * thumb.anchorFromJointTransform).columns.3
+        let b = (o * index.anchorFromJointTransform).columns.3
+        let d = simd_length(SIMD3<Float>(a.x - b.x, a.y - b.y, a.z - b.z))
+        guard d.isFinite else { return nil }
+        let t = max(0, min(1, (Self.pinchOpen - d) / (Self.pinchOpen - Self.pinchClosed)))
+        tracePinch(hand: hand, distance: d, value: t)
+        return t
+    }
+
+    /// A tracked hand's trigger in discrete mode: the place of the pinch block
+    /// in `update`, with the same sources and the same switches. The bit and
+    /// the axis are one press; no partial closure reaches the guest.
+    private func discretePinchInput(_ anchor: HandAnchor, hand: Int,
+                                    into st: inout KleptonHandState,
+                                    at presentationTime: TimeInterval) {
+        let measured = discretePinchValue(anchor, hand: hand)
+        let t = measured ?? 0
+        lock.lock()
+        let sysSeen = systemPinchSeen
+        let native = discreteSystemPinches.sample(
+            hand: hand, at: ProcessInfo.processInfo.systemUptime)
+        lock.unlock()
+        // Counted as in the other path, so the two-second line reads the same.
+        let byDistance = Self.pinchSrc != .system
+            && (pinchHeld[hand] ? (t > 0.30) : (t > 0.55))
+        let bySystem = Self.pinchSrc != .distance && sysSeen && native.down
+        let pinchAllowed = padName == nil || Self.gamepadKeepsPinch
+        st.indexTrigger = discretePinches[hand].update(
+            value: measured, systemDown: bySystem,
+            systemStarted: Self.pinchSrc != .distance && native.started,
+            distanceEnabled: Self.pinchSrc != .system,
+            enabled: pinchAllowed, at: presentationTime)
+        let pressed = st.indexTrigger != 0
+        if bySystem { pinchFromSystem[hand] += 1 }
+        if byDistance { pinchFromDistance[hand] += 1 }
+        pinchHeld[hand] = pressed
+        if pressed {
+            pinchFires[hand] += 1
+            let bit = hand == 0 ? OVRPRawButton.lIndexTrigger
+                                : OVRPRawButton.rIndexTrigger
+            st.buttons |= bit; st.touches |= bit
+        }
+    }
+
+    /// `handleSpatialEvents` in discrete mode. Direct and indirect pinches are
+    /// both taken, and each gesture is followed by its id from its first event
+    /// to its last: the event that ends one may carry neither its kind nor its
+    /// hand, and still ends the gesture that hand began.
+    private func handleDiscreteSpatialEvents(_ events: SpatialEventCollection) {
+        for e in events {
+            let active = e.phase == .active
+            let isPinch = e.kind == .indirectPinch || e.kind == .directPinch
+            guard isPinch || !active else { continue }
+            let hand: Int?
+            switch e.chirality {
+            case .left: hand = 0
+            case .right: hand = 1
+            default: hand = nil
+            }
+            lock.lock()
+            let fresh = active && !discreteSystemPinches.owns(id: e.id)
+            let owner = discreteSystemPinches.receive(
+                id: e.id, hand: hand, active: active,
+                at: ProcessInfo.processInfo.systemUptime)
+            if owner != nil {
+                spatialEvents += 1
+                systemPinchSeen = true
+            }
+            if hand == nil { spatialNoChirality += 1 }
+            lock.unlock()
+            if Self.pinchTrace, let owner, fresh || !active {
+                NSLog("[cp] system pinch \(active ? "start" : "release") hand \(owner) id \(e.id), "
+                      + "chirality \(hand == nil ? "inherited" : "provided")")
+            }
+        }
+    }
 
     /// Whether a hand is currently NOT hand-tracked because the other one holds
     /// a controller (see `update`). Only for the one-line transition log.
@@ -2047,6 +2232,7 @@ final class KleptonControllers {
     /// guest's index trigger means "the user is selecting", which is what an
     /// indirect pinch is.
     func handleSpatialEvents(_ events: SpatialEventCollection) {
+        if Self.discretePinch { handleDiscreteSpatialEvents(events); return }
         for e in events {
             guard e.kind == .indirectPinch else { continue }
             // No chirality means the system could not attribute the pinch to a
@@ -2116,6 +2302,7 @@ final class KleptonControllers {
 
             let accPose = sense[hand]
             if let accPose {
+                if Self.discretePinch { resetDiscretePinch(hand) }
                 handSuppressed[hand] = false
                 st.position = accPose.0; st.orientation = accPose.1
                 st.linearVelocity = accPose.2; st.angularVelocity = accPose.3
@@ -2132,6 +2319,7 @@ final class KleptonControllers {
                           + "one is off (KL_HANDS_WITH_CONTROLLER=1 restores it)")
                 }
                 pinchHeld[hand] = false
+                if Self.discretePinch { resetDiscretePinch(hand) }
                 kl_ovrp_set_hand_motion(Int32(hand), 0, -10, 0, 0, 0, 0, 1,
                                         0, 0, 0, 0, 0, 0)
                 kl_ovrp_set_controller_input(Int32(hand), 0, 0, 0, 0, 0, 0)
@@ -2148,6 +2336,10 @@ final class KleptonControllers {
                 // lost (Tea For God's menu: "12 down" on a hand holding a Sense).
                 if st.fromController {
                     pinchHeld[hand] = false
+                    if Self.discretePinch { resetDiscretePinch(hand) }
+                } else if Self.discretePinch {
+                    discretePinchInput(anchor, hand: hand, into: &st, at: presentationTime)
+                    mergePad(into: &st, hand: hand)
                 } else {
                 // pollButtons() has already cleared this hand's bits (no Sense
                 // controller wrote it), so everything the pinch sets is set
@@ -2215,6 +2407,26 @@ final class KleptonControllers {
                 // wrapped round a controller in the lap are exactly the hands
                 // the tracker loses. Its buttons must not wait for a hand to be
                 // seen again.
+                //
+                // Discrete pinch: a hand that is lost lets go. Without a
+                // gamepad nothing below pushes for a bare hand, so the release
+                // is said here; and the gesture is used up, so that the hand
+                // coming back still pinched does not click.
+                if Self.discretePinch && !st.fromController {
+                    pinchMissingHand[hand] += 1
+                    resetDiscretePinch(hand)
+                    st.indexTrigger = 0
+                    let bit = hand == 0 ? OVRPRawButton.lIndexTrigger
+                                        : OVRPRawButton.rIndexTrigger
+                    st.buttons &= ~bit; st.touches &= ~bit
+                    if padName == nil {
+                        kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
+                                                     st.indexTrigger, st.handTrigger,
+                                                     st.stick.x, st.stick.y)
+                        lock.lock(); state[hand] = st; lock.unlock()
+                        continue
+                    }
+                }
                 if !st.fromController, padName != nil {
                     pinchHeld[hand] = false
                     mergePad(into: &st, hand: hand)

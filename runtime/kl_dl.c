@@ -821,6 +821,27 @@ void *klb_dlopen(const char *path, int flags) {
 
 static void *kl_dl_interpose(const char *name, void *real);
 
+// android_dlopen_ext(path, flags, android_dlextinfo *). With no extension asked
+// for it is dlopen, and that is the only form served. The struct begins with a
+// uint64_t of flags on both Android ABIs, and nothing after it is read: every
+// flag names something this loader does not do (a file descriptor instead of a
+// path, a reserved address range, a linker namespace), and loading by path
+// while ignoring one would load something other than what was asked for. Such
+// a request fails with a dlerror that says so. BattleGroupVR2 (fix 38,
+// 2026-10-13) imports the name; until now it was left unresolved, and a call
+// stopped the process by name.
+void *klb_android_dlopen_ext(const char *path, int flags, const void *info) {
+    uint64_t extflags = 0;
+    if (info) memcpy(&extflags, info, sizeof extflags);
+    if (extflags) {
+        snprintf(g_dlerr, sizeof g_dlerr,
+                 "android_dlopen_ext: unsupported extension flags 0x%llx",
+                 (unsigned long long)extflags);
+        return NULL;
+    }
+    return klb_dlopen(path, flags);
+}
+
 // KL_TRACE_DLSYM=1: name every dlsym that comes back NULL, with the guest image
 // that asked. A NULL returned here and then CALLED is the jump-to-0x0 AMFI kills
 // as an "Invalid Page" (OLAR) — uncatchable, so the crash report cannot name the

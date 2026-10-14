@@ -45,7 +45,8 @@ RUNTIME_JNI := runtime/kl_jni.c \
            runtime/jni/kl_jni_services.c runtime/jni/kl_jni_io.c \
            runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
            runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c \
-           runtime/jni/kl_jni_haptics.c
+           runtime/jni/kl_jni_haptics.c \
+           runtime/jni/kl_jni_firebase.c runtime/jni/kl_jni_vivox.c
 
 # The Linux process runtime (runtime/linux/) and its door. Part of what ships:
 # a Linux guest in the visionOS app is the same code as build/m_linux.
@@ -66,17 +67,19 @@ RUNTIME_SHIP := $(LX_SRC) runtime/guest/kl_linuxproc.c \
            runtime/gfx/kl_egl.c runtime/media/kl_opensl.c runtime/media/kl_audio.c runtime/xr/kl_ovrp.c \
            runtime/xr/kl_ovrp_sret.S runtime/gfx/kl_reproject.c runtime/gfx/kl_present.c \
            runtime/xr/kl_ovrplat.c runtime/xr/kl_steamapi.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
-           runtime/gfx/kl_vulkan.c runtime/gfx/kl_vk_eyefix.c runtime/gfx/kl_mtl_foveate.m \
+           runtime/gfx/kl_vulkan.c runtime/gfx/kl_vk_eyefix.c runtime/gfx/kl_mtl_foveate.m runtime/gfx/kl_mtl_busy.m \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
            runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_xashservers.c runtime/guest/kl_sdl2.c \
            runtime/guest/kl_gles3jni.c runtime/guest/kl_driver.c \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
+           runtime/media/kl_audio_switch.c runtime/media/kl_sink2_audio.c \
+           runtime/media/kl_sink2_opensl.c runtime/media/kl_sink2_aaudio.c \
            runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_fove.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
            runtime/guest/kl_mono.c \
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \
            runtime/media/kl_menu_font.S \
-           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c runtime/diag/kl_stall.c \
+           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c runtime/diag/kl_stall.c runtime/diag/kl_metrics.c \
            runtime/guest/kl_songs.c
 RUNTIME_DIAG := runtime/diag/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
@@ -151,6 +154,17 @@ guestswap:
 build/t_load: tests/t_load.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_load.c $(RUNTIME) $(LDLIBS)
+
+# android_dlopen_ext through the guest-facing symbol table: the plain form is
+# dlopen, and every extension flag is refused with a dlerror that names it. No
+# guest library is loaded; milliseconds, in `make check`.
+build/t_dl_ext: tests/t_dl_ext.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_dl_ext.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: dl-ext
+dl-ext: build/t_dl_ext
+	./build/t_dl_ext
 
 # Which guest the host gates run against. `make check TARGET=superhot` points
 # every one of them at another title's tree — the libraries, the assets and the
@@ -362,6 +376,61 @@ build/t_xrspace: tests/t_xrspace.c $(RUNTIME) $(RUNTIME_HDRS)
 xrspace: build/t_xrspace
 	./build/t_xrspace
 
+# The pose-boundary gate for KL_OVRP_ONE_POSE (from rebelancap's fork) — one
+# head pose per guest frame cycle, and the anchor filed for reprojection equal
+# to it. Unity's render and sim threads number the same frame differently in
+# gameplay, so a boundary keyed on that number froze two head poses inside one
+# frame (his `poses/frame` 1.70 instead of 1.00). A process per case, because
+# the switch is read once: on; on with the index boundary, which must be SEEN
+# to split; off, where nothing may be frozen; and on for the two kinds of guest
+# that never call ovrp_WaitToBeginFrame (OpenXR frames, with and without an
+# ovrp_Update2 in mid-frame), where the switch must do nothing. Milliseconds;
+# in `make check`.
+build/t_posebound: tests/t_posebound.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_posebound.c $(RUNTIME) $(LDLIBS)
+
+posebound: build/t_posebound
+	./build/t_posebound
+
+# The audio path's switch (runtime/media/kl_audio_switch.c): two whole audio
+# paths are linked in, and KL_AUDIO_SINK2 picks one for a run. The gate holds
+# that the choice is made by the first lookup and not before, and that every
+# public name then answers from the chosen path — run once each way.
+build/t_audioswitch: tests/t_audioswitch.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_audioswitch.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: audioswitch
+audioswitch: build/t_audioswitch
+	./build/t_audioswitch 0 && ./build/t_audioswitch 1
+
+# The second sink's own gates, from rebelancap's fork with it (tests/t_audio.c
+# and tests/t_aaudio.c there). They call his code under its linked names, past
+# the switch. The first: a guest's sample format, per encoding, and the OpenSL
+# surface driven with PCM and PCM_EX sources — a float32 guest played as int16
+# is half-speed static in one ear, and the [sl] line it produced read the same
+# as a correct player's. Milliseconds; in `make check`.
+build/t_sink2_audio: tests/t_sink2_audio.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_sink2_audio.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: sink2-audio
+sink2-audio: build/t_sink2_audio
+	@./build/t_sink2_audio
+
+# The second: the block-seam harness. It models a guest's mixer — a copy
+# callback in front of an asynchronous producer — so the AAudio path can be
+# measured on the host. Real time (20 s by default) and it opens the real
+# output device, at +-1 LSB, so it is NOT in `check`.
+build/t_sink2_aaudio: tests/t_sink2_aaudio.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_sink2_aaudio.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: sink2-aaudio
+sink2-aaudio: build/t_sink2_aaudio
+	@./build/t_sink2_aaudio
+
 # The OpenXR action-surface gate — the same argument as xrspace above,
 # one API family across. A binding decoded to the wrong bit, two hands combined
 # the wrong way, a stale press surviving a controller being put down, an action
@@ -421,6 +490,43 @@ build/t_jniobj: tests/t_jniobj.c $(RUNTIME) $(RUNTIME_HDRS)
 
 jniobj: build/t_jniobj
 	./build/t_jniobj
+
+# java.io.FileOutputStream and File.delete/setWritable/setReadOnly through the
+# guest-facing JNI slots, A and V calls both, against a temporary directory
+# under build/: what is written, what a failed open or write throws, which
+# permission bits move, and that deleting a link leaves its target. No guest;
+# in `make check`.
+build/t_jni_io: tests/t_jni_io.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jni_io.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: jni-io
+jni-io: build/t_jni_io
+	./build/t_jni_io
+
+# BattleGroupVR2's own answers (fix 38), each with the proof that no other
+# title gets them: the Firebase and Vivox starts that throw instead of
+# stopping the process, and the Unity 6.2 memory callback with the title's
+# memory defaults. Made-up SDK calls; no game, no network; in `make check`.
+build/t_jni_firebase: tests/t_jni_firebase.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jni_firebase.c $(RUNTIME) $(LDLIBS)
+
+build/t_jni_vivox: tests/t_jni_vivox.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jni_vivox.c $(RUNTIME) $(LDLIBS)
+
+build/t_jni_memory: tests/t_jni_memory.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jni_memory.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: jni-firebase jni-vivox jni-memory
+jni-firebase: build/t_jni_firebase
+	./build/t_jni_firebase
+jni-vivox: build/t_jni_vivox
+	./build/t_jni_vivox
+jni-memory: build/t_jni_memory
+	./build/t_jni_memory
 
 # kl_view.c is the KL_VIEW=1 interactive viewer (SDL3); only m_boot links it,
 # so only this rule carries the pkg-config flags. kl_view.c compiles to a stub
@@ -689,6 +795,38 @@ build/t_fove: tests/t_fove.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_fove.c $(RUNTIME) $(LDLIBS)
 
+# The metrics panel's GPU numbers (kl_mtl_busy.m): every committed command
+# buffer counted, overlapping spans once. Skips itself without a Metal device.
+build/t_mtlbusy: tests/t_mtlbusy.m runtime/gfx/kl_mtl_busy.m runtime/gfx/kl_mtl_busy.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tests/t_mtlbusy.m runtime/gfx/kl_mtl_busy.m -framework Metal -framework Foundation
+
+# ...and the sample they are part of (kl_metrics.c): rates, the busiest thread, memory.
+build/t_metrics: tests/t_metrics.c runtime/diag/kl_metrics.c runtime/diag/kl_metrics.h runtime/gfx/kl_mtl_busy.m runtime/gfx/kl_mtl_busy.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tests/t_metrics.c runtime/diag/kl_metrics.c runtime/gfx/kl_mtl_busy.m -framework Metal -framework Foundation
+
+# The panel itself as a picture, from a made-up minute: the drawing runs on the
+# Mac, so its layout can be looked at without a headset.
+build/metrics_preview: tools/metrics_preview/main.swift visionos/Sources/KleptonMetrics.swift
+	@mkdir -p build
+	swiftc -O -o $@ visionos/Sources/KleptonMetrics.swift tools/metrics_preview/main.swift
+
+# The discrete hand pinch (KleptonPinch.swift, KL_PINCH_DISCRETE): the filter
+# the app compiles, run on the Mac against timed sequences of fingertip values
+# and system pinch events at 60, 90 and 100 Hz. No ARKit; in `make check`.
+build/t_pinch: tests/t_pinch.swift visionos/Sources/KleptonPinch.swift
+	@mkdir -p build
+	swiftc -o $@ visionos/Sources/KleptonPinch.swift tests/t_pinch.swift
+
+.PHONY: pinch
+pinch: build/t_pinch
+	./build/t_pinch
+
+.PHONY: metrics-preview
+metrics-preview: build/metrics_preview
+	@./build/metrics_preview 60 build/metrics && echo "  build/metrics-panel.png, build/metrics-line.png"
+
 # Full regression sweep — run this first when picking work back up.
 #
 # tgkill/tkill(tid, 0) liveness probes answered by the raw-syscall door.
@@ -703,7 +841,7 @@ tgkill: build/t_tgkill
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_mtxtable build/t_bcast build/t_fault build/t_glcaps build/t_x18race build/t_tgkill build/klepton-ld build/t_uevk build/t_jniobj build/t_fove
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_posebound build/t_audioswitch build/t_sink2_audio build/t_xrinput build/t_softinput build/t_ctr build/t_mtxtable build/t_bcast build/t_fault build/t_glcaps build/t_x18race build/t_tgkill build/klepton-ld build/t_uevk build/t_jniobj build/t_fove build/t_mtlbusy build/t_metrics build/t_dl_ext build/t_jni_io build/t_jni_firebase build/t_jni_vivox build/t_jni_memory build/t_pinch
 	@# The guest steps read $(TARGET)'s own files. Without them the loader steps print nothing and pass, and the
 	@# run ends at the il2cpp step with a bare "Error 1" - a check that looked green until its last line. A
 	@# working copy without the game's tree (a fresh git worktree) is told so here, before anything runs.
@@ -723,6 +861,12 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@grep -E '=== HEVC|30 access units' build/hevc.log && tail -1 build/hevc.log
 	@./build/t_xrspace > build/xrspace.log 2>&1 || { cat build/xrspace.log; exit 1; }
 	@head -2 build/xrspace.log && tail -1 build/xrspace.log
+	@./build/t_posebound > build/posebound.log 2>&1 || { cat build/posebound.log; exit 1; }
+	@head -1 build/posebound.log && grep -E '^(PASS|FAIL)' build/posebound.log
+	@{ ./build/t_audioswitch 0 && ./build/t_audioswitch 1; } > build/audioswitch.log 2>&1 || { cat build/audioswitch.log; exit 1; }
+	@grep -E '^(===|PASS|FAIL)' build/audioswitch.log
+	@./build/t_sink2_audio > build/sink2-audio.log 2>&1 || { cat build/sink2-audio.log; exit 1; }
+	@echo "=== second audio sink: sample formats, OpenSL sources ===" && tail -1 build/sink2-audio.log
 	@./build/t_xrinput > build/xrinput.log 2>&1 || { cat build/xrinput.log; exit 1; }
 	@grep -E '=== OpenXR actions' build/xrinput.log && tail -1 build/xrinput.log
 	@./build/t_softinput > build/softinput.log 2>&1 || { cat build/softinput.log; exit 1; }
@@ -741,6 +885,20 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@head -3 build/haptics.log && tail -1 build/haptics.log
 	@./build/t_fove > build/fove.log 2>&1 || { cat build/fove.log; exit 1; }
 	@head -1 build/fove.log && tail -1 build/fove.log
+	@./build/t_mtlbusy > build/mtlbusy.log 2>&1 || { cat build/mtlbusy.log; exit 1; }
+	@head -1 build/mtlbusy.log && tail -1 build/mtlbusy.log
+	@./build/t_metrics > build/metrics.log 2>&1 || { cat build/metrics.log; exit 1; }
+	@head -1 build/metrics.log && tail -1 build/metrics.log
+	@./build/t_dl_ext > build/dl-ext.log 2>&1 || { cat build/dl-ext.log; exit 1; }
+	@echo "=== android_dlopen_ext ===" && tail -1 build/dl-ext.log
+	@./build/t_jni_io > build/jni-io.log 2>&1 || { cat build/jni-io.log; exit 1; }
+	@echo "=== JNI file output ===" && tail -1 build/jni-io.log
+	@./build/t_jni_firebase > build/jni-firebase.log 2>&1 || { cat build/jni-firebase.log; exit 1; }
+	@./build/t_jni_vivox > build/jni-vivox.log 2>&1 || { cat build/jni-vivox.log; exit 1; }
+	@./build/t_jni_memory > build/jni-memory.log 2>&1 || { cat build/jni-memory.log; exit 1; }
+	@echo "=== BattleGroupVR2: Firebase, Vivox, memory ===" && tail -1 build/jni-firebase.log && tail -1 build/jni-vivox.log && tail -1 build/jni-memory.log
+	@./build/t_pinch > build/pinch.log 2>&1 || { cat build/pinch.log; exit 1; }
+	@echo "=== discrete hand pinch ===" && tail -1 build/pinch.log
 	@$(MAKE) -s ovrpabi
 # The opus roundtrip is the one gate here that RUNS guest code rather than
 # inspecting it, so it is worth keeping wherever it exists — but libunityopus.so

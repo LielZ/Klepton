@@ -199,7 +199,7 @@ prctl sched_getaffinity sched_setaffinity stat fstat lstat statfs uname sigactio
 __FD_ISSET_chk __FD_SET_chk __ctype_get_mb_cur_max lseek64 getpwuid getpwuid_r
 opendir readdir closedir setjmp longjmp strtold wcstold strtold_l
 swprintf vswprintf vprintf vsscanf execl system syscall sysconf fopen access mkdir unlink rename
-dlopen dlsym dlclose dlerror dladdr dl_iterate_phdr
+dlopen dlsym dlclose dlerror dladdr dl_iterate_phdr android_dlopen_ext
 memrchr memalign
 fputc fputs fwrite fread fclose fflush fgets getc feof ferror clearerr
 fseek fseeko ftell ftello setvbuf

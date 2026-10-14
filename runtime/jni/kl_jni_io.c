@@ -1,10 +1,12 @@
-// java.util.zip.ZipFile, java.io.InputStream, AVPro's crypto helpers
+// java.util.zip.ZipFile, java.io.InputStream, java.io.FileOutputStream,
+// AVPro's crypto helpers
 //
 // One family of the synthetic JNIEnv's Java classes. The mechanism (registries,
 // dispatch, id interning) is kl_jni.c; this file owns implementations and the
 // binding table that names them. See runtime/jni/kl_jni_int.h for the seam.
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -378,6 +380,118 @@ static klj_val klj_InputStream_close(void *env, void *self, const klj_val *a, in
     return (klj_val){.l = NULL};
 }
 
+// ---- java.io.FileOutputStream ----
+// BattleGroupVR2 0.251 (fix 38, 2026-10-13) reaches FileOutputStream(File) at
+// its start, from the Firebase SDK's cache of the files it embeds, and stopped
+// here. Real writes, to the path java.io.File and the guest's own open() name:
+// the same kl_guest_path mapping, nothing wider. A failed open or write throws
+// what Java's does; it must never look saved.
+typedef struct { int fd; pthread_mutex_t lock; } klj_output;
+
+static int klj_output_close(klj_output *st) {
+    if (!st) return 0;
+    pthread_mutex_lock(&st->lock);
+    int fd = st->fd, error = 0;
+    st->fd = -1;
+    if (fd >= 0 && close(fd) != 0) error = errno;
+    pthread_mutex_unlock(&st->lock);
+    return error;
+}
+static void klj_output_free(void *p) {
+    klj_output *st = p;
+    if (!st) return;
+    klj_output_close(st);
+    pthread_mutex_destroy(&st->lock);
+    free(st);
+}
+static klj_val klj_output_open(const char *path, int append) {
+    if (!path) {
+        klj_raise("java/lang/NullPointerException", "FileOutputStream path is null");
+        return (klj_val){0};
+    }
+    klj_output *st = calloc(1, sizeof *st);
+    if (!st) {
+        klj_raise("java/lang/OutOfMemoryError", "FileOutputStream");
+        return (klj_val){0};
+    }
+    int error = pthread_mutex_init(&st->lock, NULL);
+    if (error) {
+        free(st);
+        klj_raise("java/io/IOException", strerror(error));
+        return (klj_val){0};
+    }
+    char kp[1024];
+    st->fd = open(kl_guest_path(path, kp, sizeof kp),
+                  O_WRONLY | O_CREAT | O_CLOEXEC | (append ? O_APPEND : O_TRUNC), 0666);
+    if (st->fd < 0) {
+        error = errno;
+        klj_output_free(st);
+        KLJ_LOG("FileOutputStream(%s): %s", path, strerror(error));
+        klj_raise("java/io/FileNotFoundException", strerror(error));
+        return (klj_val){0};
+    }
+    KLJ_LOG("FileOutputStream(%s, append=%d) opened", path, append);
+    return (klj_val){.l = klj_own(klj_new_object_data("java/io/FileOutputStream", st),
+                                 klj_output_free)};
+}
+static klj_val klj_FileOutputStream_init_file(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    klj_object *file = n > 0 ? klj_as_object(a[0].l) : NULL;
+    return klj_output_open(file ? file->data : NULL, n > 1 && a[1].j != 0);
+}
+static klj_val klj_FileOutputStream_init_str(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    return klj_output_open(n > 0 ? klj_str(a[0].l) : NULL, n > 1 && a[1].j != 0);
+}
+static klj_val klj_output_write(void *self, const void *data, size_t len) {
+    klj_object *o = klj_as_object(self);
+    klj_output *st = o ? o->data : NULL;
+    int error = EBADF;
+    if (st) {
+        pthread_mutex_lock(&st->lock);
+        if (st->fd >= 0) {
+            error = 0;
+            const uint8_t *p = data;
+            while (len) {
+                ssize_t done = write(st->fd, p, len);
+                if (done < 0 && errno == EINTR) continue;
+                if (done <= 0) { error = done < 0 ? errno : EIO; break; }
+                p += done; len -= (size_t)done;
+            }
+        }
+        pthread_mutex_unlock(&st->lock);
+    }
+    if (error) klj_raise("java/io/IOException", strerror(error));
+    return (klj_val){0};
+}
+static klj_val klj_FileOutputStream_write_off(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_array *b = n > 0 ? klj_arr(a[0].l) : NULL;
+    if (!b) {
+        klj_raise("java/lang/NullPointerException", "FileOutputStream byte array is null");
+        return (klj_val){0};
+    }
+    int off = n > 1 ? (int)a[1].j : 0, len = n > 2 ? (int)a[2].j : b->len;
+    // Subtract after checking off: off + len could overflow for bad arguments.
+    if (off < 0 || len < 0 || off > b->len || len > b->len - off) {
+        klj_raise("java/lang/IndexOutOfBoundsException", "FileOutputStream byte range");
+        return (klj_val){0};
+    }
+    return klj_output_write(self, len ? (const uint8_t *)b->data + off : NULL, (size_t)len);
+}
+static klj_val klj_FileOutputStream_write1(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    uint8_t byte = n > 0 ? (uint8_t)a[0].j : 0;
+    return klj_output_write(self, &byte, 1);
+}
+static klj_val klj_FileOutputStream_close(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    int error = klj_output_close(o ? o->data : NULL);
+    if (error) klj_raise("java/io/IOException", strerror(error));
+    return (klj_val){0};
+}
+
 // ---- AVPro Video's Java crypto helpers ----
 //
 // VRChat ships RenderHeads' AVPro Video, whose native half keeps five crypto
@@ -626,5 +740,13 @@ const klj_binding klj_bind_io[] = {
     {"java/io/InputStream", "skip",      "(J)J",    klj_InputStream_skip},
     {"java/io/InputStream", "available", "()I",     klj_InputStream_available},
     {"java/io/InputStream", "close",     "()V",     klj_InputStream_close},
+    {"java/io/FileOutputStream", "<init>", "(Ljava/io/File;)V", klj_FileOutputStream_init_file},
+    {"java/io/FileOutputStream", "<init>", "(Ljava/io/File;Z)V", klj_FileOutputStream_init_file},
+    {"java/io/FileOutputStream", "<init>", "(Ljava/lang/String;)V", klj_FileOutputStream_init_str},
+    {"java/io/FileOutputStream", "<init>", "(Ljava/lang/String;Z)V", klj_FileOutputStream_init_str},
+    {"java/io/FileOutputStream", "write", "([BII)V", klj_FileOutputStream_write_off},
+    {"java/io/FileOutputStream", "write", "([B)V", klj_FileOutputStream_write_off},
+    {"java/io/FileOutputStream", "write", "(I)V", klj_FileOutputStream_write1},
+    {"java/io/FileOutputStream", "close", "()V", klj_FileOutputStream_close},
     {0}
 };

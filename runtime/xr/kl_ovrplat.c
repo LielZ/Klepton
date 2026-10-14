@@ -380,6 +380,11 @@ static uint64_t klplat_called(const char *name) {
 #define KLPLAT_MSG_ACHIEVEMENT_DEFS 0x03D3458Du  // .Achievements_GetAllDefinitions (empty array)
 #define KLPLAT_MSG_ACHIEVEMENT_PROG 0x4F9FDE1Du  // .Achievements_GetAllProgress (empty array)
 #define KLPLAT_MSG_LOGGED_IN_USER  0x436F345Du  // .User_GetLoggedInUser (Message<User>)
+#define KLPLAT_MSG_RICH_DESTINATIONS 0x586F2D14u // .RichPresence_GetDestinations (empty array).
+                                                //   Read from AC Nexus's, Demeo's and Premium
+                                                //   Bowling's global-metadata, where it stands
+                                                //   before GetNextDestinationArrayPage's and
+                                                //   Set's; Real VR Fishing's own was not here
 #define KLPLAT_MSG_USER_GET        0x6BCF9E47u  // .User_Get (Message<User>; KL_PROBE_ENUM, Wooorld 2.4.0)
 #define KLPLAT_MSG_USER_PROOF      0x22810483u  // .User_GetUserProof (BRINK Traveler's
                                                 //   global-metadata, beside GetLoggedInUser's)
@@ -1897,6 +1902,24 @@ static uint64_t klplat_Achievements_GetAllProgress(void) {
                           KLPLAT_MSG_ACHIEVEMENT_PROG, 0);
 }
 
+// The rich-presence DESTINATIONS — the places inside the game its developer
+// registered with the store, which a game reads to offer "join me here". They
+// say where a player can be, not what a player owns, and no service here has a
+// list of them: the answer is an EMPTY one, completed like the two achievement
+// lists above (IsError false, a DestinationArray of size 0) and read the same
+// way, through GetDestinationArray (-> the message payload) and the existing
+// Array_GetSize answer (plat_is_empty_array -> 0). The name had no entry at
+// all, so the first call ended the run ("unimplemented Oculus Platform entry
+// point"); Real VR Fishing (x2582932495064035) asks at start and, by its
+// sender, waits for the completion (fix 37, 2026-10-14; not run here). The
+// setters beside it (ovr_RichPresence_Set, _Clear, ...) stay "could not be
+// made" in g_plat_request.
+static uint64_t klplat_RichPresence_GetDestinations(void) {
+    plat_hit("ovr_RichPresence_GetDestinations");
+    return klplat_request("ovr_RichPresence_GetDestinations",
+                          KLPLAT_MSG_RICH_DESTINATIONS, 0);
+}
+
 // Who is signed in — the ASYNC request form (the synchronous ovr_GetLoggedInUserID
 // is separate, below). Its completion is Message<User>. By DEFAULT we still answer
 // 0, "the request could not be made", which is the offline path Beat Saber wants
@@ -1984,7 +2007,22 @@ static int klplat_user_listed(const char *t) {
                                 // 2026-10-13). With the user its music starts,
                                 // it asks for its leaderboards and the pointer
                                 // appears.
-                                "x2334376869949242" };
+                                "x2334376869949242",
+                                // BattleGroupVR2 0.251: its start waits for
+                                // player data. The entitlement request is
+                                // answered as for every game, then
+                                // GetLoggedInUser comes back 0 and the wait
+                                // never ends (the sender's device log, fix 38,
+                                // 2026-10-13). With the user it reaches its
+                                // menu and tutorial, as the sender saw; not
+                                // run by anyone here.
+                                "x9386827918099701",
+                                // Real VR Fishing: the AC Nexus chain again, by
+                                // its sender — the entitlement request
+                                // completes, GetLoggedInUser fails and the
+                                // game's online start gives up in its loading
+                                // scene (fix 37, 2026-10-14; not run here).
+                                "x2582932495064035" };
     // Beat Saber from 1.45 on (Unity 6; kl_guest_beatsaber_openxr): its start
     // asks for the user FIRST and goes no further without one — no entitlement
     // request, no scene, one draw a frame of black and silence (on device,
@@ -2064,8 +2102,17 @@ static uint64_t klplat_user_id(void) { pthread_once(&g_user_once, klplat_user_in
 // (seen on a Mac host, 2026-10-13: signed in after 0.4 s, then two seconds of
 // download and an upload). The game itself carries a profile over when the id
 // changes: it copies it to the new id's folder (LAST_DATAPATH_Oculus).
+//
+// ...and the two titles that got the offline user with fixes 37 and 38 (Real VR
+// Fishing, BattleGroupVR2; 2026-10-14) have it from their first release here:
+// nobody on this side has their files, so nobody could look whether they key
+// an account on the id — Real VR Fishing is an online game with things to buy —
+// and one account shared by every player is the worse of the two mistakes.
+// There are no saves filed under the fixed id to lose, apart from the two
+// senders' own.
 int kl_ovrplat_user_id_per_install(const char *target) {
-    return target && (strcmp(target, "x3634830803298285") == 0 || strcmp(target, "walkabout") == 0);
+    return target && (strcmp(target, "x3634830803298285") == 0 || strcmp(target, "walkabout") == 0 ||
+                      strcmp(target, "x2582932495064035") == 0 || strcmp(target, "x9386827918099701") == 0);
 }
 static uint64_t klplat_User_GetLoggedInUser(void) {
     plat_hit("ovr_User_GetLoggedInUser");
@@ -2760,6 +2807,7 @@ static const char *klplat_MessageType_ToString(uint32_t type) {
     case KLPLAT_MSG_ENTITLEMENT:            return "ovrMessage_Entitlement_GetIsViewerEntitled";
     case KLPLAT_MSG_ACCESS_TOKEN:           return "ovrMessage_User_GetAccessToken";
     case KLPLAT_MSG_ACHIEVEMENT_DEFS:       return "ovrMessage_Achievements_GetAllDefinitions";
+    case KLPLAT_MSG_RICH_DESTINATIONS:      return "ovrMessage_RichPresence_GetDestinations";
     case KLPLAT_MSG_LOGGED_IN_USER:         return "ovrMessage_User_GetLoggedInUser";
     case KLPLAT_MSG_USER_GET:               return "ovrMessage_User_Get";
     case KLPLAT_MSG_ORG_SCOPED_ID:          return "ovrMessage_User_GetOrgScopedID";
@@ -2875,6 +2923,9 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_Message_GetAchievementDefinitionArray", (void *)klplat_Message_GetPayload},
     {"ovr_Achievements_GetAllProgress",        (void *)klplat_Achievements_GetAllProgress},
     {"ovr_Message_GetAchievementProgressArray", (void *)klplat_Message_GetPayload},
+    // The rich-presence destinations: an empty list, completed (see the handler).
+    {"ovr_RichPresence_GetDestinations",       (void *)klplat_RichPresence_GetDestinations},
+    {"ovr_Message_GetDestinationArray",        (void *)klplat_Message_GetPayload},
     // The logged-in user (async) and the User accessors its completion feeds.
     // Gated by KL_PLAT_USER inside the handler; the accessors are inert unless a
     // user was handed out. The exact-match binding overrides ovr_User_GetLoggedInUser's

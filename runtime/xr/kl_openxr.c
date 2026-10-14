@@ -809,6 +809,19 @@ static klxr_instance *klxr_inst(void *h) {
     return (i && i->magic == KLXR_MAGIC_INSTANCE) ? i : NULL;
 }
 
+// Is the guest Steam's Android build of Moss (depot 846472, made for Steam
+// Frame)? It shares the target `moss` with the Meta build – same package, same
+// engine, same library names – and differs in its XR path: OpenXR here,
+// OVRPlugin there. What this runtime does for it alone asks here, so the Meta
+// build and every other OpenXR guest get what they got. Told from the Meta
+// build by Steam's library in the game's files, like Walkabout's Steam build
+// (klxr_pitches).
+static int klxr_moss_from_steam(void) {
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    return t && !strcmp(t, "moss") && (kl_steamapi_shipped() || kl_steamapi_in_use());
+}
+
 // The extensions we advertise, and the list is deliberately short.
 //
 // The guest's own log lines say what it does with the answer: it needs
@@ -829,7 +842,9 @@ static klxr_instance *klxr_inst(void *h) {
 enum { KLXR_GATE_ALWAYS = 0,      // unconditional
        KLXR_GATE_REFRESH = 1,     // ...unless KL_XR_REFRESH_EXT=0
        KLXR_GATE_VULKAN = 2,      // ...only when MoltenVK is actually reachable
-       KLXR_GATE_USER_PRESENCE = 3 };  // ...missioniss only (see below)
+       KLXR_GATE_USER_PRESENCE = 3,    // ...missioniss only (see below)
+       KLXR_GATE_PERF_METRICS = 4,     // ...not for Moss from Steam (see below)
+       KLXR_GATE_FRAME_CONTROLLER = 5 };   // ...Moss from Steam only (see below)
 
 static const struct { const char *name; uint32_t version; int gate; } g_extensions[] = {
     { "XR_KHR_opengl_es_enable",       10, KLXR_GATE_ALWAYS },
@@ -947,8 +962,9 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     // environment, and the guest's screens render on top through the
     // projection layer. Graduates to a real body if the background must show.
     { "XR_FB_passthrough",                    1, KLXR_GATE_ALWAYS },
-    { "XR_META_performance_metrics",          2, KLXR_GATE_ALWAYS },
+    { "XR_META_performance_metrics",          2, KLXR_GATE_PERF_METRICS },
     { "XR_EXT_user_presence",                 1, KLXR_GATE_USER_PRESENCE },
+    { "XR_VALVE_frame_controller_interaction", 1, KLXR_GATE_FRAME_CONTROLLER },
 };
 #define KLXR_EXT_ALL ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
 
@@ -1024,6 +1040,25 @@ static int klxr_ext_gate_open(int gate) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
         return kl_env_on("KL_XR_USER_PRESENCE", t && !strcmp(t, "missioniss"));
+    }
+    case KLXR_GATE_FRAME_CONTROLLER:
+        // The Steam Frame's own controller profile. Moss from Steam binds its jump and attack to that
+        // controller's keys and, of the Touch profile, only the sticks (its other Touch keys are the
+        // OVRPlugin input module's, which this build does not load): on the headset the reader could walk
+        // and nothing else (2026-10-14). Without the extension Unreal suggests the profile under a null
+        // path. The profile itself has been driveable here since VRChat. For that build only;
+        // KL_XR_FRAME_CONTROLLER overrides.
+        return kl_env_on("KL_XR_FRAME_CONTROLLER", klxr_moss_from_steam());
+    case KLXR_GATE_PERF_METRICS: {
+        // XR_META_performance_metrics is in the list by name only: none of its
+        // four entry points is served. A guest that asks xrGetInstanceProcAddr
+        // and checks the result is told so. Moss from Steam (depot 846472, UE
+        // 4.27.2 with Valve's SteamFrameOpenXRExtension) enables the extension
+        // because it is offered, does not check, and calls the NULL it was
+        // given: a jump to address 0 right after xrEnumerateViewConfigurationViews,
+        // before the session. Withheld, it does not enable it and goes on.
+        // For that build only; KL_XR_PERF_METRICS overrides.
+        return kl_env_on("KL_XR_PERF_METRICS", !klxr_moss_from_steam());
     }
     default:
         return 1;
@@ -1430,6 +1465,28 @@ static XrResult klxr_EnumerateViewConfigurationViews(
     int ew = 0, eh = 0;
     kl_ovrp_eye_texture_size_for_cone(&ew, &eh);
     if (ew <= 0 || eh <= 0) { ew = 2290; eh = 2400; }   // the Quest 2 default
+
+    // Moss from Steam (depot 846472, UE 4.27.2 on its OpenXR plugin with mobile
+    // multiview) drew a black picture at the 2290 above. The engine makes its
+    // swapchain the recommended size rounded UP to a multiple of 4 (2292) and
+    // keeps the view rect at the recommendation (2290); a render target larger
+    // than the views sends its mobile renderer down the "needs upscaling" road:
+    // the scene goes into the engine's own scene colour and the pass that would
+    // carry it on never comes for an array target. Traced on the Mac: every
+    // frame three passes into its own 2292x2400 pair, none into a swapchain
+    // image, no copy either – and the headsets this build was made for all
+    // recommend multiples of 4. With one here the two sizes agree and the
+    // scene pass resolves straight into the swapchain image.
+    // Rounded down, so a size that was capped stays under its cap. For that
+    // build only; KL_XR_EYE_ALIGN=<n> sets the multiple for any guest, 1 for
+    // none.
+    {
+        int align = kl_env_int("KL_XR_EYE_ALIGN", klxr_moss_from_steam() ? 4 : 1);
+        if (align > 1 && align <= 64 && ew >= 2 * align && eh >= 2 * align) {
+            ew -= ew % align;
+            eh -= eh % align;
+        }
+    }
 
     for (uint32_t i = 0; i < 2; i++) {
         klxr_log_chain("xrEnumerateViewConfigurationViews", views[i].next);
@@ -2950,6 +3007,11 @@ static float klxr_local_height(void) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
         on = t && strcmp(t, "x7527722310622065") == 0;
+        // Moss from Steam is the same case, seated: it places the reader's head against its table-top
+        // world from LOCAL as OpenXR defines it. With LOCAL on the floor the head stood 1.3 to 1.6 m above
+        // where the game expects it, and the whole scene lay far below and away ("viel zu weit weg von der
+        // Welt", headset 2026-10-14: `xrLocateSpace: VIEW in LOCAL: (-0.06 1.43 -0.06)`).
+        if (klxr_moss_from_steam()) on = 1;
     }
     if (!on) return kl_ovrp_eye_height();
     if (latched < 0.0f) {
@@ -3216,6 +3278,7 @@ enum {
     KLXR_SRC_NONE = 0,
     KLXR_SRC_BUTTON,          // a bit of the RAW buttons word
     KLXR_SRC_TOUCH,           // ...of the RAW touches word
+    KLXR_SRC_BUTTON_OTHER,    // a bit of EITHER hand's buttons word (see klxr_eval_other)
     KLXR_SRC_INDEX_TRIGGER,
     KLXR_SRC_HAND_TRIGGER,
     KLXR_SRC_STICK_X,
@@ -3354,6 +3417,7 @@ static int klxr_path_hand(const char *p, const char **suffix) {
 static const char *klxr_src_name(int kind) {
     switch (kind) {
         case KLXR_SRC_BUTTON:        return "button";
+        case KLXR_SRC_BUTTON_OTHER:  return "button (either hand)";
         case KLXR_SRC_TOUCH:         return "touch";
         case KLXR_SRC_INDEX_TRIGGER: return "index trigger";
         case KLXR_SRC_HAND_TRIGGER:  return "hand trigger";
@@ -3650,6 +3714,30 @@ static XrResult klxr_SuggestInteractionProfileBindings(
                     bit  = g_xr_sources[s].bit[hand];
                     break;
                 }
+            // Unreal binds a "grip click" key to the BARE /input/squeeze – the
+            // Touch profile has no squeeze/click, the runtime is to make the
+            // press out of the value. Moss from Steam suggests it for both
+            // hands and both came out "not recognised", a grip press that
+            // never arrives. Served like squeeze/click above, from the hand
+            // trigger's own threshold bit. For that build only: no other
+            // guest's use of the bare path has been looked at.
+            if (kind == KLXR_SRC_NONE && strcmp(suffix, "/input/squeeze") == 0 &&
+                klxr_moss_from_steam()) {
+                kind = KLXR_SRC_BUTTON;
+                bit  = hand ? KL_OVRP_RAW_RHAND_TRIGGER : KL_OVRP_RAW_LHAND_TRIGGER;
+            }
+            // The Steam Frame's right controller carries all four face buttons; the two
+            // controllers here carry two each, as Touch does. For Moss from Steam the right
+            // hand's x and y are the LEFT controller's (Square and Triangle on a Sense
+            // controller), so that attack (right x) and jump (right a) are two buttons.
+            // Without this both read the right A. Attack is ALSO the right B (Circle): that
+            // is where the Quest build has it (HeroPrimary <- OculusPress_Right_FaceButtonB),
+            // and what the owner asked for after the first run with Square alone.
+            if (hand == 1 && klxr_moss_from_steam() && strcmp(profile, KLXR_VALVE_PROFILE) == 0) {
+                if (strcmp(suffix, "/input/x/click") == 0) { kind = KLXR_SRC_BUTTON_OTHER; bit = KL_OVRP_RAW_X | KL_OVRP_RAW_B; }
+                if (strcmp(suffix, "/input/y/click") == 0) { kind = KLXR_SRC_BUTTON_OTHER; bit = KL_OVRP_RAW_Y; }
+                if (strcmp(suffix, "/input/x/touch") == 0 || strcmp(suffix, "/input/y/touch") == 0) kind = KLXR_SRC_NONE;
+            }
             // A row whose bit for THIS hand is zero names a control this hand
             // does not have (a/b on the left, x/y on the right). Not an error
             // — just not bound.
@@ -3842,10 +3930,19 @@ typedef struct {
 // `bind` is the hand whose suggested binding is read, `in` the controller it is
 // read on — the same hand, except under a left dominant hand (klxr_bind_hand),
 // where the binding's button is the other controller's counterpart.
+// The other controller's snapshot, for KLXR_SRC_BUTTON_OTHER; set by klxr_SyncActions around each call.
+static const klxr_hand_input *klxr_eval_other;
 static float klxr_eval(const klxr_action *a, int bind, int hand, const klxr_hand_input *in) {
     uint32_t bit = bind == hand ? a->bit[bind] : klxr_mirror_bits(a->bit[bind]);
     switch (a->kind[bind]) {
         case KLXR_SRC_BUTTON:        return (in->buttons & bit) ? 1.0f : 0.0f;
+        case KLXR_SRC_BUTTON_OTHER: {
+            // A and B are in the right hand's word and X and Y in the left's (kl_ovrp.h), so one mask over
+            // both words names buttons of either controller without ambiguity.
+            uint32_t all = in->buttons;
+            if (klxr_eval_other && klxr_eval_other->present) all |= klxr_eval_other->buttons;
+            return (all & a->bit[bind]) ? 1.0f : 0.0f;
+        }
         case KLXR_SRC_TOUCH:         return (in->touches & bit) ? 1.0f : 0.0f;
         case KLXR_SRC_INDEX_TRIGGER: return in->index_trigger;
         case KLXR_SRC_HAND_TRIGGER:  return in->hand_trigger;
@@ -3911,6 +4008,7 @@ static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
                     // way the scalars are.
                     v = in[h].stick_x; w = in[h].stick_y;
                 } else {
+                    klxr_eval_other = &in[1 - h];
                     v = klxr_eval(a, b, h, &in[h]);
                 }
             }
@@ -7567,12 +7665,15 @@ int kl_openxr_claims(const char *soname) {
     return strcmp(b, "libopenxr_loader.so") == 0;
 }
 
+static int g_xr_opened;
 void *kl_openxr_dlopen(const char *soname) {
     if (!kl_openxr_claims(soname)) return NULL;
     fprintf(stderr, "  [xr] guest dlopen(\"libopenxr_loader.so\") -> synthetic OpenXR "
                     "runtime (the real loader would look for an Android broker)\n");
+    __atomic_store_n(&g_xr_opened, 1, __ATOMIC_RELEASE);
     return (void *)g_xr_handle;
 }
+int kl_openxr_in_use(void) { return __atomic_load_n(&g_xr_opened, __ATOMIC_ACQUIRE); }
 
 int kl_openxr_is_handle(const void *h) { return h == (const void *)g_xr_handle; }
 

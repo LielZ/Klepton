@@ -50,6 +50,8 @@ const char *kl_jni_native_sig(const char *cls, const char *name);
 // which is where a title runs Resources.UnloadUnusedAssets(). The declaring
 // class comes from the natives table rather than being assumed. Returns 0 if
 // the guest never registered it. Driven from kl_mem_pressure_* (klepton.h).
+// For one Unity 6.2 title, which has no nativeLowMemory, it is the player's
+// nativeMemoryUsageChanged(Critical) instead (KL_LOWMEM_USAGE_CHANGED).
 int kl_jni_low_memory(void);
 
 // Construct the jobjects the host passes *into* guest natives. Every jobject the

@@ -37,6 +37,8 @@
 	<string>$(KL_VK_FOVEATION_DEFAULT)</string>
 	<key>KLPictureReset</key>
 	<string>$(KL_PICTURE_RESET)</string>
+	<key>KLTestOn</key>
+	<string>$(KL_TEST_ON)</string>
 	<key>KLOutputDefault</key>
 	<string>$(KL_OUTPUT_DEFAULT)</string>
 	<key>KLStartScreen</key>

@@ -748,6 +748,24 @@ static klj_val klj_WebView_getSettings(void *env, void *self, const klj_val *a, 
     static void *settings;
     return klj_singleton("android/webkit/WebSettings", &settings);
 }
+// WebSettings.getDefaultUserAgent(Context) — static, and asked without a web
+// view: an HTTP client reads it for its own User-Agent header. Real VR Fishing
+// (x2582932495064035) asks, by its sender, and there was no answer (fix 37,
+// 2026-10-14; not run here). There is no browser engine here to name, so the
+// string says what Build.* already says — the Android release and the model,
+// read from the same table so the two cannot disagree — in the usual shape of
+// such a string, and claims no Chrome build.
+static klj_val klj_WebSettings_getDefaultUserAgent(void *env, void *self,
+                                                   const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    const char *rel = kl_jni_build_string("RELEASE"), *model = kl_jni_build_string("MODEL");
+    char ua[192];
+    snprintf(ua, sizeof ua, "Mozilla/5.0 (Linux; Android %s; %s) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Version/4.0 Mobile VR Safari/537.36",
+             rel ? rel : "10", model ? model : "Quest 2");
+    KLJ_LOG("WebSettings.getDefaultUserAgent() -> \"%s\"", ua);
+    return (klj_val){.l = kl_jni_new_string(ua)};
+}
 // draw(Canvas): the one call that would produce pixels. It does not, and it
 // says so once rather than every frame.
 static klj_val klj_WebView_draw(void *env, void *self, const klj_val *a, int n) {
@@ -1828,6 +1846,10 @@ const klj_binding klj_bind_android[] = {
     {"android/webkit/WebView", "<init>", "(Landroid/content/Context;)V", klj_WebView_init},
     {"android/webkit/WebView", "loadUrl", "(Ljava/lang/String;)V", klj_WebView_loadUrl},
     {"android/webkit/WebView", "getSettings", "()Landroid/webkit/WebSettings;", klj_WebView_getSettings},
+    // Declared as Java declares it; a guest that spells the argument as its
+    // own activity class reaches it through the assignability tier in kl_jni.c.
+    {"android/webkit/WebSettings", "getDefaultUserAgent",
+     "(Landroid/content/Context;)Ljava/lang/String;", klj_WebSettings_getDefaultUserAgent},
     {"android/webkit/WebView", "draw", "(Landroid/graphics/Canvas;)V", klj_WebView_draw},
     {"android/webkit/WebView", "dispatchTouchEvent", "(Landroid/view/MotionEvent;)Z", klj_false},
     {"android/graphics/Bitmap", "createBitmap",

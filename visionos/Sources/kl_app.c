@@ -26,6 +26,7 @@
 #include "kl_glfb.h"      // kl_glfb_release_current — the handoff hands the context on
 #include "kl_x18.h"       // claim the veneers' TSD slot before anything else can
 #include "kl_env.h"
+#include "kl_metrics.h"   // the panel in the headset: its sample is taken on the heartbeat
 
 // --- Which guest ------------------------------------------------------------
 //
@@ -870,28 +871,16 @@ static long long kl_phys_footprint(void) {
 // (guest_pace_wait), the poses the compositor offered it (kl_app_guest_publish —
 // one per display refresh the app was given), and the GPU time of the command
 // buffers that carry the game's scene pass (kl_mtl_foveate.m). The heartbeat
-// turns them into rates once a second, for the readout in the headset
-// (kl_app_perf, KleptonCompositor's stats card), and once a minute into a
-// [perf] line in the log: a short test run says little about a session, and
-// what the system does to an app that has been warm for twenty minutes — halve
-// its display rate, most of all — is not visible in the first two.
+// turns them once a minute into a [perf] line in the log: a short test run says
+// little about a session, and what the system does to an app that has been warm
+// for twenty minutes — halve its display rate, most of all — is not visible in
+// the first two. (What the headset shows of a running game is kl_metrics.c,
+// which counts where a picture is shown and so has a rate for every guest.)
 static _Atomic unsigned long long g_perf_frames, g_perf_publishes;
 static _Atomic int g_perf_thermal = -1;
-static struct { float game_fps, display_hz, gpu_ms; } g_perf_now;
-static pthread_mutex_t g_perf_mu = PTHREAD_MUTEX_INITIALIZER;
 double kl_mtl_scene_gpu_ms(void);     // kl_mtl_foveate.m: mean since the last call, <0 for none
 
 void kl_app_note_thermal(int state) { g_perf_thermal = state; }
-
-int kl_app_perf(float *game_fps, float *display_hz, float *gpu_ms, int *thermal) {
-    pthread_mutex_lock(&g_perf_mu);
-    if (game_fps) *game_fps = g_perf_now.game_fps;
-    if (display_hz) *display_hz = g_perf_now.display_hz;
-    if (gpu_ms) *gpu_ms = g_perf_now.gpu_ms;
-    pthread_mutex_unlock(&g_perf_mu);
-    if (thermal) *thermal = g_perf_thermal;
-    return g_perf_frames > 0;
-}
 
 // The least memory the app had left before its limit while the game drew, in
 // MB; -1 where the system does not say or the game never drew. The start
@@ -908,7 +897,7 @@ static double perf_seconds(void) {
 // Called four times a second from the heartbeat.
 static void perf_tick(void) {
     static double t_sec, t_min, t_first;
-    static unsigned long long f_sec, p_sec, f_min, p_min;
+    static unsigned long long f_min, p_min;
     static double gpu_sum; static int gpu_n;
     static int on = -1, every;
     if (on < 0) {
@@ -922,18 +911,13 @@ static void perf_tick(void) {
     unsigned long long f = g_perf_frames, pub = g_perf_publishes;
     if (!f) return;                                    // nothing of the game yet
     double t = perf_seconds();
-    if (!t_first) { t_first = t_sec = t_min = t; f_sec = f_min = f; p_sec = p_min = pub; return; }
+    if (!t_first) { t_first = t_sec = t_min = t; f_min = f; p_min = pub; return; }
     if (t - t_sec >= 1.0) {
-        double dt = t - t_sec, g = kl_mtl_scene_gpu_ms();
-        pthread_mutex_lock(&g_perf_mu);
-        g_perf_now.game_fps = (float)((double)(f - f_sec) / dt);
-        g_perf_now.display_hz = (float)((double)(pub - p_sec) / dt);
-        if (g >= 0) g_perf_now.gpu_ms = (float)g;
-        pthread_mutex_unlock(&g_perf_mu);
+        double g = kl_mtl_scene_gpu_ms();
         if (g >= 0) { gpu_sum += g; gpu_n++; }
         long long left = kl_avail_memory();
         if (left > 0 && (g_perf_min_avail < 0 || (left >> 20) < g_perf_min_avail)) g_perf_min_avail = left >> 20;
-        t_sec = t; f_sec = f; p_sec = pub;
+        t_sec = t;
     }
     if (t - t_min >= (double)every) {
         double dt = t - t_min;
@@ -985,6 +969,7 @@ static void *heartbeat(void *arg) {
         // exited), so this is the only audio census a device log carries.
         if (ticks % 40 == 0) { kl_opensl_heartbeat(stderr); fflush(stderr); }
         perf_tick();
+        kl_metrics_tick();
         ticks++;
         struct timespec iv = { 0, 250000000 };  // nanosleep: usleep is EINVAL at >= 1e6
         nanosleep(&iv, NULL);
@@ -1475,6 +1460,7 @@ static struct {
     // for "somebody else will set this once". Every other reader takes the mutex.
     volatile int    stop;
     int             state;        // kl_app_guest_state()
+    int             asked_quit;   // the loop ended on the game's own quit (kl_app_guest_asked_quit)
     int             running;      // has the thread been spawned and not joined?
     int             finished;     // has it left its loop and written the report?
     pthread_t       thread;
@@ -1485,6 +1471,13 @@ int kl_app_guest_state(void) {
     int s = g_guest.state;
     pthread_mutex_unlock(&g_guest.mu);
     return s;
+}
+
+int kl_app_guest_asked_quit(void) {
+    pthread_mutex_lock(&g_guest.mu);
+    int q = g_guest.asked_quit;
+    pthread_mutex_unlock(&g_guest.mu);
+    return q;
 }
 
 // An SDL guest is an engine with a shutdown of its own, and that shutdown is
@@ -1542,6 +1535,29 @@ static int guest_fresh_pose(void) {
     if (v < 0) {
         const char *t = kl_driver_target_name();
         v = kl_env_on("KL_GUEST_FRESH_POSE", t && strcmp(t, "x5812519008825194") == 0);
+    }
+    return v;
+}
+// KL_UNITY_QUIT_EXITS: nativeRender returning false ends the run.
+//
+// On Android that return is how a Unity game quits: UnityPlayer's frame loop
+// finishes the activity when nativeRender answers false, which it does once the
+// game has called Application.Quit(). Here the loop went on calling an engine
+// that had stopped drawing, so quitting from a game's own menu left its last
+// picture standing, reprojected, until the app was closed by hand. With this the
+// loop ends there and the app leaves (KleptonCompositor, at "the guest thread
+// has ended").
+//
+// Default on for the one title it was run with — Real VR Fishing
+// (x2582932495064035), on its sender's headset (fix 37, 2026-10-14; not run
+// here). Every other guest keeps the loop as it was until a false has been seen
+// to mean the same for it: a game that answers false once and draws on would be
+// ended by this.
+static int guest_quit_exits(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_UNITY_QUIT_EXITS", t && strcmp(t, "x2582932495064035") == 0);
     }
     return v;
 }
@@ -1615,6 +1631,7 @@ static void guest_pace_wait(void) {
     }
     last_turn_ns = g_guest.published_ns;
     g_perf_frames++;
+    kl_metrics_note_game_frame();
     // Coalesce, do not queue: everything published since the last frame is one
     // turn. A guest that is behind then skips frames — which reprojection covers
     // — rather than being owed a backlog it can never work off.
@@ -1704,9 +1721,19 @@ static void *guest_thread(void *unused) {
             pthread_mutex_unlock(&g_guest.mu);
         }
 
-        if (kl_app_frame() < 0) {
+        int rendered = kl_app_frame();
+        if (rendered < 0) {
             printf("[guest] nativeRender is gone — the frame loop ends here\n");
             fflush(NULL);
+            break;
+        }
+        if (rendered == 0 && guest_quit_exits()) {
+            printf("[guest] nativeRender returned false: the game asked to quit — "
+                   "the frame loop ends here (KL_UNITY_QUIT_EXITS)\n");
+            fflush(NULL);
+            pthread_mutex_lock(&g_guest.mu);
+            g_guest.asked_quit = 1;
+            pthread_mutex_unlock(&g_guest.mu);
             break;
         }
         if (stats_s) {
@@ -1792,8 +1819,15 @@ int kl_app_guest_start(void) {
     // five minutes and then the system halved the app's cadence to 60 Hz and
     // kept it there, with the compositor's own pass idle — a headset shedding
     // load it should never have been given.
+    // ...and an Unreal guest whose build drives OpenXR: Moss from Steam. Unpaced on the headset
+    // (2026-10-14) it drew as fast as it could at the display's own eye size, and the system showed
+    // the app at half rate from the start – 50 and 60 Hz where the Quest build, paced, is shown at 100
+    // and 120. Told apart from the Quest build of the same target by the Steam library it ships; the
+    // OVRPlugin pacer below is installed as well and is simply never reached by this build.
+    extern int kl_steamapi_shipped(void);
     if (kl_app_target_is_steamlink() || target_is_jkxr() || target_is_linux() ||
-        (g_target->name && strcmp(g_target->name, "cs1") == 0))
+        (g_target->name && strcmp(g_target->name, "cs1") == 0) ||
+        (g_target->kind == KL_GUEST_UE4 && kl_steamapi_shipped()))
         kl_openxr_set_frame_pacer(guest_pace_wait);
     // ...and the same clock on the OVRPlugin side, for the other guest that
     // owns its loop. ovrp_WaitToBeginFrame is this API's xrWaitFrame. It is

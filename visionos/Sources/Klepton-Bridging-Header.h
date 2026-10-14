@@ -38,6 +38,10 @@
 // where it reads the fence value. The eye TEXTURE still arrives through
 // kl_glfb's own table, so nothing else about this seam widens.
 #import "kl_vulkan.h"
+// ...and by one for the panel that shows how the game runs (KL_STATS_CARD):
+// the compositor counts what it presents into it and reads back a sample a
+// second.
+#import "kl_metrics.h"
 // One call, declared here rather than importing kl_mediandk.h: that header is
 // the guest-facing media table and wants <stdio.h> and CoreVideo context the
 // Swift side has no other use for.

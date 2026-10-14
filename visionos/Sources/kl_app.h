@@ -113,13 +113,8 @@ void kl_app_guest_publish(void);
 // may halve.
 void kl_app_set_panel_hz(float hz);
 // The system's thermal state (ProcessInfo.ThermalState's raw value, 0 nominal
-// .. 3 critical), for the [perf] line and the readout.
+// .. 3 critical), for the [perf] line.
 void kl_app_note_thermal(int state);
-// How the game ran over the last second: the frames it started, the poses the
-// compositor offered it (the rate the app is displayed at), and the GPU time
-// of its scene command buffers, 0 where that is not measured. Returns 0 until
-// the game has started a frame.
-int kl_app_perf(float *game_fps, float *display_hz, float *gpu_ms, int *thermal);
 // The least memory left before the app's limit while the game drew, in MB; -1
 // where that is not known.
 long long kl_app_min_avail_mb(void);
@@ -139,6 +134,11 @@ int  kl_app_guest_request_quit(void);
 void kl_app_exit_report(void);
 // ...and whether it has: its main has returned.
 int  kl_app_guest_quit_done(void);
+// Did the guest's loop end because the game itself asked to quit — a Unity
+// guest's nativeRender returning false, where that is taken for the end of the
+// run (KL_UNITY_QUIT_EXITS; see guest_thread)? Then there is nothing left to
+// show and the app is to leave, as Android finishes the activity.
+int  kl_app_guest_asked_quit(void);
 
 // Which guest this app was built for, and whether it is the Steam Link one.
 //

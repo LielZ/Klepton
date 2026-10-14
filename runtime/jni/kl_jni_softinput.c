@@ -779,14 +779,16 @@ void *kl_jni_activity(void) {
 // ...and the single UnityPlayer, for the same reason and by the same rule. See
 // kl_jni.h: one per process, pinned, created lazily by whichever lifecycle call
 // runs first.
+static void *g_unity_player;
 void *kl_jni_unity_player(void) {
-    static void *player;
-    if (!player) {
-        player = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+    if (!g_unity_player) {
+        void *player = kl_jni_new_object("com/unity3d/player/UnityPlayer");
         ((klj_object *)player)->pinned = 1;
+        g_unity_player = player;
     }
-    return player;
+    return g_unity_player;
 }
+void *klj_unity_player_made(void) { return g_unity_player; }
 
 // SensorManager.getDefaultSensor(type) -> null, for every type.
 //

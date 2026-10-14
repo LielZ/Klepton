@@ -74,7 +74,10 @@ static uint32_t kls_appid(void) {
     static uint32_t id;
     if (!id) {
         const char *t = kl_driver_target_name();
-        id = kl_env_uint("KL_STEAM_APPID", t && strcmp(t, "walkabout") == 0 ? 1408230u : 0u);
+        // Moss: this is only reached by the build from Steam (app 846470); the
+        // Meta build of the same target never opens the Steam API.
+        id = kl_env_uint("KL_STEAM_APPID", t && strcmp(t, "walkabout") == 0 ? 1408230u :
+                                           t && strcmp(t, "moss") == 0 ? 846470u : 0u);
         STEAM_LOG("app id %u\n", id);
     }
     return id;
@@ -355,10 +358,184 @@ void *kl_steamapi_sym(const char *name) {
     return kl_named_stub(name, (void *)kls_unserved);
 }
 
+// ---- the C++ API: a guest that LINKS the library (Unreal) ----
+// Unity reaches Steam one flat function at a time (above). Unreal's
+// OnlineSubsystemSteam is written against the SDK's C++ headers: libUE4 has
+// libsteam_api.so in its DT_NEEDED, imports fourteen functions from it and makes
+// every other call through an INTERFACE OBJECT one of those hands out – a pointer
+// to a pointer to a table of code addresses, called with the object in x0. Seen
+// with Moss from Steam depot 846472 (UE 4.27.2, SDK interfaces SteamUser023,
+// SteamUtils010, STEAMUSERSTATS_INTERFACE_VERSION013): the first import it called,
+// SteamAPI_RestartAppIfNecessary, was unresolved and the end of the run; with the
+// flat token above for an interface the first SteamUtils() call would have jumped
+// through sixteen zero bytes.
+//
+// So the imports bind here (kl_shim.c, the Steam tier, Unreal guests only) and
+// an interface is an object as kl_lx_steam.c builds them for a Linux guest:
+// every slot names itself once and answers 0, the slots this game depends on get
+// the same answers the flat API gives. Slot numbers are the declaration order of
+// the virtuals in the SDK header of the version named.
+enum { KLS_SLOTS = 256, KLS_IFACES = 48 };
+typedef struct kls_obj {
+    void  **vtbl;                   // what the guest dereferences: must be first
+    char    name[64];
+    void   *table[KLS_SLOTS];
+    uint8_t seen[KLS_SLOTS];
+} kls_obj;
+static kls_obj *g_obj[KLS_IFACES];
+static int g_nobj;
+
+static uint64_t kls_slot_default(kls_obj *self, unsigned n) {
+    if (!self->seen[n]) {
+        self->seen[n] = 1;
+        STEAM_LOG("%s: vtable slot %u called and not implemented — answering 0\n", self->name, n);
+    }
+    return 0;
+}
+#define SLOT(n) static uint64_t kls_slot_##n(kls_obj *self) { return kls_slot_default(self, n); }
+#define ROW(h) SLOT(0x##h##0) SLOT(0x##h##1) SLOT(0x##h##2) SLOT(0x##h##3) SLOT(0x##h##4) \
+               SLOT(0x##h##5) SLOT(0x##h##6) SLOT(0x##h##7) SLOT(0x##h##8) SLOT(0x##h##9) \
+               SLOT(0x##h##a) SLOT(0x##h##b) SLOT(0x##h##c) SLOT(0x##h##d) SLOT(0x##h##e) \
+               SLOT(0x##h##f)
+ROW(0) ROW(1) ROW(2) ROW(3) ROW(4) ROW(5) ROW(6) ROW(7)
+ROW(8) ROW(9) ROW(a) ROW(b) ROW(c) ROW(d) ROW(e) ROW(f)
+#undef SLOT
+#define SLOT(n) (void *)kls_slot_##n,
+static void *const k_obj_default[KLS_SLOTS] = {
+    ROW(0) ROW(1) ROW(2) ROW(3) ROW(4) ROW(5) ROW(6) ROW(7)
+    ROW(8) ROW(9) ROW(a) ROW(b) ROW(c) ROW(d) ROW(e) ROW(f)
+};
+#undef SLOT
+#undef ROW
+
+static void kls_specialise(kls_obj *o) {
+    void **t = o->table;
+    if (!strncmp(o->name, "SteamUtils", 10)) {
+        t[2]  = (void *)kls_one;                        // GetConnectedUniverse: k_EUniversePublic
+        t[3]  = (void *)kls_Utils_GetServerRealTime;
+        t[4]  = (void *)kls_Utils_GetIPCountry;
+        t[8]  = (void *)kls_Utils_GetAppID;
+        t[22] = (void *)kls_language;                   // GetSteamUILanguage
+    } else if (!strncmp(o->name, "SteamUser", 9) && strncmp(o->name, "SteamUserStats", 14)) {
+        t[0]  = (void *)kls_one;                        // GetHSteamUser
+        t[1]  = (void *)kls_true;                       // BLoggedOn
+        t[2]  = (void *)kls_User_GetSteamID;
+    } else if (!strncmp(o->name, "STEAMAPPS", 9)) {
+        t[0]  = (void *)kls_true;                       // BIsSubscribed
+        t[4]  = (void *)kls_language;                   // GetCurrentGameLanguage
+        t[5]  = (void *)kls_language;                   // GetAvailableGameLanguages
+        t[6]  = (void *)kls_Apps_BIsSubscribedApp;
+        t[7]  = (void *)kls_Apps_BIsSubscribedApp;      // BIsDlcInstalled
+        t[10] = (void *)kls_Apps_GetDLCCount;
+        t[11] = (void *)kls_Apps_BGetDLCDataByIndex;
+    } else if (!strncmp(o->name, "SteamFriends", 12)) {
+        t[0]  = (void *)kls_Friends_GetPersonaName;
+    }
+}
+
+static void *kls_object(const char *version) {
+    if (!version) return NULL;
+    pthread_mutex_lock(&g_lock);
+    kls_obj *o = NULL;
+    for (int k = 0; k < g_nobj && !o; k++)
+        if (!strcmp(g_obj[k]->name, version)) o = g_obj[k];
+    if (!o && g_nobj < KLS_IFACES) {
+        o = calloc(1, sizeof *o);
+        snprintf(o->name, sizeof o->name, "%s", version);
+        memcpy(o->table, k_obj_default, sizeof o->table);
+        o->vtbl = o->table;
+        kls_specialise(o);
+        g_obj[g_nobj++] = o;
+        STEAM_LOG("interface %s handed out\n", version);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return o;
+}
+
+static void *kls_cxx_FindOrCreateUserInterface(int32_t user, const char *version) {
+    (void)user;
+    return kls_object(version);
+}
+// No game server in a client: a NULL interface is what the engine tests for.
+static void *kls_cxx_FindOrCreateGameServerInterface(int32_t user, const char *version) {
+    (void)user; (void)version;
+    return NULL;
+}
+
+// The lazy accessor behind SteamUser(), SteamUtils() and the rest:
+//   struct { void (*fn)(void *ctx); uintptr_t counter; <ctx> }
+// fn is the GUEST's and fills ctx by calling back into the two functions above.
+// The counter is how the SDK re-initialises after a restart of the API; with one
+// API lifetime it only has to stop being zero.
+static void *kls_cxx_ContextInit(void *data) {
+    struct { void (*fn)(void *); uintptr_t counter; } *d = data;
+    void *ctx = d + 1;
+    if (d->counter != 1) {
+        d->fn(ctx);
+        d->counter = 1;
+    }
+    return ctx;
+}
+
+// Callbacks: registered and never fired. CCallbackBase is { vtable, flags, id };
+// the flag is what the SDK's own destructor checks before unregistering.
+static void kls_cxx_RegisterCallback(void *cb, int32_t id) {
+    struct { void *vt; uint8_t flags; int32_t id; } *c = cb;
+    c->flags |= 1;
+    c->id = id;
+}
+static void kls_cxx_UnregisterCallback(void *cb) {
+    struct { void *vt; uint8_t flags; int32_t id; } *c = cb;
+    c->flags &= (uint8_t)~1;
+}
+
+static const struct { const char *name; void *fn; } g_cxx[] = {
+    {"SteamInternal_SteamAPI_Init",             (void *)kls_InitEx},
+    {"SteamAPI_RestartAppIfNecessary",          (void *)kls_zero},
+    {"SteamAPI_GetHSteamUser",                  (void *)kls_one},
+    {"SteamInternal_ContextInit",               (void *)kls_cxx_ContextInit},
+    {"SteamInternal_FindOrCreateUserInterface", (void *)kls_cxx_FindOrCreateUserInterface},
+    {"SteamAPI_RegisterCallback",               (void *)kls_cxx_RegisterCallback},
+    {"SteamAPI_UnregisterCallback",             (void *)kls_cxx_UnregisterCallback},
+    {"SteamAPI_RunCallbacks",                   (void *)kls_void},
+    {"SteamAPI_Shutdown",                       (void *)kls_void},
+    // ESteamAPIInitResult 1 = failed: no game server is registered from here.
+    {"SteamInternal_GameServer_Init_V2",        (void *)kls_one},
+    {"SteamInternal_FindOrCreateGameServerInterface", (void *)kls_cxx_FindOrCreateGameServerInterface},
+    {"SteamGameServer_GetHSteamUser",           (void *)kls_zero},
+    {"SteamGameServer_RunCallbacks",            (void *)kls_void},
+    {"SteamGameServer_Shutdown",                (void *)kls_void},
+};
+
+// A Steam name imported by a guest library, bound at relocation time. NULL for
+// a name not listed: it stays in the unresolved report and stops by name when
+// called, rather than being answered with a guess.
+void *kl_steamapi_lookup(const char *name) {
+    if (!name || strncmp(name, "Steam", 5) != 0) return NULL;
+    for (size_t i = 0; i < sizeof g_cxx / sizeof g_cxx[0]; i++)
+        if (strcmp(g_cxx[i].name, name) == 0) {
+            __atomic_store_n(&g_in_use, 1, __ATOMIC_RELEASE);
+            return g_cxx[i].fn;
+        }
+    return NULL;
+}
+
 void kl_steamapi_report(FILE *f) {
     static int done;
-    if (done || !g_nfn) return;
+    if (done || (!g_nfn && !g_nobj)) return;
     done = 1;
+    // A guest on the C++ API: its interfaces, and the slots answered 0.
+    if (g_nobj) {
+        fprintf(f, "\n=== Steam API interfaces (C++) ===\n  handed out: %d\n", g_nobj);
+        for (int k = 0; k < g_nobj; k++) {
+            fprintf(f, "    %-44s", g_obj[k]->name);
+            int any = 0;
+            for (unsigned n = 0; n < KLS_SLOTS; n++)
+                if (g_obj[k]->seen[n]) fprintf(f, "%s%u", any++ ? ", " : " slots answered 0 by default: ", n);
+            fputc('\n', f);
+        }
+    }
+    if (!g_nfn) return;
     unsigned unserved = 0;
     for (unsigned i = 0; i < g_nfn; i++) if (!g_fn[i].served && g_fn[i].calls) unserved++;
     fprintf(f, "\n=== Steam API surface ===\n  resolved: %u, of which answered 0 by default and called: %u\n", g_nfn, unserved);

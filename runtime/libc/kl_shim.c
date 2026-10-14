@@ -90,6 +90,7 @@ int getentropy(void *buffer, size_t size);
 #include "kl_ovrp.h"
 #include "kl_target.h"   // kl_guest_kind, for the ovrp_ tier of kl_shim_lookup
 #include "kl_ovrplat.h"
+#include "kl_steamapi.h"
 #include "kl_jni.h"
 
 // ---------- bionic stack-guard canary in Darwin TSD slot 5 ----------
@@ -2101,6 +2102,7 @@ X(klb_sem_timedwait) X(klb_sem_getvalue) X(klb_sem_trywait)
 X(klb_sem_open) X(klb_sem_close)
 X(klb_pthread_getschedparam) X(klb_pthread_setschedparam)
 X(klb_dlopen) X(klb_dlsym) X(klb_dlclose) X(klb_dlerror) X(klb_dladdr)
+X(klb_android_dlopen_ext)
 X(klb_clock_gettime) X(klb_clock_getres) X(klb_gettimeofday)
 X(klb_clock_nanosleep) X(klb___poll_chk)
 // kl_libc_slink.c — the surface Steam Link reaches for and Beat Saber does not.
@@ -2613,6 +2615,7 @@ static const kl_entry g_shim[] = {
     // dl
     E("dlopen", klb_dlopen), E("dlsym", klb_dlsym), E("dlclose", klb_dlclose),
     E("dlerror", klb_dlerror), E("dladdr", klb_dladdr),
+    E("android_dlopen_ext", klb_android_dlopen_ext),
     E("dl_iterate_phdr", kl_dl_iterate_phdr),
 
     // logging / misc
@@ -2858,6 +2861,20 @@ void *kl_shim_lookup(const char *name) {
     if (!strncmp(name, "ovrp_", 5)) {
         extern kl_guest_kind kl_driver_kind(void);
         if (kl_driver_kind() == KL_GUEST_UE4) return kl_ovrp_sym(name);
+    }
+
+    // Tier 13: the Steamworks API as an ELF import. Steam's Android build of an
+    // Unreal game (Moss from depot 846472, for Steam Frame) has libsteam_api.so
+    // in libUE4's DT_NEEDED and imports fourteen Steam* functions; the library
+    // is replaced like the ones above (kl_steamapi.h), so without this tier the
+    // first one called, SteamAPI_RestartAppIfNecessary, ended the run as an
+    // unresolved import. Unity reaches the same stand-in by dlsym.
+    //
+    // For Unreal guests only, and only the names kl_steamapi_lookup lists: one
+    // it does not know stays unresolved and stops by name when called.
+    if (!strncmp(name, "Steam", 5)) {
+        extern kl_guest_kind kl_driver_kind(void);
+        if (kl_driver_kind() == KL_GUEST_UE4) return kl_steamapi_lookup(name);
     }
     return NULL;
 }

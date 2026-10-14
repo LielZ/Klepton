@@ -1,3 +1,4 @@
+#include "kl_sink1.h"   // kl_audio_* etc. are kl1_* in this file — kl_audio_switch.c
 // See kl_audio.h. The producer/consumer split, in one paragraph:
 //
 //   feeder thread (kl_opensl.c)          CoreAudio render thread

@@ -1,3 +1,4 @@
+#include "kl_sink1.h"   // kl_audio_* etc. are kl1_* in this file — kl_audio_switch.c
 // See kl_aaudio.h. The guest-facing half of the audio path; kl_audio.c is the
 // device.
 //

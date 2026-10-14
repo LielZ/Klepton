@@ -264,6 +264,24 @@ static void kl_driver_env_defaults(const kl_target *t) {
         setenv("KL_USLEEP_CAP", "250", 0);
         setenv("KL_GUEST_QOS",  "1",   0);
     }
+    else if (!strcmp(t->name, "x9386827918099701")) {
+        // BattleGroupVR2 0.251 (Unity 6.2, Vulkan; fix 38, 2026-10-13). The
+        // app was ended at its per-process memory limit while the game was
+        // still starting. Three settings are the sender's answer, each seen by
+        // the sender on a Vision Pro and by nobody here; a fourth, the 2x cap
+        // on multisampling, is beside its siblings in klvk_sample_mask.
+        //
+        // MoltenVK without MTLHeaps, as for Alyx above and for the same two
+        // reasons: a pool is one heap of its full size whether or not it is
+        // filled, and every depth target is paid for a second time beside it.
+        setenv("MVK_CONFIG_USE_MTLHEAP", "0", 0);
+        // The game is told memory is short while 1.5 GiB are still free
+        // instead of 384 MiB (kl_mem_pressure_poll): what it asks for at its
+        // start came in steps larger than the smaller reserve, so the warning
+        // arrived after the allocation that ended the app. It reaches the game
+        // through Unity 6.2's own callback (kl_jni_low_memory).
+        setenv("KL_LOWMEM_FREE_MB", "1536", 0);
+    }
 }
 
 void kl_driver_init(const kl_target *t, const char *libdir, kl_slink_door door) {

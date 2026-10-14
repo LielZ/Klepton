@@ -193,6 +193,12 @@ B_C = oid("BC")
 # emitted, so the icon is strictly additive.
 F_ASSETS = oid("FASSET"); B_ASSETS = oid("BASSET"); BP_RES = oid("BPRES")
 import os as _os
+# The Test switches an installer wants on from the start (KL_TEST_ON below):
+# names of environment variables and nothing else, so that what lands in the
+# project file and in Info.plist cannot be anything but a list of names.
+TEST_ON = ",".join(n for n in re.split(r"[,\s]+", os.environ.get("KLEPTON_TEST_ON", ""))
+                   if re.fullmatch(r"KL_[A-Z0-9_]{1,60}", n))
+
 # Compile-time launcher opt-in (also drives LAUNCHER_COND + the display name below).
 _launcher_on = _os.environ.get("KL_CUSTOM_LAUNCHER", "").strip().lower() in ("1", "true", "yes", "on")
 # NB: the bundle id is deliberately NOT switched by the launcher flag. It is a SIGNING
@@ -259,6 +265,14 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # `productStart`). An installer asks for the second with
                         # KLEPTON_START_SCREEN=1; KLStartScreen in Info.plist.
                         + f"\t\t\t\tKL_START_SCREEN = {1 if os.environ.get('KLEPTON_START_SCREEN') == '1' else 0};\n"
+                        # ...and which Test switches this installation has ON
+                        # until its owner says otherwise in the game
+                        # (KLEPTON_TEST_ON, the variables' names with commas
+                        # between them; KLTestOn in Info.plist,
+                        # KleptonTestSwitches). An installer names them for
+                        # someone who wants a change that is built in but off
+                        # in every game at once, without a visit to each.
+                        + f"\t\t\t\tKL_TEST_ON = \"{TEST_ON}\";\n"
                         # ...and what KleptonGameData.swift reads: which files
                         # this build's guest needs and the store ids to fetch
                         # them by. KL_DATA_TREE is empty for a target without the
@@ -349,7 +363,7 @@ SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swif
          "KleptonChroma.swift", "KleptonMic.swift",
          "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonGameData.swift",
          "KleptonAlyx.swift", "KleptonText.swift", "KleptonSteamCloud.swift",
-         "KleptonBackup.swift"]
+         "KleptonBackup.swift", "KleptonMetrics.swift", "KleptonPinch.swift"]
 # Steam's connection, sign-in and Steam Cloud (SteamCloudKit/README.md: parts of
 # Glovebox's SteamLauncherKit, MIT), compiled into the app's own module. The
 # folder is a Swift package only so that its tests run on a Mac.

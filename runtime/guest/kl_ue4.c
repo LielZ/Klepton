@@ -16,6 +16,8 @@
 #include "kl_egl.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_steamapi.h"
+#include "kl_openxr.h"
 #include "kl_mediandk.h"
 #include <sys/stat.h>
 #include "kl_aaudio.h"
@@ -1061,6 +1063,11 @@ void kl_ue4_report(FILE *out) {
     kl_mediandk_report(out);
     kl_ovrp_report(out);
     kl_ovrplat_report(out);
+    // An Unreal guest from Steam (Moss, depot 846472): Steam instead of the
+    // Oculus platform, OpenXR instead of OVRPlugin. Both say nothing for a
+    // guest that used neither.
+    kl_steamapi_report(out);
+    if (kl_openxr_in_use()) kl_openxr_report(out);
     fprintf(out, "\n=== JNI surface ===\n");
     kl_jni_report(out);
     fflush(out);

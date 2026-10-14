@@ -6743,8 +6743,15 @@ static uint32_t klvk_sample_mask(void) {
         // app went from 0.6 to 5.5 GB in the second its eye layer was set up
         // and played at 7.5 to 7.7 of its 8.2 GB, 0.5 GB from being ended, with
         // presents arriving late now and then (on device, 2026-10-13).
+        // BattleGroupVR2 (x9386827918099701, Unity 6.2): three 4x colour and
+        // depth pairs again, which at its eye size ask for about 5.2 GiB at
+        // its start, before a scene is loaded; the app was ended at its
+        // per-process limit. Told 2x it makes its targets, passes and
+        // pipelines at 2x itself, at the same eye size (the sender's figures
+        // and device runs, fix 38, 2026-10-13; not measured here).
         v = kl_env_int("KL_VK_MAX_SAMPLES", t && (strcmp(t, "x5812519008825194") == 0 ||
-                                                  strcmp(t, "x3634830803298285") == 0) ? 2 : 0);
+                                                  strcmp(t, "x3634830803298285") == 0 ||
+                                                  strcmp(t, "x9386827918099701") == 0) ? 2 : 0);
     }
     return v == 1 ? 0x1u : v == 2 ? 0x3u : v == 4 ? 0x7u : ~0u;
 }

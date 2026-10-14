@@ -19,7 +19,6 @@
 //   __getcwd_chk                 (Darwin)
 //   __sched_cpualloc             (Darwin)
 //   __sched_cpufree              (Darwin)
-//   android_dlopen_ext           (Darwin)
 //   android_getaddrinfofornet    (Darwin)
 //   android_gethostbynamefornet  (Darwin)
 //   clock_nanosleep              (Darwin)

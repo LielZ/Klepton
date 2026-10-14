@@ -407,13 +407,41 @@ const char *kl_jni_native_sig(const char *cls, const char *name) {
 // The class is looked up rather than assumed: nativeLowMemory is registered
 // through RegisterNatives like the other 45, and which class declares it is the
 // natives table's answer to give. Returns 1 if the guest was told.
+//
+// Unity 6.2 registers no nativeLowMemory. Its player has
+// nativeMemoryUsageChanged(int) instead, an INSTANCE native taking
+// ApplicationMemoryUsage, where Critical (4) raises both
+// Application.memoryUsageChanged and the old Application.lowMemory — as the
+// sender of fix 38 read it out of BattleGroupVR2 0.251 (2026-10-13); nobody
+// here has that build. It is called only where nativeLowMemory is not
+// registered, with the one player the lifecycle runs on, and only once that
+// player exists: this arrives on the OS's memory-pressure thread too.
+//
+// KL_LOWMEM_USAGE_CHANGED, default on for that title alone. A Unity 6.2 game
+// that runs today is told nothing under pressure and would start to be; what
+// each does with it has not been looked at.
+static int klj_lowmem_usage_changed(void) {
+    const char *t = kl_driver_target_name();
+    return kl_env_on("KL_LOWMEM_USAGE_CHANGED", t && strcmp(t, "x9386827918099701") == 0);
+}
 int kl_jni_low_memory(void) {
-    const klj_native *n = NULL;
+    const klj_native *n = NULL, *usage = NULL;
     pthread_mutex_lock(&g_lock);
-    for (unsigned i = 0; i < g_nnatives; i++)
+    for (unsigned i = 0; i < g_nnatives; i++) {
         if (strcmp(g_natives[i].name, "nativeLowMemory") == 0) { n = &g_natives[i]; break; }
+        if (!usage && strcmp(g_natives[i].name, "nativeMemoryUsageChanged") == 0 &&
+            strcmp(g_natives[i].sig, "(I)V") == 0 &&
+            (strcmp(g_natives[i].cls, "com/unity3d/player/UnityPlayerForActivityOrService") == 0 ||
+             strcmp(g_natives[i].cls, "com/unity3d/player/UnityPlayer") == 0))
+            usage = &g_natives[i];
+    }
     pthread_mutex_unlock(&g_lock);
-    if (!n) return 0;
+    if (!n) {
+        void *player = usage ? klj_unity_player_made() : NULL;
+        if (!player || !klj_lowmem_usage_changed()) return 0;
+        ((void (*)(void *, void *, kl_jint))usage->fn)(kl_jni_env(), player, 4);
+        return 1;
+    }
     // A static native is called with its declaring class as the second
     // argument. The guest may keep it, so it is the interned jclass, not NULL.
     ((void (*)(void *, void *))n->fn)(kl_jni_env(), kl_jni_class(n->cls));
@@ -779,6 +807,10 @@ static kl_jint klj_IsSameObject(void *env, void *a, void *b) { (void)env; return
 static const struct { const char *cls, *super; } g_supers[] = {
     {"com/unity3d/player/UnityPlayerActivity", "android/app/Activity"},
     {"com/unity3d/player/UnityPlayer", "android/widget/FrameLayout"},
+    // Unity 2023+ declares the lifecycle natives on this subclass (see
+    // unity_lifecycle_native in kl_driver.c). A method looked up on it and
+    // declared against UnityPlayer is UnityPlayer's.
+    {"com/unity3d/player/UnityPlayerForActivityOrService", "com/unity3d/player/UnityPlayer"},
     {"android/widget/FrameLayout", "android/view/ViewGroup"},
     {"android/view/ViewGroup", "android/view/View"},
     // Steam Link's own activity really does extend SDLActivity, and
@@ -1483,6 +1515,11 @@ static int klj_args_assignable(const char *tbl, const char *guest) {
 
 static const klj_binding *klj_find_binding(const char *cls, const char *name,
                                            const char *sig) {
+    // One title's own answers first. Each of these is NULL unless the target
+    // is the one it was written for, so no other game's lookup changes.
+    const klj_binding *own = klj_firebase_binding(cls, name, sig);
+    if (!own) own = klj_vivox_binding(cls, name, sig);
+    if (own) return own;
     // Exact wins outright across EVERY family table, so the answer does not
     // depend on which file a class landed in; a loose match is only ever the
     // fallback.
@@ -1677,6 +1714,33 @@ static klj_val klj_call_common(void *env, void *self, void *mid, char want,
             }
             return zero;
         }
+
+    // The bHaptics entries the family table does not have. Its 40 rows are one
+    // version of the plugin's wrapper, read from Paint the Town Red's APK
+    // (runtime/jni/kl_jni_haptics.c). Real VR Fishing (x2582932495064035) has
+    // the plugin too, in a version nobody here has the files of to compare,
+    // and its sender ran it on a headset with every com.bhaptics call
+    // answering zero/NULL/void (fix 37, 2026-10-14). So for this title what the
+    // table does not answer is dropped that way, as a vest that is not there,
+    // instead of ending the run by name — and the names are logged, which is
+    // the list of rows to add. Every other guest keeps the stop.
+    // KL_JNI_DROP_BHAPTICS=0 restores it here, =1 tries the drop elsewhere.
+    if (strncmp(w->cls, "com/bhaptics/", 13) == 0) {
+        static int drop = -1;
+        if (drop < 0) {
+            const char *t = kl_driver_target_name();
+            drop = kl_env_on("KL_JNI_DROP_BHAPTICS", t && strcmp(t, "x2582932495064035") == 0);
+        }
+        if (drop) {
+            static int said;
+            if (said < 16) {
+                said++;
+                KLJ_LOG("%s.%s%s — not in the bHaptics table, dropped (no vest on this host)",
+                        w->cls, w->name, w->sig);
+            }
+            return zero;
+        }
+    }
 
     KLJ_LOG("no host implementation for %s.%s%s", w->cls, w->name, w->sig);
     if (!g_permissive) {
@@ -3172,6 +3236,30 @@ int kl_jni_object_lifetime_selftest(FILE *out) {
     OBJ_CHECK(((klj_wanted *)mid_none)->sig[0] == 0,
               "an unbound name asked with NO signature was given sig \"%s\"",
               ((klj_wanted *)mid_none)->sig);
+
+    // ---- 5. an argument spelled as the guest's own activity class ----
+    //
+    // Unity's reflection helper spells a parameter as the class of the object
+    // it passes, dotted, so WebSettings.getDefaultUserAgent(Context) is asked
+    // for with UnityPlayerActivity in the slot. The row is declared as Java
+    // declares it and is reached through the assignability tier — and the game
+    // that asks (Real VR Fishing, fix 37) is one nobody here can run, so this
+    // is where the spelling is held to. Resolved before it is called: a call
+    // that resolves to nothing ends the process instead of failing a check.
+    static const char ua_sig[] = "(Lcom.unity3d.player.UnityPlayerActivity;)Ljava/lang/String;";
+    int ua_bound = klj_resolve_binding("android/webkit/WebSettings",
+                                       "getDefaultUserAgent", ua_sig) != NULL;
+    OBJ_CHECK(ua_bound, "WebSettings.getDefaultUserAgent%s resolves to no binding", ua_sig);
+    if (ua_bound) {
+        void *ws = klj_class_object("android/webkit/WebSettings");
+        klj_jvalue ua_arg[1] = {{0}};
+        const char *ua = klj_str(klj_call_a(env, ws, klj_want(ws, "getDefaultUserAgent", ua_sig, 'M'),
+                                            ua_arg, 'L').l);
+        const char *model = kl_jni_build_string("MODEL");
+        OBJ_CHECK(ua && model && strstr(ua, model),
+                  "getDefaultUserAgent answered \"%s\", which does not name the "
+                  "model Build.MODEL does (\"%s\")", ua ? ua : "(null)", model ? model : "(null)");
+    }
 
     fprintf(out, "  %d checks, %d failed\n", checks, fails);
 #undef OBJ_CHECK

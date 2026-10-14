@@ -67,6 +67,8 @@ int   kl_xr_android_surface_present(void *swapchain);
 // runtime broker it needs. See the long note in kl_openxr.c.
 int   kl_openxr_claims(const char *soname);
 void *kl_openxr_dlopen(const char *soname);
+// Has the guest opened the loader by name (an Unreal guest on OpenXR does)?
+int   kl_openxr_in_use(void);
 int   kl_openxr_is_handle(const void *h);
 void *kl_openxr_sym(const char *name);
 

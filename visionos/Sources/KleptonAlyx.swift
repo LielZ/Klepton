@@ -361,8 +361,8 @@ enum AlyxOutput: Int, CaseIterable, Identifiable {
 ///   what a budget of one refresh buys here — a small picture at the full rate.)
 /// - Fewer effects: bloom and ambient occlusion off, the two things in the
 ///   ladder's table that are passes of their own.
-/// - Readout: frames a second, display rate, GPU time and thermal state as a
-///   line at the lower left of the view (KleptonCompositor's stats card).
+/// - Readout: the metrics panel above the middle of the view (KL_STATS_CARD,
+///   KleptonMetrics.swift).
 enum AlyxCadence: Int, CaseIterable, Identifiable {
     case every = 1, second = 2
 
@@ -1262,9 +1262,9 @@ struct AlyxPanel: View {
             }
             GroupBox(klT("More", "Weiteres")) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Toggle(klT("Show frame rate", "Bildrate einblenden"), isOn: $stats)
-                    Text(klT("One line at the lower left of the view: pictures a second, display rate, graphics time and temperature.",
-                             "Eine Zeile unten links im Blickfeld: Bilder pro Sekunde, Display-Takt, Grafikzeit und Temperatur."))
+                    Toggle(klT("Show performance from the start", "Leistungsanzeige von Anfang an einblenden"), isOn: $stats)
+                    Text(klT("A small panel just above the middle of the view: pictures a second, repeated pictures, GPU and CPU load, memory and heat, with the last minute as graphs. Holding Create and Options together for a second shows it and hides it at any time, whether this is on or not.",
+                             "Eine kleine Tafel knapp über der Blickmitte: Bilder pro Sekunde, wiederholte Bilder, Auslastung von GPU und CPU, Speicher und Wärme, dazu die letzte Minute als Verlauf. Create und Options eine Sekunde lang zusammen gehalten blendet sie jederzeit ein und aus, ob das hier an ist oder nicht."))
                         .font(.footnote).foregroundStyle(.secondary)
                     Toggle(klT("Keep depth samples out of memory", "Tiefenwerte nicht im Speicher halten"), isOn: $leanDepth)
                     Text(klT("Saves about 90 to 170 MB of memory, depending on the picture. If parts of the picture are missing or flicker, switch it off.",

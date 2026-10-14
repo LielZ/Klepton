@@ -1,3 +1,4 @@
+#include "kl_sink1.h"   // kl_audio_* etc. are kl1_* in this file — kl_audio_switch.c
 // OpenSL ES, enough of it for Unity's FMOD to open an output device.
 //
 // Measured rather than guessed: serving the library handle and logging dlsym

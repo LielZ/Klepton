@@ -1016,12 +1016,16 @@ static unsigned g_shader_pins_n;
 // Tied to the title it was measured on. Every Unity title that works was
 // verified with its samplers on the linker's units, and the two fixed-size
 // tables here meet a guest's whole shader set for the first time this way.
+// Real VR Fishing (x2582932495064035) is the second, on its sender's word: the
+// fix that turned the pins on for it names texture faults among its reasons
+// and was run on a headset that way (fix 37, 2026-10-14; not run here).
 static int klfb_bind_pins(void) {
     static int v = -1;
     if (v < 0) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
-        v = kl_env_on("KL_GLFB_BIND_PINS", t && strcmp(t, "x2773034772778845") == 0);
+        v = kl_env_on("KL_GLFB_BIND_PINS", t && (strcmp(t, "x2773034772778845") == 0 ||
+                                                 strcmp(t, "x2582932495064035") == 0));
     }
     return v;
 }

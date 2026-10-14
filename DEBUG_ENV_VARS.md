@@ -40,6 +40,21 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   unimplemented calls into third-party analytics SDKs (`com/gameanalytics/…`, `com/amplitude/…`).
   Default 1: such calls are dropped and answer zero/NULL/void, since there is
   no host to report to. Max Mustard aborted on `GameAnalytics.addErrorEvent`.
+  Not this switch, and not a drop: for BattleGroupVR2 (`x9386827918099701`)
+  alone, the Firebase SDK's start (`runtime/jni/kl_jni_firebase.c`) and
+  `VivoxNative.init(Context)` (`runtime/jni/kl_jni_vivox.c`) are answered with
+  the exception Java throws for a backend that is not there —
+  `UnsupportedOperationException`, `IllegalStateException` for
+  `FirebaseApp.getInstance` — so the SDK reports it to the game instead of the
+  process stopping on the name. No Firebase feature and no voice chat; every
+  other Firebase or Vivox call still aborts by name.
+- `KL_JNI_DROP_BHAPTICS=0|1` — (`runtime/kl_jni.c`) drop the calls into
+  `com/bhaptics/…` that the bHaptics table (`runtime/jni/kl_jni_haptics.c`)
+  has no row for: they answer zero/NULL/void, as a vest that is not there, and
+  the first 16 are named in the log. The table is one version of the plugin's
+  wrapper; a game with another version otherwise stops at the first entry it
+  lacks. Default 1 for `x2582932495064035` (Real VR Fishing, whose files nobody
+  here has to read the missing rows out of), else 0 — the stop by name.
 - `KL_MP14_TRACE=1` — (`runtime/jni/kl_jni_ue4.c`) name the first few hundred
   calls a guest makes on UE4's `MediaPlayer14` (position, frame fetch, playing,
   complete, resolution change, start/pause/seek), each with the thread it came
@@ -48,8 +63,9 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
 - `KL_PLAT_USER=0|1` — (`runtime/xr/kl_ovrplat.c`) hand out a synthetic
   OFFLINE user for `ovr_GetLoggedInUserID` / `ovr_User_GetLoggedInUser`.
   "Who is playing", not an ownership answer. Default on for the titles listed
-  in `klplat_user_default` — the ones that quit or wait without a user — and
-  off for every other.
+  in `klplat_user_listed` — the ones that quit or wait without a user,
+  BattleGroupVR2 (`x9386827918099701`) among them, whose start waits for
+  player data — and off for every other.
 - `KL_PLAT_IAP_EMPTY=0|1` — (`runtime/xr/kl_ovrplat.c`) answer
   `ovr_IAP_GetProductsBySKU` and `ovr_IAP_GetViewerPurchases` with an EMPTY
   list instead of refusing the request. For a title whose start waits for the
@@ -772,7 +788,8 @@ The guest's own memory management, and the three seams that used to disable it.
   uses the location it is told for a sampler as the texture unit; with the
   linker's own numbering that can be 32 or more, which the engine refuses
   ("Invalid texture unit!") — text as filled boxes. Default 1 for
-  `x2773034772778845` (Premium Bowling, Unity 6000.3.22f1), else 0.
+  `x2773034772778845` (Premium Bowling, Unity 6000.3.22f1) and
+  `x2582932495064035` (Real VR Fishing, as its fix was sent in), else 0.
 - `KL_FS_JAR_FILE=0|1` — a path of the form `jar:file:///…` with no `!/`
   entry part is read as the plain path it wraps; Unity's Android file layer
   strips that scheme itself. Default 1 for `x3635172946605196` (BRINK
@@ -781,8 +798,10 @@ The guest's own memory management, and the three seams that used to disable it.
   (ELF thread-local storage, dynamic model) for a library's own TLS: a block
   per thread and module, made at first use. Off, such a library does not
   load, as before. Default 1 for `x3635172946605196`, `x4360608937312293`
-  (Wooorld, whose sign-in needs `libovravatar2`) and `x2773034772778845`
-  (Premium Bowling, same library), else 0 — a title that works may ship an
+  (Wooorld, whose sign-in needs `libovravatar2`), `x2773034772778845`
+  (Premium Bowling, same library), `x3634830803298285` (Demeo,
+  `libInteractionSdk`) and `x9386827918099701` (BattleGroupVR2, the
+  `LibRuntimeOptimizer` it ships), else 0 — a title that works may ship an
   optional library it has been running without.
 - `KL_MADV_DONTNEED=remap|reusable|zero|passthrough` — how a guest
   `madvise(MADV_DONTNEED)` is served. Default `remap`. **`MADV_DONTNEED` is 4 on
@@ -810,6 +829,18 @@ The guest's own memory management, and the three seams that used to disable it.
 - `KL_LOWMEM_CLEAR=<percent>` — re-arm threshold, default 70. A guest that
   cannot free anything is asked once, not once a frame. The OS's own
   memory-pressure signal ignores both and always fires.
+- `KL_LOWMEM_FREE_MB=<MiB>` — where the OS says how much this process may
+  still allocate (`os_proc_available_memory`, so on a headset), the guest is
+  told when less than this is left, and the two percentages above are not
+  looked at; told again only after 1.5 times as much was free. Default 384.
+  1536 for BattleGroupVR2 (`x9386827918099701`): what it asks for at its start
+  came in steps larger than the smaller reserve.
+- `KL_LOWMEM_USAGE_CHANGED=0|1` — (`runtime/kl_jni.c`) a guest with no
+  `nativeLowMemory` is told through Unity 6.2's
+  `UnityPlayer.nativeMemoryUsageChanged(Critical)` instead, on the player the
+  lifecycle runs on. Default 1 for BattleGroupVR2 (`x9386827918099701`), else
+  0: another Unity 6.2 title is told nothing under pressure, as before, and
+  what each does when told has not been looked at.
 
 ## Guest storage (`runtime/kl_jni.c`)
 
@@ -1811,7 +1842,10 @@ puts the camera on the ground with its hands underneath it.
   is told the device supports (limits and image-format properties), 0 for the
   truth. A guest's multisampled eye targets are real memory here, so this is
   what a larger eye is paid for with. Default 2 for `x5812519008825194`
-  (with `KL_OVRP_EYE_MAX` 3840), else 0.
+  (with `KL_OVRP_EYE_MAX` 3840), `x3634830803298285` (Demeo) and
+  `x9386827918099701` (BattleGroupVR2: three 4x colour and depth pairs ask
+  for about 5.2 GiB at its start; its eye size is left alone, and it runs
+  without MTLHeaps, `MVK_CONFIG_USE_MTLHEAP=0`, as Alyx does), else 0.
 - `KL_VK_FORCE_SAMPLES=4` — every multisampled image, render-pass attachment
   and pipeline a Vulkan guest makes with fewer samples is made with 4. For a
   guest whose own anti-aliasing setting cannot be reached (Marvel's Deadpool VR
@@ -3153,6 +3187,14 @@ except its own control vars (next section).
   launch is made a first launch. Set `=0` when the headset has to come off with a
   capture or a debugger still attached. Either way the phase change is logged
   (`[app] scene phase -> …`).
+- `KL_UNITY_QUIT_EXITS=0|1` — (`visionos/Sources/kl_app.c`) a Unity guest's
+  `nativeRender` returning false ends its frame loop and the app leaves, the
+  way Android finishes the activity when a game calls `Application.Quit()`.
+  Without it the loop goes on calling an engine that has stopped drawing, and
+  a game quit from its own menu leaves its last picture standing until the app
+  is closed by hand. Default 1 for `x2582932495064035` (Real VR Fishing), else
+  0: no other game has been watched answering false. Not on the
+  `KL_SYNC_GUEST` path.
 - `KL_SYNC_GUEST=1` — drive the guest inline on the compositor thread, i.e.
   P5b's shape before the guest moved to its own thread. The clock P5.4's device numbers were taken
   against, and the A/B for anything that looks like a pacing regression.
@@ -3265,10 +3307,28 @@ written down is a value found twice.
   Default is **both, OR'd**: the system's `.indirectPinch` and the fingertip
   distance — each has been unreliable alone and their failures are
   uncorrelated. Use to isolate one when the question is which is misbehaving.
+- `KL_PINCH_DISCRETE=0|1` — (`visionos/Sources/KleptonPinch.swift`) a hand's
+  pinch as a trigger that is 0 or 1 and nothing between, the button with it.
+  Default 1 for BattleGroupVR2 (`x9386827918099701`), whose trigger action is
+  a boolean on the trigger's value: the partial closure every other game is
+  handed while the fingers approach is a click there. Else 0, and hand input
+  is what it was. On: a system pinch, direct or indirect, presses at once and
+  releases when its gesture ends, whatever the fingertips measure; each
+  gesture presses once, followed by its id, so the event that ends it needs
+  no hand of its own and an update that arrives after the hand was lost, or
+  more than 200 ms late, presses nothing. The fingertip distance presses
+  after 40 ms closed and can press again after 50 ms open; up to 80 ms of
+  missing fingertips on a tracked hand are bridged without counting towards
+  either. A lost hand, a distance that is not a number and a stalled frame
+  loop release, and need the hand open again before the distance presses.
+  `KL_PINCH_SRC` chooses the source as before. Controllers are not touched.
 - `KL_PINCH_TRACE=0` — silence the pinch trace, which is **on by default**
   during bring-up: one line every 2 s per hand — closest pinch reached, axis
   value produced, frames asserted, or `no skeleton`. Those four distinguish
-  the four ways "the trigger does not click" can be true.
+  the four ways "the trigger does not click" can be true. With
+  `KL_PINCH_DISCRETE`, a second line counts the frames without the hand,
+  without a skeleton and without both fingertips, and each system pinch's
+  start and release is named with its hand and id.
 - `KL_HAPTICS_OFF=1` — do not play the guest's haptics. The pull still runs
   (nothing backs up either way — the queue retires on the clock), so this is
   purely "is the buzzing the guest's, or ours". Playback is CoreHaptics on a
@@ -3307,6 +3367,13 @@ written down is a value found twice.
   line counts it whenever it happens: `anchor N walked back / N held / N
   unknown` — walked back is the timestamp being stepped into range, held is the
   last measured pose standing in, unknown is having never tracked at all.
+- `KL_CP_ANCHOR_TRACKED=0|1` — take a device anchor whose `isTracked` is false
+  for no answer at all: the guest keeps its last head pose and the composite
+  holds the last measured one (`KL_CP_ANCHOR_HOLD`) instead of both following
+  whatever transform the anchor carries while the headset is finding its place
+  again. Counted on the `cadence` line like any other refusal. Default 1 for
+  `x2582932495064035` (Real VR Fishing, as its fix was sent in), else 0 — what
+  other games show through a tracking loss has not been compared.
 - `KL_CP_EYE=<0|1>` — composite ONLY that eye, leaving the other black. The
   binocular-vs-temporal split for a doubled image: one second, halves the
   search space.
@@ -3487,10 +3554,10 @@ Not knobs — the shim reads these to answer the guest with host truth.
   (0 nominal .. 3 critical) and memory used / left. `kl_app.c`, `perf_tick`.
 - `KL_MTL_GPU_TIME=0|1` — the GPU time of the command buffers that carry the
   multisampled scene pass, from their own start and end times (a completed
-  handler each; **on for `alyx`**). Feeds `[perf]` and the readout.
-- `KL_STATS_CARD=1` — one line at the lower left of the view: frames a second,
-  display rate, GPU time, thermal state. Redrawn at most once a second.
-  Half-Life: Alyx sets it from "Show frame rate" in its start window.
+  handler each; **on for `alyx`**). Feeds `[perf]`.
+- `KL_STATS_CARD=1|line` — how the game runs, shown in the headset; see "The
+  metrics panel" at the end of this file. Half-Life: Alyx sets it from "Show
+  performance" in its start window.
 - `KL_GUEST_PACE_DIV=<n>` — a guest paced through `xrWaitFrame` starts a frame
   on every nth refresh of the panel (default 1). Timed against the panel's own
   period, so a display rate the system has halved does not make it a quarter.
@@ -3595,3 +3662,185 @@ Moss's defaults since 2026-10-13 (the owner's setting on the headset): `KL_OVRP_
 `KL_OVRP_EYE_DESC_CAP` on, `KL_OVRP_EYE_ALIGN` 4, `KL_VK_ANISO` 16, `KL_GUEST_PACE_DIV` 2, foveated
 rendering at "high". "high" itself changed with it for every Vulkan game: box 0.18 and floor 0.16 (were
 0.30 and 0.08); the Test switch `KL_FOVE_BOX=0.30` + `KL_FOVE_FLOOR=0.08` is the way back.
+
+After the release, one piece of his pose core (his commit be18669), as a switch
+that is off (2026-10-13). For a run from `Documents/lx/env.txt`; not a row in
+the window. `runtime/xr/kl_ovrp.c`, the block `ONE POSE PER GUEST FRAME`.
+
+- `KL_OVRP_ONE_POSE=1` (or `index`) — one head pose per guest frame. At the
+  frame's boundary the published head pose is frozen together with the eye
+  transform (offsets and cant), and every head-derived answer for the rest of
+  that frame returns it: both `ovrp_Update2/3` steps, every
+  `ovrp_GetNodePoseState`, the eye view and the head an OpenXR guest reads.
+  Hands and controllers stay live. The frame record filed for reprojection is
+  taken from the same samples and so carries the frozen pose.
+  **Default off** (unset, `0`, `off`, `live`): nothing is frozen and every read
+  takes the path it took before; his fork has it on. Without it an OVRPlugin
+  guest gets one sample per step, so the Physics and the Render step differ, and
+  a second Render sample in the same frame differs again. `KL_OVRP_LATCH` and
+  the step samples keep running underneath. A read that names a frame index
+  (`ovrp_GetNodePoseState3`) is still answered from that index's own sample
+  (`KL_OVRP_RECORD_INDEXED`), which with this switch on is the pose frozen when
+  the guest sampled for that index.
+- `KL_OVRP_POSE_BOUNDARY=cycle|index` — with `KL_OVRP_ONE_POSE` only: what
+  renews the frozen pose. **Default `cycle`**: once per `ovrp_WaitToBeginFrame`.
+  `index`: whenever `ovrp_Update2/3` carries a new frame index — which freezes
+  twice in a frame whose two steps carry different indices (Unity with the
+  render thread trailing; his measurement on Paint the Town Red VR). A guest
+  that never calls `ovrp_WaitToBeginFrame` (OpenXR) is renewed at each
+  `kl_ovrp_frame_latch` whatever this says.
+
+  With the switch on, two lines at the start (`[ovrp] one pose per guest frame
+  ON`, `[ovrp] pose boundary = …`) and four every 300 frozen frames; with it off
+  none of them:
+  - `[ovrp] one-pose: served update2 A step B head C eyeview D live E |
+    live-divergence worst X deg mean Y | eye-offset rot pushes … changes …
+    worst … deg` — how many answers the frozen poses gave per entry point
+    (`live` = asked before the first freeze, answered the old way).
+    `live-divergence` is how far the published pose had moved on from the
+    frozen one when it was asked for: the motion that used to reach the
+    picture inside one frame. The last three numbers are how often and how far
+    the eye's rotation changed between pushes from the compositor.
+  - `[ovrp] pose boundary: freezes F, reuses R, guest frame cycles C |
+    poses/frame P | update2 per freeze U (mode=cycle|index)` — `poses/frame`
+    must read 1.00; above that a frame was answered from two poses (his 1.70 in
+    gameplay with `index`). `update2 per freeze` is 2.00 for a guest that
+    samples both steps once per frame. `guest frame cycles 0` with
+    `mode=index` is a guest that does not call `ovrp_WaitToBeginFrame`.
+  - `[ovrp] frozen series: mean step … deg, alternation index …, sign flips …%,
+    worst reversal … deg` — the frozen poses against each other. A head turned
+    evenly gives an alternation index near 0 and no sign flips; an index near 1
+    or flips while turning mean the series itself zigzags (two time bases
+    interleaved in what the compositor publishes), which no reprojection sees.
+  - `[ovrp] intra-frame pose spread: worst … deg` — the largest angle between
+    two head poses `ovrp_GetNodePoseState` returned between two frame
+    boundaries. 0.000 when every read was answered from the frame's pose;
+    above that, reads named another frame's index (a render thread still
+    drawing the previous frame — each such read still matches that frame's
+    record) or straddled the boundary.
+
+His audio sink (his commits 3fc48c9 and 975cad6), whole, as a switch that is
+off (2026-10-14; the owner heard Moss both ways on the headset and both
+sounded right). A row in the window's Test group. It is not merged into the
+audio path that has shipped: both are linked in, and
+`runtime/media/kl_audio_switch.c` answers every `kl_audio_*`, `kl_opensl_*` and
+`kl_aaudio_*` name from the one chosen for the run.
+
+- `KL_AUDIO_SINK2=1` — play through the second audio path
+  (`runtime/media/kl_sink2_audio.c`, `kl_sink2_opensl.c`, `kl_sink2_aaudio.c`;
+  his files, changed only in the names of the headers they include). What is
+  different with it on:
+  - every guest sample format (8, 16, 24, 32 bit, float) is widened to float
+    before the resampler; the first path converts the other widths to 16 bit in
+    the OpenSL feeder and takes 16 bit and float from AAudio;
+  - each OpenSL player and each AAudio stream is a source of its own, and ONE
+    owns the output: the first to hand over a buffer that is not silence. The
+    others are paced for their buffer's length and dropped. The owner changes
+    after 2 s of its silence while another source is heard. The first path
+    settles the device by rate and mixes sources at the same rate
+    (`kl_opensl_yield_device`, `take_device`, `silent_yield`);
+  - an AAudio stream is asked for 256 frames whatever the game — the five
+    Wwise titles the first path asks 1024 of are asked 256 too — and an empty
+    buffer between two blocks of the guest's mixer is waited out of the sink's
+    lead (12 ms at most) instead of played;
+  - `dlsym` on libaaudio answers NULL for a name that is not served, where the
+    first path hands out a stub that aborts when called;
+  - a census every 15 s (`[au] …` per source, `[aaudio] …` per stream) and one
+    line in the `[hb]` loop.
+  The choice is made by the first call that opens, looks up or plays something
+  and is logged once: `[au] audio path: the first sink` or `… the second sink`.
+  A guest with two streams of one backend that are both heard (Steam Link's
+  two AAudio outputs) therefore plays one of them; `KL_AUDIO_MIX_SOURCES=1`
+  is his way round it and has not been run here.
+  With the switch on these do nothing: `KL_AAUDIO_OLD_BURST`,
+  `KL_AUDIO_MIX_UNLOCK`, `KL_SL_SILENT_YIELD`, `KL_AAUDIO_TRACE`.
+- With `KL_AUDIO_SINK2=1` only, his knobs:
+  - `KL_AAUDIO_BURST=<frames>` — frames per callback (256); also read by the
+    first path.
+  - `KL_AUDIO_SOURCE=opensl|aaudio` — force the owner. `KL_AUDIO_MIX_SOURCES=1`
+    — no owner, every source writes into the one ring. `KL_AUDIO_STEAL_MS=<n>`
+    — how long the owner must be silent before another takes over (2000).
+  - `KL_AAUDIO_HOLE_DROP=<n>`, `KL_AAUDIO_SEAM_WAIT_MS=<ms>`,
+    `KL_AAUDIO_SEAM_LEAD_MS=<ms>` — the block-seam handling; `…_WAIT_MS=0`
+    drops an empty buffer and pulls again without waiting.
+  - `KL_AUDIO_REPORT_SECS=<n>` — the census interval (15; 0 turns it off).
+  - `KL_AUDIO_DUMP=<path>`, `KL_AAUDIO_DUMP=<path>`, `KL_AUDIO_DUMP_S=<n>` —
+    a WAV of what goes to the device and of what the guest's callback handed
+    over, `n` seconds each (20), closed by themselves.
+- Gates: `make audioswitch` (the switch, both ways) and `make sink2-audio` (his
+  format test) are in `make check`; `make sink2-aaudio` (his block-seam
+  harness) runs 20 s in real time against the output device and is not.
+
+## The metrics panel (`KL_STATS_CARD`)
+
+- `KL_STATS_CARD=1` — a panel fixed to the head just above the middle of the
+  view (0.34 x 0.17 m at 1.2 m, its centre 5 degrees up), after the performance
+  overlay of a Quest (OVR Metrics Tool): the last second in numbers and the
+  last minute as three graphs, refreshed once a second. In English whatever
+  the device speaks. It is drawn into the game's picture and so is as sharp as
+  that is — 30 pixels a degree at an output quality of 0.4 (Moss), 40 at 1.0 —
+  with a texture level drawn for each of those sizes; no setting of its own
+  makes it sharper than the picture, the game's "output onto the display" does.
+  **Default off, and that only means "not there from the start"**: the panel
+  can be called up in every game (next paragraph). Test switch "Show
+  performance in the headset from the start".
+  `KL_STATS_CARD=line` is the one line it began as (frames a second, display
+  rate, GPU load, heat), at the lower left.
+
+  **Create + Options held together for a second** show the panel and hide it
+  again, in every game and whatever `KL_STATS_CARD` says. Nothing is sampled or
+  counted before the panel is first shown (it says "Measuring …" for its first
+  second, and its graphs begin there); from then on the sampling goes on while
+  it is hidden, so the graphs are whole when it returns. So that the game does
+  not open its menu with it, the two buttons always go through
+  `kl_metrics_chord`: a press of one alone reaches the game a quarter of a
+  second late (a shorter tap is played once it is over), and while both are
+  down neither does — also when they are let go before the second is up.
+  `KL_STATS_CARD_BUTTONS=0` hands both buttons to the game untouched; the panel
+  is then only what `KL_STATS_CARD` makes it. `applyPanelChord`,
+  KleptonControllers.swift.
+
+  | Row | What it is |
+  | --- | --- |
+  | FPS / Hz | new pictures of the game shown a second / pictures presented a second (the rate the system shows the app at) |
+  | Shaders | requests a second to Metal for a library from a shader's source or a render pipeline state, by ANGLE or MoltenVK alike, in two numbers: **new** — took 2 ms or longer, so it was compiled — and **cached** — answered at once from what the system had compiled before, in this run or an earlier one (`klc_note`, `runtime/gfx/kl_mtl_busy.m`; measured on a Mac: 0.01-0.1 ms against 4-95) |
+  | GPU | share of the second the GPU worked for this app: the spans of every command buffer the process committed, overlaps counted once (`runtime/gfx/kl_mtl_busy.m`) |
+  | GPU, game | that time less the compositor's, over the game's frames |
+  | GPU, display | GPU time of one composite pass |
+  | CPU | CPU time of the whole process, in cores |
+  | (thread name) | the busiest thread's share of one core — the one a CPU-bound game waits for |
+  | Memory | footprint, and what is left before the system's limit |
+  | Heat | the system's thermal state |
+  | Picture | the eye picture the compositor reads, in pixels |
+
+  Graphs: frames a second against the display rate; GPU load and the busiest
+  thread; shaders a second, as a bar for every second that had any, the compiled
+  ones red from the bottom and the cached ones grey on top — a hitch in the
+  first graph with a red bar under it was a compile. (The sample also
+  holds the repeated pictures a second, `stale`; the panel showed them until
+  the owner asked for the compiles in their place — they are the display rate
+  less the frame rate, which both stand at the top.)
+
+  Counted where a picture is shown (`kl_metrics_note_shown`, the compositor's
+  frame loop), so every kind of guest has a frame rate — the line before this
+  read the count of started frames, which only a guest paced through the XR API
+  has, and showed nothing for a Unity game. The sample is taken on the
+  heartbeat's thread and the picture of it drawn on a queue of its own; the
+  compositor's thread pays two counts and one quad a frame.
+  `runtime/diag/kl_metrics.c`, `visionos/Sources/KleptonMetrics.swift`
+  (drawing only — runs on a Mac with made-up samples), `encodeStatsCard`.
+  Tests: `build/t_metrics`, `build/t_mtlbusy`.
+
+## Test switches that are on from the installation (`KLEPTON_TEST_ON`)
+
+- `KLEPTON_TEST_ON=<name>[,<name>…]` — a BUILD-time variable, read by
+  `visionos/gen_xcodeproj.py`: the Test switches (by the name of their
+  variable, e.g. `KL_OVRP_ONE_POSE,KL_AUDIO_SINK2`) that this installation has
+  on from its first start. It lands in Info.plist as `KLTestOn`;
+  `KleptonTestSwitches.isOn` takes a choice made in the game's window first and
+  this list second, so a switch named here can still be turned off in the game
+  (and stays off), and one that is put back follows the installation again.
+  Anything that is not a `KL_…` name is dropped. Unset: every switch is off
+  until chosen, as before. AVP Play sets it from its setting "Experimental:
+  switch on the new pose and audio implementations when installing"; the log
+  line of such a switch ends in `(on from the installation)`.

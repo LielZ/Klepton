@@ -24,6 +24,12 @@
 #include <stdio.h>
 #include <stdint.h>
 
+// Which of the two audio paths this run plays through: 1 the second sink
+// (KL_AUDIO_SINK2=1), 0 the first, -1 while no call has needed to know yet.
+// Every name in this header, kl_opensl.h and kl_aaudio.h is answered by
+// kl_audio_switch.c, which says how the choice is made. Asking does not make it.
+int  kl_audio_sink2_chosen(void);
+
 // Open the device for a guest stream of `rate` Hz, `channels` channels,
 // `bits` bits per sample (16 is the only width FMOD produces and the only one
 // implemented). Returns 0 on success; on failure the caller must keep its own

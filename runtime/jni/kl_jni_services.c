@@ -294,7 +294,9 @@ static klj_val klj_Omni_start(void *env, void *self, const klj_val *a, int n) {
 // static, return void and only set process-wide switches for web views that
 // may be created later (resumeAll resumes the ones that exist: none). With no
 // answer the first of them stopped the game before its first frame ("no host
-// implementation", 2026-10-11).
+// implementation", 2026-10-11). Real VR Fishing (x2582932495064035) sets two
+// more of the same kind on the way into its title scene, setDrmEnabled and
+// globallySetUserAgent (fix 37, 2026-10-14; not run here).
 //
 // Deliberately only these. WebView3D.<init> and everything that would hand the
 // game a page stays unimplemented, so a game that really opens a web view
@@ -306,6 +308,21 @@ static klj_val klj_Vuplex_setting(void *env, void *self, const klj_val *a, int n
         KLJ_LOG("com/vuplex/webview/WebView3D: no Android WebView on this host — "
                 "the plugin's static settings are accepted and change nothing");
     return (klj_val){0};
+}
+
+// ...and the question the plugin asks before it makes a web view: is the
+// system's WebView package installed? It is not, and false is the plugin's own
+// answer for a device without one — the game is told its browser is unavailable
+// by the plugin instead of stopping at WebView3D.<init>. Real VR Fishing asks;
+// what it leaves out without a browser (its online music, by its sender) is
+// left out.
+static klj_val klj_Vuplex_isWebViewAvailable(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("com/vuplex/webview/WebView3D.isWebViewAvailable() -> false "
+                "(no Android WebView on this host)");
+    return (klj_val){.j = 0};
 }
 
 // ---- Meta Voice SDK: a telemetry service that is never bound ----
@@ -1575,6 +1592,37 @@ static klj_val klj_File_canWrite(void *env, void *self, const klj_val *a, int n)
 static klj_val klj_File_isDirectory(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n; return (klj_val){.j = klj_File_access(self, 0, 1)};
 }
+// Firebase's embedded-file cache makes an old file writable, deletes it, then
+// marks its replacement read-only before writing through an already-open fd.
+// These are real filesystem operations, including their boolean failure result.
+static klj_val klj_File_delete(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data || !*(const char *)o->data) return (klj_val){.j = 0};
+    char kp[1024];
+    // remove unlinks a symlink itself and removes only empty directories.
+    return (klj_val){.j = remove(kl_guest_path(o->data, kp, sizeof kp)) == 0};
+}
+static int klj_File_permission(void *self, mode_t mask, int enable) {
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data || !*(const char *)o->data) return 0;
+    char kp[1024];
+    const char *path = kl_guest_path(o->data, kp, sizeof kp);
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    mode_t mode = st.st_mode & 07777;
+    return chmod(path, enable ? mode | mask : mode & ~mask) == 0;
+}
+static klj_val klj_File_setWritable(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    // The one-argument overload defaults to ownerOnly=true.
+    mode_t mask = n < 2 || a[1].j ? S_IWUSR : S_IWUSR | S_IWGRP | S_IWOTH;
+    return (klj_val){.j = klj_File_permission(self, mask, n > 0 && a[0].j)};
+}
+static klj_val klj_File_setReadOnly(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = klj_File_permission(self, S_IWUSR | S_IWGRP | S_IWOTH, 0)};
+}
 // mkdirs()/mkdir(): Java's contract is "true only if this call created it" —
 // false for a directory that was already there.
 static klj_val klj_File_mkdirs(void *env, void *self, const klj_val *a, int n) {
@@ -2564,10 +2612,14 @@ const klj_binding klj_bind_services[] = {
     {"com/oculus/metrics/MetricsService", "setOverlayDebugString", "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z", klj_void_noop},
     // Vuplex 3D WebView's process-wide switches (see klj_Vuplex_setting). Static,
     // through ReflectionHelper. Only the three Wooorld calls on its way to its
-    // first scene; a web view itself (WebView3D.<init>) is not served.
+    // first scene and Real VR Fishing's two; a web view itself
+    // (WebView3D.<init>) is not served, and isWebViewAvailable says so.
     {"com/vuplex/webview/WebView3D", "setAlternativePointerInputSystemEnabled", "(Z)V", klj_Vuplex_setting},
     {"com/vuplex/webview/WebView3D", "setAutoplayEnabled", "(Z)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "setDrmEnabled", "(Z)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "globallySetUserAgent", "(Ljava/lang/String;)V", klj_Vuplex_setting},
     {"com/vuplex/webview/WebView3D", "resumeAll", "()V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "isWebViewAvailable", "()Z", klj_Vuplex_isWebViewAvailable},
     // The Voice SDK's telemetry connection (see klj_VoiceLogger_getService):
     // the fragment is an inert object, the service behind it is never bound.
     {"com/oculus/assistant/api/unity/logging/UnityPlatformLoggerServiceFragment", "createAndAttach",
@@ -2724,6 +2776,10 @@ const klj_binding klj_bind_services[] = {
     {"java/io/File", "canRead",         "()Z",                  klj_File_canRead},
     {"java/io/File", "canWrite",        "()Z",                  klj_File_canWrite},
     {"java/io/File", "isDirectory",     "()Z",                  klj_File_isDirectory},
+    {"java/io/File", "delete",          "()Z",                  klj_File_delete},
+    {"java/io/File", "setWritable",     "(Z)Z",                 klj_File_setWritable},
+    {"java/io/File", "setWritable",     "(ZZ)Z",                klj_File_setWritable},
+    {"java/io/File", "setReadOnly",     "()Z",                  klj_File_setReadOnly},
     {"java/io/File", "mkdirs",          "()Z",                  klj_File_mkdirs},
     {"java/io/File", "mkdir",           "()Z",                  klj_File_mkdir},
     {"android/content/res/AssetManager", "open", "(Ljava/lang/String;)Ljava/io/InputStream;", klj_AssetManager_open},

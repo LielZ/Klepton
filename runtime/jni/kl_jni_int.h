@@ -202,6 +202,13 @@ extern const klj_binding klj_bind_jkxr[];
 extern const klj_binding klj_bind_services[];
 extern const klj_binding klj_bind_haptics[];
 extern const klj_binding *const klj_binding_tables[];
+// One title's own answers, asked before the tables: each looks at the target
+// first and is NULL for every other (kl_jni_firebase.c, kl_jni_vivox.c).
+const klj_binding *klj_firebase_binding(const char *cls, const char *name, const char *sig);
+const klj_binding *klj_vivox_binding(const char *cls, const char *name, const char *sig);
+// The UnityPlayer if a lifecycle call has made it, NULL before — for a caller on
+// another thread, which must not be the one to make it (kl_jni_softinput.c).
+void *klj_unity_player_made(void);
 
 
 

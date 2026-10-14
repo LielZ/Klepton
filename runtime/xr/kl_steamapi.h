@@ -27,6 +27,9 @@ void *kl_steamapi_dlopen(const char *soname);   // NULL if not the Steam API
 int   kl_steamapi_claims(const char *soname);   // the same test, without opening
 int   kl_steamapi_is_handle(const void *h);
 void *kl_steamapi_sym(const char *name);
+// A Steam name a guest library IMPORTS (Unreal links the library and uses the
+// SDK's C++ interfaces); NULL for a name that is not served.
+void *kl_steamapi_lookup(const char *name);
 // Has the guest opened the Steam API — is this the Steam build of its game?
 int   kl_steamapi_in_use(void);
 // The same question asked of the files, so it has an answer before the guest runs.

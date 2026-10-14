@@ -477,6 +477,25 @@ final class KleptonCompositor {
     private var anchorHeld = 0
     private var anchorUnknown = 0
     private let holdAnchor = klEnvOn("KL_CP_ANCHOR_HOLD", default: true)
+    // KL_CP_ANCHOR_TRACKED: a device anchor the tracker itself marks as not
+    // tracked counts as no answer. As the sender of fix 37 describes it,
+    // `queryDeviceAnchor` goes on returning an anchor while the headset has
+    // lost its place and is finding it again, with `isTracked` false and a
+    // transform that is not where the head is; taken as a pose, the guest and
+    // the composite both follow it. Refused, the three readers below do what
+    // they already do for a nil: the guest keeps its last pose, the composite
+    // holds the last measured one (KL_CP_ANCHOR_HOLD) and the drawable is
+    // given no anchor. Default on for the one title it was run with — Real VR
+    // Fishing (x2582932495064035), on its sender's headset (2026-10-14; not
+    // run here) — because what every other game shows through such a moment
+    // has not been looked at.
+    // Static: `headAt` is a C function pointer and can capture nothing.
+    private static let trackedAnchorsOnly =
+        klEnvOn("KL_CP_ANCHOR_TRACKED", default: klTargetName() == "x2582932495064035")
+    private static func usable(_ anchor: DeviceAnchor?) -> DeviceAnchor? {
+        guard let anchor, !trackedAnchorsOnly || anchor.isTracked else { return nil }
+        return anchor
+    }
     // Host recenter — the Quest Oculus-button hold, done where the Quest does
     // it: in the OS layer. `recenterXform` rebases the world origin so the
     // head's current yaw+XZ become identity; folded into originFromDevice(),
@@ -632,7 +651,7 @@ final class KleptonCompositor {
         var t = presentation
         var steps = 0
         while steps < 10 {
-            if let a = worldTracking.queryDeviceAnchor(atTimestamp: t) {
+            if let a = Self.usable(worldTracking.queryDeviceAnchor(atTimestamp: t)) {
                 if steps > 0 { anchorWalkedBack += 1 }
                 return a
             }
@@ -675,7 +694,7 @@ final class KleptonCompositor {
         // Predicted to the presentation time, not "now": the pose the guest
         // renders with should be the pose the display will show it at, which is
         // the whole point of having a deadline to render against.
-        if let anchor = worldTracking.queryDeviceAnchor(atTimestamp: presentationTime) {
+        if let anchor = Self.usable(worldTracking.queryDeviceAnchor(atTimestamp: presentationTime)) {
             // This is the pose the guest will render with, and kl_ovrp latches
             // it into the stage record when the guest reaches ovrp_BeginFrame —
             // which is what the composite pass reads back to know where the
@@ -1914,8 +1933,19 @@ final class KleptonCompositor {
             // in one case and "there is nothing left to reproject" in the other.
             if !loggedGuestEnd && kl_app_guest_state() < 0 {
                 loggedGuestEnd = true
-                NSLog("[cp] the guest thread has ended (\(String(cString: kl_app_status())))"
-                      + " — everything from here is its last picture, reprojected")
+                if kl_app_guest_asked_quit() != 0 {
+                    // The game quit by itself (KL_UNITY_QUIT_EXITS, kl_app.c):
+                    // on a Quest its activity is finished and the player is
+                    // back in the home space, and holding its last picture
+                    // here would only be something to close by hand. Left
+                    // from the main thread, not from inside this submission,
+                    // and the way backgrounding leaves.
+                    NSLog("[cp] the guest thread has ended: the game asked to quit — leaving the app")
+                    DispatchQueue.main.async { Lifecycle.leave() }
+                } else {
+                    NSLog("[cp] the guest thread has ended (\(String(cString: kl_app_status())))"
+                          + " — everything from here is its last picture, reprojected")
+                }
             }
         }
 
@@ -2036,6 +2066,10 @@ final class KleptonCompositor {
                       + "does not starve (the guest is still loading). "
                       + "Further skips silenced.")
             }
+        }
+        do {    // counted only once the metrics panel has been shown (kl_metrics_begin)
+            let again = frameValue != 0 && frameValue == lastGuestFrame
+            kl_metrics_note_shown(frameValue != 0 && !again ? 1 : 0, again ? 1 : 0)
         }
         if frameValue != 0 && frameValue == lastGuestFrame {
             staleInARow += 1
@@ -2262,6 +2296,7 @@ final class KleptonCompositor {
             let first = self.cmdError == nil && b.error != nil
             if first { self.cmdError = b.error }
             self.cmdLock.unlock()
+            kl_metrics_note_composite(b.gpuEndTime - b.gpuStartTime)
             if n <= 12 { NSLog("[cp] cmdbuf #\(n) COMPLETED" + (b.error != nil ? " err=\(b.error!)" : "")) }
             if first { NSLog("[cp] composite command buffer error: \(b.error!)") }
         }
@@ -2572,6 +2607,7 @@ final class KleptonCompositor {
         // the overlay pass below is then the entire composite rather than a
         // decoration on top of one.
         if nproj == 0, visible > 0, let bind0, let bind1 {
+            noteStatsEye(bind0)
             if !loggedEyeTextures {
                 loggedEyeTextures = true
                 NSLog("[cp] eye textures: slot0 \(bind0.width)x\(bind0.height) "
@@ -3102,87 +3138,141 @@ final class KleptonCompositor {
         return drawn
     }
 
-    // How the game is running, as one line at the lower left of the view
-    // (KL_STATS_CARD=1): the frames the game draws a second, the rate the app
-    // is displayed at, the GPU time of the game's scene and the system's
-    // thermal state — kl_app_perf, which the heartbeat fills once a second.
+    // How the game is running, shown in the headset (KL_STATS_CARD): a panel in
+    // the manner of a Quest's performance overlay — the last second in numbers,
+    // the last minute as graphs (KleptonMetrics.swift) — or, with
+    // KL_STATS_CARD=line, the one line this began as. Fixed to the head, above
+    // the middle of the view, where it is out of the way of what one looks at
+    // and still readable with a glance.
     //
-    // Light by construction: the numbers are three counters; the line is drawn
-    // into a small texture only when its text changes, at most once a second;
-    // and what a frame pays for it is one quad of a few thousand pixels in a
-    // pass that is being drawn anyway. Fixed to the head, low and to the left,
-    // where it is out of the way of what one looks at and still readable with
-    // a glance.
-    private var statsTexture: MTLTexture?
-    private var statsText = ""
-    private var statsContext: CGContext?
-    private static let statsPixels = (w: 960, h: 96)
-    private static let statsSize = SIMD2<Float>(0.40, 0.04)          // metres, at 1.2 m
-    private static let statsEnabled = klEnvOn("KL_STATS_CARD", default: false)
+    // The two menu buttons of the controllers held together for a second show
+    // it and hide it, in every game (kl_metrics_chord); KL_STATS_CARD only says
+    // whether it is there from the start. Until it is first shown nothing of it
+    // exists — no sampling, no count of the GPU's command buffers, no texture —
+    // so the first time it appears it says that it is measuring, and its graphs
+    // begin there.
+    //
+    // A meter must not be what it measures. So nothing of it happens on this
+    // thread but two counts a frame (kl_metrics_note_shown, _note_composite)
+    // and one quad in a pass that is being drawn anyway: the sample is taken
+    // once a second on the heartbeat's thread (kl_metrics.c), and the picture of it
+    // is drawn on a queue of its own into the texture no frame is reading — two
+    // textures, swapped when the new one is complete.
+    private enum StatsMode { case panel, line }
+    private static let statsMode: StatsMode =
+        ProcessInfo.processInfo.environment["KL_STATS_CARD"]?.lowercased() == "line" ? .line : .panel
+    private var statsFromStart: Bool? = klEnvOn("KL_STATS_CARD", default: false)     // nil once applied
+    private let statsLock = NSLock()
+    private var statsFront: MTLTexture?                 // under statsLock: the one a frame may sample
+    private var statsTimer: DispatchSourceTimer?
+    private var statsSampler: MTLSamplerState?          // the panel's own: it picks between the texture's levels
+    private let statsQueue = DispatchQueue(label: "klepton.metrics", qos: .utility)
 
-    private func statsLine() -> String? {
-        var fps: Float = 0, hz: Float = 0, gpu: Float = 0
-        var thermal: Int32 = -1
-        guard kl_app_perf(&fps, &hz, &gpu, &thermal) != 0 else { return nil }
-        var parts = [String(format: "%.0f fps", fps), String(format: "Display %.0f Hz", hz)]
-        if gpu > 0 { parts.append(String(format: "GPU %.1f ms", gpu)) }
-        switch thermal {
-        case 0: parts.append(klT("cool", "kühl"))
-        case 1: parts.append(klT("warm", "warm"))
-        case 2: parts.append(klT("hot", "heiß"))
-        case 3: parts.append(klT("critical", "kritisch"))
-        default: break
+    private func startStats(_ mode: StatsMode) {
+        kl_metrics_begin()
+        let px = mode == .panel ? KLMetricsPanel.panelPixels : KLMetricsPanel.linePixels
+        // The panel in three sizes, each drawn for itself, as the levels of one texture: it is shown with
+        // as many pixels as the game's picture has there, which differs from game to game (KleptonMetrics).
+        let levels = mode == .panel ? KLMetricsPanel.panelLevels : 1
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: px.w,
+                                                            height: px.h, mipmapped: false)
+        desc.mipmapLevelCount = levels
+        desc.usage = .shaderRead
+        let contexts = (0..<levels).compactMap {
+            KLMetricsPanel.makeContext(w: px.w >> $0, h: px.h >> $0,
+                                       units: mode == .panel ? KLMetricsPanel.panelLayout.w : nil)
         }
-        return parts.joined(separator: "   ·   ")
+        let sd = MTLSamplerDescriptor()
+        sd.minFilter = .linear; sd.magFilter = .linear; sd.mipFilter = .linear
+        sd.sAddressMode = .clampToEdge; sd.tAddressMode = .clampToEdge
+        guard let a = device.makeTexture(descriptor: desc), let b = device.makeTexture(descriptor: desc),
+              let levelSampler = device.makeSamplerState(descriptor: sd), contexts.count == levels else {
+            NSLog("[cp] the metrics panel has no texture to draw into — not shown")
+            return
+        }
+        statsSampler = levelSampler
+        let textures = [a, b]
+        var samples: [KLMetricsSample] = []
+        var seq: UInt32 = 0, turn = 0, drawn = false
+        let timer = DispatchSource.makeTimerSource(queue: statsQueue)
+        timer.schedule(deadline: .now(), repeating: 0.25, leeway: .milliseconds(50))
+        timer.setEventHandler { [weak self] in
+            var m = kl_metrics()
+            let now = kl_metrics_latest(&m)
+            // Once at once, before there is a sample — whoever has just held the two buttons for a second
+            // is to see that it worked — and from then on with each new one.
+            let fresh = now != 0 && now != seq
+            guard fresh || !drawn else { return }
+            if fresh {
+                seq = now
+                var s = KLMetricsSample()
+                s.fps = m.fps; s.displayHz = m.display_hz
+                s.compiles = m.compiles; s.compilesCached = m.compiles_cached
+                s.gpuBusy = m.gpu_busy; s.gpuGameMs = m.gpu_game_ms; s.gpuCompMs = m.gpu_comp_ms
+                s.cpuCores = m.cpu_cores; s.cpuTop = m.cpu_top
+                s.cpuTopName = withUnsafeBytes(of: &m.cpu_top_name) {
+                    String(cString: $0.bindMemory(to: CChar.self).baseAddress!)
+                }
+                s.memUsedMB = Int(m.mem_used_mb); s.memLeftMB = Int(m.mem_left_mb)
+                s.thermal = ProcessInfo.processInfo.thermalState.rawValue
+                s.eyeW = Int(m.eye_w); s.eyeH = Int(m.eye_h)
+                samples.append(s)
+                if samples.count > KLMetricsPanel.history { samples.removeFirst(samples.count - KLMetricsPanel.history) }
+            }
+            if mode == .line && samples.isEmpty { return }
+            drawn = true
+            turn += 1
+            let back = textures[turn % 2]
+            for (level, ctx) in contexts.enumerated() {
+                if mode == .panel { KLMetricsPanel.drawPanel(ctx, samples: samples) }
+                else if let s = samples.last { KLMetricsPanel.drawLine(ctx, sample: s) }
+                guard let data = ctx.data else { return }
+                back.replace(region: MTLRegionMake2D(0, 0, px.w >> level, px.h >> level), mipmapLevel: level,
+                             withBytes: data, bytesPerRow: (px.w >> level) * 4)
+            }
+            guard let self else { return }
+            self.statsLock.lock(); self.statsFront = back; self.statsLock.unlock()
+        }
+        timer.resume()
+        statsTimer = timer
+        NSLog("[cp] metrics %@ in the view (KL_STATS_CARD), refreshed once a second",
+              mode == .panel ? "panel" : "line")
     }
 
-    private func drawStats(_ text: String) {
-        let w = Self.statsPixels.w, h = Self.statsPixels.h
-        if statsContext == nil {
-            statsContext = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                                     space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-            statsContext?.translateBy(x: 0, y: CGFloat(h)); statsContext?.scaleBy(x: 1, y: -1)
-        }
-        if statsTexture == nil {
-            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w,
-                                                                height: h, mipmapped: false)
-            desc.usage = .shaderRead
-            statsTexture = device.makeTexture(descriptor: desc)
-        }
-        guard let ctx = statsContext, let tex = statsTexture else { return }
-        UIGraphicsPushContext(ctx)
-        UIColor(red: 0.035, green: 0.04, blue: 0.05, alpha: 1).setFill()
-        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
-        let font = UIFont.monospacedDigitSystemFont(ofSize: 44, weight: .semibold)
-        let s = NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: UIColor(white: 0.95, alpha: 1)])
-        let box = s.size()
-        s.draw(at: CGPoint(x: 28, y: (CGFloat(h) - box.height) / 2))
-        UIGraphicsPopContext()
-        if let data = ctx.data {
-            tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: data, bytesPerRow: w * 4)
-        }
+    private var statsEye = (w: 0, h: 0)
+    /// The eye picture this frame reads, for the panel's "Picture" row.
+    private func noteStatsEye(_ t: MTLTexture) {
+        guard t.width != statsEye.w || t.height != statsEye.h else { return }
+        statsEye = (t.width, t.height)
+        kl_metrics_note_eye(Int32(t.width), Int32(t.height))
     }
 
     private func encodeStatsCard(_ enc: MTLRenderCommandEncoder,
                                  viewIndices: [Int],
                                  drawable: LayerRenderer.Drawable,
                                  originFromHead: simd_float4x4) -> Int {
-        guard Self.statsEnabled, let pipe = overlayPipeline, let text = statsLine() else { return 0 }
-        if text != statsText || statsTexture == nil {
-            drawStats(text)
-            statsText = text
+        guard let pipe = overlayPipeline else { return 0 }
+        let mode = Self.statsMode
+        if let fromStart = statsFromStart {
+            statsFromStart = nil
+            if fromStart { kl_metrics_set_visible(1) }
         }
-        guard let tex = statsTexture else { return 0 }
+        // Create and Options held together for a second bring it up and put it away (kl_metrics_chord).
+        guard kl_metrics_visible() != 0 else { return 0 }
+        if statsTimer == nil { startStats(mode) }
+        statsLock.lock(); let front = statsFront; statsLock.unlock()
+        guard let tex = front else { return 0 }
         var ov = kl_ovrp_overlay()
         ov.shape = 0
         ov.head_locked = 1
         ov.tex_w = Int32(tex.width); ov.tex_h = Int32(tex.height)
         ov.viewport.0 = (0, 0, Int32(tex.width), Int32(tex.height))
         ov.viewport.1 = (0, 0, Int32(tex.width), Int32(tex.height))
-        // In the head's own frame: 1.2 m ahead, a little left of the middle and well below it.
-        ov.pose = (0, 0, 0, 1, -0.16, -0.36, -1.2)
-        ov.size = (Self.statsSize.x, Self.statsSize.y)
+        // In the head's own frame, 1.2 m ahead: the panel just left of the middle with its lower edge a little
+        // above it (the owner's place for it, found in three tries on the headset); the line at the lower left.
+        let size = mode == .panel ? KLMetricsPanel.panelSize : KLMetricsPanel.lineSize
+        ov.pose = mode == .panel ? (0, 0, 0, 1, -0.05, 0.101, -1.2) : (0, 0, 0, 1, -0.16, -0.36, -1.2)
+        ov.size = (size.x, size.y)
         ov.origin_top_left = 1
         var uniforms: [kl_overlay_uniforms] = []
         for vi in viewIndices {
@@ -3195,7 +3285,7 @@ final class KleptonCompositor {
         if let depthState { enc.setDepthStencilState(depthState) }
         enc.setRenderPipelineState(pipe)
         enc.setFragmentTexture(tex, index: 0)
-        enc.setFragmentSamplerState(sampler, index: 0)
+        enc.setFragmentSamplerState(statsSampler ?? sampler, index: 0)
         uniforms.withUnsafeBytes { buf in
             enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
             enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
@@ -4158,11 +4248,11 @@ final class KleptonCompositor {
         (Double, UnsafeMutablePointer<Float>?) -> Int32 = { time, out in
         guard let out, let tracker = KleptonCompositor.headAtTracker else { return 0 }
         var t = time
-        var anchor = tracker.queryDeviceAnchor(atTimestamp: t)
+        var anchor = KleptonCompositor.usable(tracker.queryDeviceAnchor(atTimestamp: t))
         var steps = 0
         while anchor == nil && steps < 10 {
             t -= 0.005
-            anchor = tracker.queryDeviceAnchor(atTimestamp: t)
+            anchor = KleptonCompositor.usable(tracker.queryDeviceAnchor(atTimestamp: t))
             steps += 1
         }
         guard let a = anchor else { return 0 }
