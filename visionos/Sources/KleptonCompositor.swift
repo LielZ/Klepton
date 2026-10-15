@@ -3718,6 +3718,12 @@ final class KleptonCompositor {
         let textures = [a, b]
         var samples: [KLMetricsSample] = []
         var seq: UInt32 = 0, turn = 0, drawn = false
+        // XR head prediction for a test build's panel (KleptonXRPredict): -1 where it is not shown. A switch
+        // is drawn at once rather than with the next second's sample — whoever tapped is looking for it.
+        var predict = (on: -1, used: false)
+        func predictNow() -> (on: Int, used: Bool) {
+            KleptonTestBuild.on ? (Int(kl_openxr_predict()), kl_openxr_predict_used() != 0) : (-1, false)
+        }
         let timer = DispatchSource.makeTimerSource(queue: statsQueue)
         timer.schedule(deadline: .now(), repeating: 0.25, leeway: .milliseconds(50))
         timer.setEventHandler { [weak self] in
@@ -3726,10 +3732,18 @@ final class KleptonCompositor {
             // Once at once, before there is a sample — whoever has just held the two buttons for a second
             // is to see that it worked — and from then on with each new one.
             let fresh = now != 0 && now != seq
-            guard fresh || !drawn else { return }
+            let p = predictNow()
+            let switched = p != predict
+            predict = p
+            guard fresh || !drawn || (switched && !samples.isEmpty) else { return }
+            if switched, !fresh, var last = samples.popLast() {
+                last.xrPredict = p.on; last.xrPredictUsed = p.used
+                samples.append(last)
+            }
             if fresh {
                 seq = now
                 var s = KLMetricsSample()
+                s.xrPredict = p.on; s.xrPredictUsed = p.used
                 s.fps = m.fps; s.displayHz = m.display_hz
                 s.compiles = m.compiles; s.compilesCached = m.compiles_cached
                 s.gpuBusy = m.gpu_busy; s.gpuGameMs = m.gpu_game_ms; s.gpuCompMs = m.gpu_comp_ms

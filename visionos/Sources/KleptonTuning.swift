@@ -495,6 +495,18 @@ enum KleptonDiagnostics {
     }
 }
 
+/// XR head prediction (KL_XR_PREDICT), switched while the game runs — test
+/// builds only. A tap of Create and Options together while the metrics panel
+/// is shown switches it (kl_metrics_chord's 2, KleptonControllers), and the
+/// panel says which it is. The starting value is KL_XR_PREDICT's; the switch is
+/// not stored, so the next start is the environment's again.
+enum KleptonXRPredict {
+    static func toggle() {
+        guard KleptonTestBuild.on else { return }
+        kl_openxr_set_predict(kl_openxr_predict() != 0 ? 0 : 1)
+    }
+}
+
 /// Behaviour that is in the runtime but not yet the default: each entry is one
 /// environment switch, off unless chosen, so a change taken over from another
 /// fork can be tried on the headset without a build per trial. The group is in
