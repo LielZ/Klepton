@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
@@ -33,6 +34,7 @@ static _Atomic unsigned long long g_shown, g_fresh, g_stale, g_frames;
 static _Atomic int g_eye_w, g_eye_h;
 static struct { double gpu_s; unsigned long n; } g_comp;     // under g_mu
 static kl_metrics g_now;                                     // under g_mu
+static struct { int state, w, h; char path[40], note[24]; } g_up = { .state = -1 };  // under g_mu
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
 void kl_metrics_begin(void) {
@@ -57,7 +59,24 @@ void kl_metrics_note_composite(double gpu_seconds) {
 }
 
 void kl_metrics_note_eye(int w, int h) { g_eye_w = w; g_eye_h = h; }
+
+void kl_metrics_note_upscale(int state, int out_w, int out_h, const char *path, const char *note) {
+    pthread_mutex_lock(&g_mu);
+    g_up.state = state; g_up.w = out_w; g_up.h = out_h;
+    snprintf(g_up.path, sizeof g_up.path, "%s", path ? path : "");
+    snprintf(g_up.note, sizeof g_up.note, "%s", note ? note : "");
+    pthread_mutex_unlock(&g_mu);
+}
 void kl_metrics_note_game_frame(void) { g_frames++; }
+
+void kl_metrics_upscale_now(kl_metrics *out) {
+    if (!out) return;
+    pthread_mutex_lock(&g_mu);
+    out->upscale = g_up.state; out->out_w = g_up.w; out->out_h = g_up.h;
+    memcpy(out->path, g_up.path, sizeof out->path);
+    memcpy(out->upscale_note, g_up.note, sizeof out->upscale_note);
+    pthread_mutex_unlock(&g_mu);
+}
 
 unsigned kl_metrics_latest(kl_metrics *out) {
     pthread_mutex_lock(&g_mu);
@@ -83,6 +102,7 @@ enum { kIdle, kPending, kPassing, kTap, kChord };
 static struct { int phase; double t; } g_pill[2];
 static double g_chord_since;
 static int g_chord_spent;                  // switched already, or one of the two was let go
+static int g_chord_switched;               // this chord switched the panel
 static _Atomic int g_visible;
 
 void kl_metrics_set_visible(int visible) { g_visible = visible != 0; }
@@ -93,9 +113,9 @@ int kl_metrics_chord(int left_down, int right_down, double now, int *pass_left, 
     if (down[0] && down[1]) {
         if (g_pill[0].phase != kChord) {
             g_pill[0].phase = g_pill[1].phase = kChord;
-            g_chord_since = now; g_chord_spent = 0;
+            g_chord_since = now; g_chord_spent = 0; g_chord_switched = 0;
         } else if (!g_chord_spent && now - g_chord_since >= KL_PILL_CHORD_S) {
-            g_chord_spent = 1;
+            g_chord_spent = g_chord_switched = 1;
             int visible = !g_visible;
             g_visible = visible;
             switched = 1;
@@ -103,7 +123,12 @@ int kl_metrics_chord(int left_down, int right_down, double now, int *pass_left, 
         }
     } else if (g_pill[0].phase == kChord) {
         g_chord_spent = 1;                 // held together means without a gap
-        if (!down[0] && !down[1]) g_pill[0].phase = g_pill[1].phase = kIdle;
+        if (!down[0] && !down[1]) {
+            g_pill[0].phase = g_pill[1].phase = kIdle;
+            // Both up again within the second, and nothing switched: a tap of the two together. Said
+            // only while the panel is there to show what it did.
+            if (!g_chord_switched && now - g_chord_since < KL_PILL_CHORD_S && g_visible) switched = 2;
+        }
     }
     for (int h = 0; h < 2; h++) {
         switch (g_pill[h].phase) {
@@ -211,6 +236,9 @@ int kl_metrics_tick(void) {
     }
     m.eye_w = g_eye_w; m.eye_h = g_eye_h;
     pthread_mutex_lock(&g_mu);
+    m.upscale = g_up.state; m.out_w = g_up.w; m.out_h = g_up.h;
+    memcpy(m.path, g_up.path, sizeof m.path);
+    memcpy(m.upscale_note, g_up.note, sizeof m.upscale_note);
     m.seq = g_now.seq + 1;
     g_now = m;
     pthread_mutex_unlock(&g_mu);

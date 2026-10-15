@@ -42,6 +42,26 @@ KLT = targets_mod.resolve(os.environ.get("KLEPTON_TARGET") or targets_mod.DEFAUL
 NAME = KLT["product"]
 BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", KLT["bundle"])
 
+# Whether this is a TEST build — a copy beside the real game, for trying
+# something on the headset — and not what a player has (KL_TEST_BUILD below,
+# KLTestBuild in Info.plist, KleptonTestBuild in KleptonTestBuild.swift). Only
+# what a tester's command line sets counts: a name of its own
+# (KLEPTON_DISPLAY_SUFFIX / _OVERRIDE — `avpplay install --display-suffix`), a
+# bundle id ending in "-test" or ".test" in any case (regex [-.]test$; testing.md's
+# convention for a test copy), KL_TEST_BUILD among KLEPTON_TEST_ON, or
+# KLEPTON_TEST_BUILD=1. Deliberately NOT
+# any bundle id that differs from the target's, nor a non-empty KLEPTON_TEST_ON:
+# AVP Play sets the first for every install (a team's own prefix) and the
+# second for a player who chose its experimental switches.
+_bundle_test = re.search(r"[-.]test$", BUNDLE_ID or "", re.I) is not None and BUNDLE_ID != KLT["bundle"]
+TEST_BUILD = (os.environ.get("KLEPTON_TEST_BUILD", "").strip().lower() in ("1", "true", "yes", "on")
+              or bool(os.environ.get("KLEPTON_DISPLAY_SUFFIX", "").strip())
+              or bool(os.environ.get("KLEPTON_DISPLAY_OVERRIDE", "").strip())
+              or _bundle_test
+              or "KL_TEST_BUILD" in re.split(r"[,\s]+", os.environ.get("KLEPTON_TEST_ON", "")))
+if TEST_BUILD:
+    print("gen_xcodeproj: test build (KLTestBuild=1): tester-only controls are in it", file=sys.stderr)
+
 # Klepton.entitlements — the two memory capabilities (see that file for what
 # they buy and why this app wants them). **On by default: they fixed the
 # loading-transition kills on device, so a build without them is the unusual
@@ -196,8 +216,33 @@ import os as _os
 # The Test switches an installer wants on from the start (KL_TEST_ON below):
 # names of environment variables and nothing else, so that what lands in the
 # project file and in Info.plist cannot be anything but a list of names.
-TEST_ON = ",".join(n for n in re.split(r"[,\s]+", os.environ.get("KLEPTON_TEST_ON", ""))
-                   if re.fullmatch(r"KL_[A-Z0-9_]{1,60}", n))
+# KLEPTON_TEST_ON_EXTRA adds a tester's own names to the installer's: AVP Play
+# sets KLEPTON_TEST_ON itself and drops one from the shell, so a test copy that
+# needs one more switch (e.g. KL_FOVE_SUBPASS_HELPERS) names it here. Unset:
+# the same list as before, byte for byte.
+TEST_ON = ",".join(dict.fromkeys(
+    n for n in re.split(r"[,\s]+", os.environ.get("KLEPTON_TEST_ON", "") + ","
+                        + os.environ.get("KLEPTON_TEST_ON_EXTRA", ""))
+    if re.fullmatch(r"KL_[A-Z0-9_]{1,60}", n)))
+
+# The render scale an installer wants the game to START at (KLEPTON_RENDER_SCALE,
+# a fraction such as 0.75; AVP Play sets it with its MetalFX switch). It replaces
+# the target's own default (targets.py "render_scale") as KLRenderScaleDefault, so
+# a choice made in the game still wins. Unset: the target's, as before. Anything
+# that is not a number in 0.5..1.0 (the range KleptonTuning's targetRenderScale
+# accepts; outside it the bundle would quietly start at 1.0) is said and ignored.
+RENDER_SCALE = float(KLT["render_scale"])
+_rs_env = os.environ.get("KLEPTON_RENDER_SCALE", "").strip()
+if _rs_env:
+    try:
+        _rs = float(_rs_env)
+    except ValueError:
+        _rs = None
+    if _rs is not None and 0.5 <= _rs <= 1.0:
+        RENDER_SCALE = _rs
+    else:
+        print(f"gen_xcodeproj: KLEPTON_RENDER_SCALE={_rs_env!r} is not a fraction in 0.5..1.0 "
+              f"- the target's {RENDER_SCALE:.2f} stays", file=sys.stderr)
 
 # Typed wire values only: never interpolate arbitrary installer input into a project.
 CONTROLLER_MODE = os.environ.get("KLEPTON_CONTROLLER_MODE", "standard")
@@ -237,8 +282,9 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # value carries '=' and ','.
                         + f"\t\t\t\tKL_GAMEPAD_MAP = \"{KLT['gamepad_map']}\";\n"
                         # ...and its render-scale default (targets.py
-                        # "render_scale"), KLRenderScaleDefault in Info.plist.
-                        + f"\t\t\t\tKL_RENDER_SCALE_DEFAULT = {float(KLT['render_scale']):.2f};\n"
+                        # "render_scale", or KLEPTON_RENDER_SCALE above),
+                        # KLRenderScaleDefault in Info.plist.
+                        + f"\t\t\t\tKL_RENDER_SCALE_DEFAULT = {RENDER_SCALE:.2f};\n"
                         # ...and whether in-game video is tried by default
                         # (targets.py "video"), KLVideoDefault in Info.plist.
                         + f"\t\t\t\tKL_VIDEO_DEFAULT = {1 if KLT['video'] else 0};\n"
@@ -278,6 +324,9 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # someone who wants a change that is built in but off
                         # in every game at once, without a visit to each.
                         + f"\t\t\t\tKL_TEST_ON = \"{TEST_ON}\";\n"
+                        # ...and whether it is a test build (TEST_BUILD above;
+                        # KLTestBuild in Info.plist).
+                        + f"\t\t\t\tKL_TEST_BUILD = {1 if TEST_BUILD else 0};\n"
                         # ...and what KleptonGameData.swift reads: which files
                         # this build's guest needs and the store ids to fetch
                         # them by. KL_DATA_TREE is empty for a target without the
@@ -370,6 +419,8 @@ SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swif
          "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonGameData.swift",
          "KleptonAlyx.swift", "KleptonText.swift", "KleptonSteamCloud.swift",
          "KleptonBackup.swift", "KleptonMetrics.swift", "KleptonPinch.swift",
+         "KleptonTestBuild.swift",
+         "KleptonArrayViews.swift",
          "KleptonControllerInput.swift", "KleptonControllerMode.swift",
          "KleptonSurrealInput.swift", "KleptonSurrealBackend.swift", "KleptonSurrealView.swift",
          "KleptonSurrealAim.swift", "KleptonSurrealAimView.swift"]
@@ -423,12 +474,18 @@ fwchildren = "\n".join(f'\t\t\t\t{g["ref"]},' for g in guest)
 # the project-level DEBUG condition.
 # With the launcher on, the game builds present a compact trademark-free name; every
 # other build (and every other target) keeps its normal display name from targets.py.
+# KLT['display'] has already been through targets.display_for (the
+# KLEPTON_DISPLAY_OVERRIDE / KLEPTON_DISPLAY_SUFFIX overrides — a second install
+# of the same target beside the first needs a name of its own on the headset);
+# the launcher's compact name takes the same overrides, so an override still
+# wins over it and a suffix is still appended to it.
 _launcher_display = {"hl1": "HL1VR", "hl2": "HL2VR", "portal": "P1VR"}
-_display = (_launcher_display.get(KLT['name'], KLT['display']) if _launcher_on
+_display = (targets_mod.display_for(_launcher_display[KLT['name']])
+            if _launcher_on and KLT['name'] in _launcher_display
             else KLT['display'])
-# A second install of the same target beside the first (the Steam build of a game
-# that is also there from the Meta Store) needs a name of its own on the headset.
-_display = os.environ.get("KLEPTON_DISPLAY_NAME") or _display
+# Inside a quoted pbxproj string: a quote or backslash in an override would end
+# the string early and leave the project unparseable.
+_display = _display.replace("\\", "\\\\").replace('"', '\\"')
 # Trailing newline, glued at line-start to the next setting — the same shape as
 # ENTITLEMENTS_SETTING / ASSETCATALOG_SETTING above, so it lands on its own line in
 # the output and expands to nothing (no blank line) when the flag is off.

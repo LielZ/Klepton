@@ -6,7 +6,7 @@ import Foundation
 //
 // The model is the performance overlay a Quest developer knows: the numbers of
 // the last second in a column — frame rate, shader compiles, GPU and CPU
-// load, memory, heat, picture size — and beside it the last minute of the
+// load, memory, heat, picture size and its MetalFX upscale — and beside it the last minute of the
 // three that say why a game does not feel smooth, as graphs. A single number
 // answers "how fast is it now"; the graphs answer "was that a hitch or is it
 // always like this", which is the question a test run is usually about.
@@ -33,10 +33,17 @@ struct KLMetricsSample {
     var cpuCores: Float = -1       // CPU the process used, in cores
     var cpuTop: Float = -1         // the busiest thread's share of one core, 0..1
     var cpuTopName = ""
+    /// Whether a tap of Create + Options switches MetalFX here
+    /// (KleptonMetalFX.canUpscale) — the panel then says so on its last line.
+    var metalfxTap = false
     var memUsedMB = -1
     var memLeftMB = -1
     var thermal = -1               // ProcessInfo.ThermalState's raw value, 0 nominal .. 3 critical
-    var eyeW = 0, eyeH = 0
+    var eyeW = 0, eyeH = 0         // the picture the game draws (render size)
+    var upscale = -1               // MetalFX: 0 off, 1 on but linear, 2 upscaled; -1 not known
+    var outW = 0, outH = 0         // ...the size after it
+    var path = ""                  // how the picture comes: "Vulkan · per eye", "OpenXR GL · 2 layers", ...
+    var upscaleNote = ""           // ...and why it is linear
 }
 
 enum KLMetricsPanel {
@@ -108,6 +115,12 @@ enum KLMetricsPanel {
         return f
     }
 
+    private static func width(_ s: String, font: CTFont) -> CGFloat {
+        let attrs = [kCTFontAttributeName: font] as CFDictionary
+        guard let str = CFAttributedStringCreate(nil, s as CFString, attrs) else { return 0 }
+        return CGFloat(CTLineGetTypographicBounds(CTLineCreateWithAttributedString(str), nil, nil, nil))
+    }
+
     private enum Align { case left, right }
     /// Draws `s` with its baseline at `y`; returns its width.
     @discardableResult
@@ -166,6 +179,9 @@ enum KLMetricsPanel {
         let left: CGFloat = 28, right: CGFloat = 404
         // How to get rid of it, and back: the two menu buttons of the Sense controllers (kl_metrics_chord).
         text(ctx, "Hold Create + Options 1 s to hide", x: left, y: h - 22, font: font(21), color: dim)
+        // A tap of the two switches MetalFX where it can upscale (KleptonMetalFX.tapToggle), on the line above.
+        let tapLine = samples.last?.metalfxTap ?? false
+        if tapLine { text(ctx, "Tap both: MetalFX on / off", x: left, y: h - 50, font: font(21), color: dim) }
         // Shown for the first time, before its first second is over.
         guard let now = samples.last else {
             text(ctx, "Measuring …", x: left, y: 112, font: font(56, bold: true), color: bright)
@@ -206,12 +222,32 @@ enum KLMetricsPanel {
         if let t = thermalName(now.thermal) {
             rows.append(("Heat", t, now.thermal >= 3 ? red : now.thermal == 2 ? amber : bright))
         }
-        if now.eyeW > 0 { rows.append(("Picture", "\(now.eyeW) × \(now.eyeH)", bright)) }
+        if now.eyeW > 0 { rows.append(("Render", "\(now.eyeW) × \(now.eyeH)", bright)) }
+        // The upscale: whether it is on, how the picture comes (the engine and the compositor's path for
+        // it), and what it is upscaled to. A switch that is on and does nothing says why, in amber.
+        if now.upscale >= 0 {
+            switch now.upscale {
+            case 2: rows.append(("MetalFX", "on", green))
+            case 1: rows.append(("MetalFX", now.upscaleNote.isEmpty ? "on · linear"
+                                                                   : "linear · " + now.upscaleNote, amber))
+            default: rows.append(("MetalFX", "off", bright))
+            }
+        }
+        if !now.path.isEmpty { rows.append(("Path", now.path, bright)) }
+        if now.upscale == 2, now.outW > 0 { rows.append(("Output", "\(now.outW) × \(now.outH)", green)) }
+        // Nine rows fit at the full size; more close up, down to a size still read at a glance, so the
+        // column always ends above the hints at the bottom — one line, two where a tap switches MetalFX.
+        let footer: CGFloat = tapLine ? 90 : 62
+        let step = min(41, (h - footer - 164) / CGFloat(max(rows.count - 1, 1)))
+        let size = min(27, (step * 0.68).rounded())
         var y: CGFloat = 164
         for (label, value, color) in rows {
-            text(ctx, label, x: left, y: y, font: font(27), color: dim)
-            text(ctx, value, x: right, y: y, font: font(27, bold: true), color: color, align: .right)
-            y += 41
+            let lw = text(ctx, label, x: left, y: y, font: font(size), color: dim)
+            // A long value (the path) is set smaller rather than over its label.
+            var vs = size
+            while vs > 16, width(value, font: font(vs, bold: true)) > right - left - lw - 14 { vs -= 1 }
+            text(ctx, value, x: right, y: y, font: font(vs, bold: true), color: color, align: .right)
+            y += step
         }
 
         // The graphs: a minute each, the newest second at the right.

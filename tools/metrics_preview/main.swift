@@ -4,6 +4,10 @@
 //
 //   make metrics-preview            build/metrics-panel.png, build/metrics-line.png
 //   build/metrics_preview 12 out    12 samples, out-panel.png / out-line.png
+//
+// Also, at full size, out-panel-notap.png (MetalFX cannot upscale: no tap
+// hint) and out-panel-tap.png (it can: MetalFX switched off by a tap, and the
+// hint for the tap).
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -40,7 +44,9 @@ for i in 0..<count {
     s.memUsedMB = 3180 + i * 3
     s.memLeftMB = 1840 - i * 3
     s.thermal = i < 40 ? 0 : 1
-    s.eyeW = 3072; s.eyeH = 2880
+    s.eyeW = 2688; s.eyeH = 2160
+    s.upscale = 2; s.outW = 3584; s.outH = 2880
+    s.path = "OpenXR Vulkan · 3 layers"
     samples.append(s)
 }
 let out = CommandLine.arguments.last!
@@ -48,6 +54,20 @@ let out = CommandLine.arguments.last!
 let p = KLMetricsPanel.makeContext(w: 480, h: 240, units: KLMetricsPanel.panelLayout.w)!
 KLMetricsPanel.drawPanel(p, samples: samples)
 write(p, out + "-panel.png")
+// At full size: a game where a tap does nothing, and one where it has just switched MetalFX off.
+let full = KLMetricsPanel.makeContext(w: KLMetricsPanel.panelPixels.w, h: KLMetricsPanel.panelPixels.h,
+                                      units: KLMetricsPanel.panelLayout.w)!
+KLMetricsPanel.drawPanel(full, samples: samples)
+write(full, out + "-panel-notap.png")
+var test = samples
+test[test.count - 1].metalfxTap = true
+test[test.count - 1].upscale = 0
+test[test.count - 1].outW = 0
+test[test.count - 1].outH = 0
+let t = KLMetricsPanel.makeContext(w: KLMetricsPanel.panelPixels.w, h: KLMetricsPanel.panelPixels.h,
+                                   units: KLMetricsPanel.panelLayout.w)!
+KLMetricsPanel.drawPanel(t, samples: test)
+write(t, out + "-panel-tap.png")
 let l = KLMetricsPanel.makeContext(w: KLMetricsPanel.linePixels.w, h: KLMetricsPanel.linePixels.h)!
 KLMetricsPanel.drawLine(l, sample: samples.last!)
 write(l, out + "-line.png")

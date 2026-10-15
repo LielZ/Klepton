@@ -22,7 +22,11 @@ typedef struct kl_metrics {
     char  cpu_top_name[32];    // ...and its name, "" where it has none
     int   mem_used_mb;         // the app's footprint
     int   mem_left_mb;         // what is left before the system's limit (visionOS)
-    int   eye_w, eye_h;        // the eye picture the compositor reads, in pixels
+    int   eye_w, eye_h;        // the picture the game draws (render size), in pixels
+    int   upscale;             // MetalFX: 0 off, 1 on but linear, 2 upscaled; -1 not said yet
+    int   out_w, out_h;        // ...the size after the upscale, in the picture's pixels (0 when none)
+    char  path[40];            // how the picture comes: "Vulkan · per eye", "OpenXR GL · 2 layers", ...
+    char  upscale_note[24];    // ...and why it is linear, in a few words ("100 %", "budget")
 } kl_metrics;
 
 // Starts the counting. Nothing below counts before it, and kl_metrics_tick
@@ -36,6 +40,9 @@ void kl_metrics_note_shown(int fresh, int stale);
 void kl_metrics_note_composite(double gpu_seconds);
 // ...and the size of the eye picture it reads.
 void kl_metrics_note_eye(int w, int h);
+// ...and its MetalFX upscale (kl_metrics.upscale and what follows it). Strings
+// are copied; NULL is "".
+void kl_metrics_note_upscale(int state, int out_w, int out_h, const char *path, const char *note);
 // The game's side, where its frames are counted: one call as a frame starts.
 void kl_metrics_note_game_frame(void);
 // Takes a sample when a second has passed since the last one; returns 1 when
@@ -44,6 +51,10 @@ void kl_metrics_note_game_frame(void);
 int kl_metrics_tick(void);
 // The newest sample; returns its seq (0 and an untouched *out before the first).
 unsigned kl_metrics_latest(kl_metrics *out);
+// The upscale as the compositor said it last (kl_metrics_note_upscale), into
+// those fields of *out only — newer than the last sample's, so a switch (a tap
+// of Create + Options) can be drawn at once rather than with the next second.
+void kl_metrics_upscale_now(kl_metrics *out);
 
 // ---- showing and hiding the panel with the controllers ---------------------
 //
@@ -56,8 +67,11 @@ unsigned kl_metrics_latest(kl_metrics *out);
 // press is to reach the game. A press is held back for a quarter of a second to
 // see whether the other one follows (a shorter tap is played afterwards), and
 // while both are down neither reaches the game, so the game's own menu does not
-// open with the panel. Returns 1 on the poll that switched the panel. One
-// caller, one thread.
+// open with the panel. Returns 1 on the poll that switched the panel, and 2 on
+// the poll that ended a TAP of the two together (both up again within the
+// second, nothing switched) while the panel was shown — which the panel itself does
+// nothing with: the app switches MetalFX upscaling on it where MetalFX can
+// upscale (KleptonMetalFX.tapToggle). 0 otherwise. One caller, one thread.
 int kl_metrics_chord(int left_down, int right_down, double now_s, int *pass_left, int *pass_right);
 // Whether the panel is to be drawn. It is not until someone says so: the
 // game's setting at its start, or the two buttons.

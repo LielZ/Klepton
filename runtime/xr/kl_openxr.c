@@ -1774,6 +1774,10 @@ typedef struct {
     int64_t  predict_time;
     int      predict_valid;
     float    predict_q[4], predict_p[3];
+    // Whether frame predict_on_frame predicts (kl_openxr_set_predict): 0 not
+    // latched yet, 1 off, 2 on. Under g_predict_mu.
+    uint64_t predict_on_frame;
+    int      predict_on;
     // KL_XR_POSE_TRACE: the head this frame was answered with, per entry
     // point, so "the guest draws from one head and declares another" is a
     // measurement rather than a reading of the guest's source. Indexed by
@@ -2949,31 +2953,140 @@ static int64_t klxr_predict_ahead(int64_t display_time) {
 // declines (every host run — `kl_ovrp_set_head_at` is the visionOS
 // compositor's) leaves the delta invalid and every pose is the latched head,
 // which is what this produced before the seam existed and keeps the two entry
-// points agreeing for free. KL_XR_PREDICT=0 is the A/B.
+// points agreeing for free. Off unless KL_XR_PREDICT=1 (see below).
 typedef struct { int valid; float q[4], p[3]; } klxr_head_delta;
+
+// The cache is read and filled from whichever guest threads locate poses
+// (Unity's render and sim threads both do), so the key and the q/p it names
+// are one unit: a reader that saw a new key beside the previous q/p would
+// answer a head that belongs to neither. Key and q/p are therefore only ever
+// read and written together under g_predict_mu. File-static rather than in the
+// session, because the session struct is zeroed whole (and the self-test
+// builds one on the stack).
+//
+// Lock order: g_predict_mu is a LEAF. Nothing is called while it is held but
+// memcpy, and none of this file's other locks (g_defer.mu) is held when it is
+// taken — xrLocateSpace, xrLocateViews and xrEndFrame reach it bare. The
+// prediction itself runs OUTSIDE it, because what it reaches is not ours to
+// order against:
+//
+//   kl_ovrp_head_predict_delta
+//     -> the frontend's head_at callback (visionOS: KleptonCompositor.headAt,
+//        up to eleven ARKit queryDeviceAnchor calls behind ARKit's own locks
+//        and queues, of unbounded duration)
+//     -> klovrp_head(): the one-pose and frame-latch seqlocks (g_op_seq,
+//        g_frame_pose_seq) and the published-pose seqlock (g_pose_seq) —
+//        read side only, bounded retries, no blocking
+//
+// Holding g_predict_mu across that would make every pose entry point on every
+// guest thread wait out an ARKit query, and put a runtime mutex underneath
+// locks of the tracker's that a thread of its could in turn hold while
+// waiting on ours — an inversion this file has no way to rule out. So:
+//
+//   1. under the lock, look the key up; a hit is the answer;
+//   2. with no lock, predict;
+//   3. under the lock again, publish — unless another thread published the
+//      same (frame, instant) first, in which case ITS head is the answer and
+//      ours is dropped. First publisher wins, so two threads missing together
+//      still hand out one head per (frame, instant). A result for a frame
+//      older than the one already cached is returned to its caller but not
+//      published, so a thread descheduled across a frame boundary cannot roll
+//      the cache back.
+//
+// **Off by default** (since 2026-10-15, after the owner's headset test: games
+// run as well without it). KL_XR_PREDICT=1 turns it on — on the launch line, or
+// from the app's Advanced › Test switch "XR prediction" (KleptonTestSwitches,
+// which an installation can start on: KLEPTON_TEST_ON=KL_XR_PREDICT).
+//
+// The value can still be changed while the game runs (kl_openxr_set_predict;
+// only the self-test does, no control in the app offers it any more). The
+// request is an atomic, and it is LATCHED per frame under g_predict_mu: the
+// first entry point to ask about a new frame decides for the whole frame, so a
+// switch arriving mid-frame cannot leave xrLocateSpace predicted and
+// xrLocateViews not. The request is read BEFORE the lock (its first read is the
+// environment's), and under it there is only the latch, so g_predict_mu stays
+// a leaf.
+static pthread_mutex_t g_predict_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_predict_want = -1;        // -1 until read from KL_XR_PREDICT
+
+int kl_openxr_predict(void) {
+    int on = atomic_load(&g_predict_want);
+    if (on >= 0) return on;
+    int from_env = kl_env_on("KL_XR_PREDICT", 0) ? 1 : 0;
+    // Two first readers read the same environment; whichever stores, it is that.
+    if (atomic_compare_exchange_strong(&g_predict_want, &on, from_env))
+        fprintf(stderr, "  [xr] head prediction %s (KL_XR_PREDICT%s)\n", from_env ? "ON" : "OFF",
+                from_env ? "=1" : " unset or 0, the default");
+    return atomic_load(&g_predict_want);
+}
+
+void kl_openxr_set_predict(int on) {
+    on = on != 0;
+    (void)kl_openxr_predict();                 // the environment's value first, so the log says what changed
+    int was = atomic_exchange(&g_predict_want, on);
+    if (was != on)
+        fprintf(stderr, "  [xr] head prediction switched %s (from the next frame)\n", on ? "ON" : "OFF");
+}
+
+// Whether `frame` predicts, given what is asked for now (`want`, read before
+// the lock). Under g_predict_mu. Kept in the session beside the cache, so a new
+// session — whose frame count starts over — latches afresh. A frame older than
+// the latched one (a thread descheduled across the boundary) gets the newer
+// frame's answer rather than rolling the latch back.
+static int klxr_predict_on_locked(klxr_session *s, uint64_t frame, int want) {
+    if (!s->predict_on || frame > s->predict_on_frame) {
+        s->predict_on = want ? 2 : 1;
+        s->predict_on_frame = frame;
+    }
+    return s->predict_on == 2;
+}
+
+// The cached entry for (frame, instant) into `d`, if that is what is cached.
+// Under g_predict_mu.
+static int klxr_predict_lookup_locked(const klxr_session *s, uint64_t frame,
+                                      int64_t display_time, klxr_head_delta *d) {
+    if (s->predict_frame != frame || s->predict_time != display_time) return 0;
+    d->valid = s->predict_valid;
+    memcpy(d->q, s->predict_q, sizeof d->q);
+    memcpy(d->p, s->predict_p, sizeof d->p);
+    return 1;
+}
 
 static klxr_head_delta klxr_frame_head_delta(klxr_session *s, int64_t display_time) {
     klxr_head_delta d = { 0, {0, 0, 0, 1}, {0, 0, 0} };
-    static int predict_on = -1;
-    if (predict_on < 0) predict_on = kl_env_on("KL_XR_PREDICT", 1);
     // A displayTime of 0 is the guest saying it has no frame in flight (JKXR's
     // recentre path locates spaces before its first xrWaitFrame). There is no
     // instant to predict to, so the latched head is the whole answer.
-    if (!predict_on || !s || display_time <= 0) return d;
-    if (s->predict_frame == s->frames_waited && s->predict_time == display_time) {
-        d.valid = s->predict_valid;
-        memcpy(d.q, s->predict_q, sizeof d.q);
-        memcpy(d.p, s->predict_p, sizeof d.p);
+    if (!s || display_time <= 0) return d;
+    int want = kl_openxr_predict();            // outside the lock: it may read the environment
+    // The key is fixed once, here: the prediction below is FOR this frame,
+    // even if xrWaitFrame advances the counter while it runs.
+    uint64_t frame = __atomic_load_n(&s->frames_waited, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_predict_mu);
+    int on = klxr_predict_on_locked(s, frame, want);
+    int hit = on && klxr_predict_lookup_locked(s, frame, display_time, &d);
+    pthread_mutex_unlock(&g_predict_mu);
+    if (!on || hit) return d;
+
+    klxr_head_delta mine = d;
+    mine.valid = kl_ovrp_head_predict_delta(
+        (double)(klxr_now() + klxr_predict_ahead(display_time)) / 1e9, mine.q, mine.p);
+
+    pthread_mutex_lock(&g_predict_mu);
+    if (klxr_predict_lookup_locked(s, frame, display_time, &d)) {
+        // Someone else published this key while we predicted: theirs stands.
+        pthread_mutex_unlock(&g_predict_mu);
         return d;
     }
-    d.valid = kl_ovrp_head_predict_delta(
-        (double)(klxr_now() + klxr_predict_ahead(display_time)) / 1e9, d.q, d.p);
-    s->predict_frame = s->frames_waited;
-    s->predict_time  = display_time;
-    s->predict_valid = d.valid;
-    memcpy(s->predict_q, d.q, sizeof d.q);
-    memcpy(s->predict_p, d.p, sizeof d.p);
-    return d;
+    if (frame >= s->predict_frame) {
+        s->predict_valid = mine.valid;
+        memcpy(s->predict_q, mine.q, sizeof mine.q);
+        memcpy(s->predict_p, mine.p, sizeof mine.p);
+        s->predict_time  = display_time;
+        s->predict_frame = frame;
+    }
+    pthread_mutex_unlock(&g_predict_mu);
+    return mine;
 }
 
 // pose' = delta o pose, the delta on the LEFT because it moves the head the
@@ -5712,7 +5825,7 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
                   last, (int)s->state);
       } }
     s->frame_predicted_time = state->predictedDisplayTime;
-    s->frames_waited++;
+    __atomic_add_fetch(&s->frames_waited, 1, __ATOMIC_RELAXED);   // read by klxr_frame_head_delta
     return KLXR_SUCCESS;
 }
 
@@ -8314,6 +8427,30 @@ static int klxr_st_head_at(double time_s, float *pose7) {
     return 1;
 }
 
+// A tracker that answers each caller with a DIFFERENT head (5, 10, ... degrees
+// of yaw) and holds the first caller until a second one is inside too — or a
+// second has passed. Two threads missing on one (frame, instant) therefore
+// both predict, and both predictions differ, so only the cache's publish step
+// can make them agree. A runtime that predicted under its cache lock would
+// never let the second caller in.
+static int g_st_race_calls;
+static int klxr_st_head_at_race(double time_s, float *pose7) {
+    (void)time_s;
+    int n = __atomic_add_fetch(&g_st_race_calls, 1, __ATOMIC_ACQ_REL);
+    for (int i = 0; i < 1000 && __atomic_load_n(&g_st_race_calls, __ATOMIC_ACQUIRE) < 2; i++)
+        usleep(1000);
+    float half = 0.5f * (float)n * 5.0f * 0.017453292f;
+    pose7[0] = 0.0f; pose7[1] = sinf(half); pose7[2] = 0.0f; pose7[3] = cosf(half);
+    pose7[4] = 0.0f; pose7[5] = 1.6f;       pose7[6] = 0.0f;
+    return 1;
+}
+typedef struct { klxr_session *s; int64_t t; klxr_head_delta d; } klxr_st_race;
+static void *klxr_st_race_run(void *arg) {
+    klxr_st_race *r = arg;
+    r->d = klxr_frame_head_delta(r->s, r->t);
+    return NULL;
+}
+
 int kl_openxr_space_selftest(FILE *f) {
     klxr_space view  = klxr_st_space(KLXR_REF_SPACE_VIEW, 0, 0, 0);
     klxr_space stage = klxr_st_space(KLXR_REF_SPACE_STAGE, 0, 0, 0);
@@ -8402,6 +8539,9 @@ int kl_openxr_space_selftest(FILE *f) {
     // head 10 degrees further, so a runtime that predicts only one of the two
     // fails by that whole angle rather than by a rounding error.
     {
+        // Prediction is off by default; these checks are about what it does when it is on.
+        int predict_was = kl_openxr_predict();
+        kl_openxr_set_predict(1);
         kl_ovrp_set_head_pose(0, 1.6f, 0, 0, 0, 0, 1);
         kl_ovrp_frame_latch();
         kl_ovrp_set_head_at(klxr_st_head_at);
@@ -8469,7 +8609,66 @@ int kl_openxr_space_selftest(FILE *f) {
                    "(%.3f rad/s about y%s)\n", spinning ? "ok  " : "FAIL",
                 (double)ang[1], known ? "" : ", NOT a measurement");
         ok &= spinning;
+
+        // Two threads missing on the same (frame, instant) at once. The
+        // prediction runs outside the cache lock (so both reach the tracker)
+        // and the first to publish wins (so both answer the same head).
+        kl_ovrp_set_head_at(klxr_st_head_at_race);
+        __atomic_store_n(&g_st_race_calls, 0, __ATOMIC_RELEASE);
+        klxr_session rs;
+        memset(&rs, 0, sizeof rs);
+        rs.frames_waited = 1;
+        int64_t when = klxr_now() + 8000000LL;
+        klxr_st_race r[2] = { { &rs, when, { 0 } }, { &rs, when, { 0 } } };
+        pthread_t rt[2];
+        for (int i = 0; i < 2; i++) pthread_create(&rt[i], NULL, klxr_st_race_run, &r[i]);
+        for (int i = 0; i < 2; i++) pthread_join(rt[i], NULL);
+        int both = __atomic_load_n(&g_st_race_calls, __ATOMIC_ACQUIRE) == 2;
+        fprintf(f, "  %s the tracker is queried outside the cache lock "
+                   "(%d concurrent queries)\n", both ? "ok  " : "FAIL", g_st_race_calls);
+        ok &= both;
+        int same = r[0].d.valid && r[1].d.valid &&
+                   memcmp(r[0].d.q, r[1].d.q, sizeof r[0].d.q) == 0 &&
+                   memcmp(r[0].d.p, r[1].d.p, sizeof r[0].d.p) == 0;
+        // ...and what was published is the answer a third caller gets.
+        klxr_head_delta again = klxr_frame_head_delta(&rs, when);
+        same &= memcmp(again.q, r[0].d.q, sizeof again.q) == 0 &&
+                __atomic_load_n(&g_st_race_calls, __ATOMIC_ACQUIRE) == 2;
+        fprintf(f, "  %s two threads racing on one instant get one head\n",
+                same ? "ok  " : "FAIL");
+        ok &= same;
+
+        // Switched while the game runs (kl_openxr_set_predict): from the next
+        // frame, and never inside one — a frame that has answered predicted
+        // keeps answering predicted, or its two entry points would disagree.
+        kl_ovrp_set_head_at(klxr_st_head_at);
+        int was = kl_openxr_predict();
+        kl_openxr_set_predict(1);
+        klxr_session ts;
+        memset(&ts, 0, sizeof ts);
+        ts.frames_waited = 1;
+        int64_t t1 = klxr_now() + 8000000LL;
+        klxr_head_delta a = klxr_frame_head_delta(&ts, t1);
+        kl_openxr_set_predict(0);
+        klxr_head_delta b = klxr_frame_head_delta(&ts, t1);
+        klxr_head_delta b2 = klxr_frame_head_delta(&ts, t1 + 1000000LL);
+        int held = a.valid && b.valid && b2.valid && memcmp(a.q, b.q, sizeof a.q) == 0;
+        fprintf(f, "  %s switching prediction off mid-frame leaves that frame "
+                   "predicted\n", held ? "ok  " : "FAIL");
+        ok &= held;
+        ts.frames_waited = 2;
+        klxr_head_delta c = klxr_frame_head_delta(&ts, t1 + 11000000LL);
+        int off = !c.valid;
+        fprintf(f, "  %s ...and the next frame answers the latched head\n", off ? "ok  " : "FAIL");
+        ok &= off;
+        kl_openxr_set_predict(1);
+        ts.frames_waited = 3;
+        klxr_head_delta e = klxr_frame_head_delta(&ts, t1 + 22000000LL);
+        fprintf(f, "  %s ...and switched back on, predicts again\n", e.valid ? "ok  " : "FAIL");
+        ok &= e.valid;
+        kl_openxr_set_predict(was);
         kl_ovrp_set_head_at(NULL);
+        kl_openxr_set_predict(predict_was);
     }
 
     // The regression itself, stated as one comparison: moving and turning the

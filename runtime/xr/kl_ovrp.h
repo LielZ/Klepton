@@ -90,13 +90,13 @@ void kl_ovrp_frame_latch(void);
 // the environment first, then call with the case it was set for (a mismatch
 // fails rather than testing something else). tests/t_posebound.c does that.
 //
-//   CYCLE  KL_OVRP_ONE_POSE=1: one head pose per ovrp_WaitToBeginFrame cycle,
+//   CYCLE  KL_OVRP_ONE_POSE=1 or unset (the default): one head pose per ovrp_WaitToBeginFrame cycle,
 //          it is the one published when the cycle opened, the frame record
 //          carries it, and the eye transform is pinned with it.
 //   INDEX  ...with KL_OVRP_POSE_BOUNDARY=index: the same pattern SPLITS — two
 //          poses per cycle. Passing means the split was seen, i.e. that the
 //          measurement the CYCLE case passes on is able to fail.
-//   OFF    switch unset: nothing is frozen, none of the feature's state
+//   OFF    KL_OVRP_ONE_POSE=0: nothing is frozen, none of the feature's state
 //          becomes valid, and the answers are the per-step ones as before.
 //   XR     KL_OVRP_ONE_POSE=1, a guest that never speaks OVRPlugin
 //          (kl_openxr): the switch is not in force for a guest that never
@@ -105,7 +105,7 @@ void kl_ovrp_frame_latch(void);
 //   MIXED  KL_OVRP_ONE_POSE=1, an OpenXR frame loop whose Meta SDK also calls
 //          ovrp_Update2(step 0, frameIdx 0) in mid-frame (Walkabout): the head
 //          read before and after that call is one pose, nothing frozen.
-//   MIXED_OFF  the same frames with the switch unset — the reference MIXED
+//   MIXED_OFF  the same frames with KL_OVRP_ONE_POSE=0 — the reference MIXED
 //          has to equal.
 enum {
     KL_OVRP_POSEBOUND_CYCLE = 0,
@@ -743,6 +743,13 @@ void kl_ovrp_set_eye_texture_size(int w, int h);
 // overrides it.
 void kl_ovrp_set_render_scale_default(float s);
 void kl_ovrp_eye_texture_size(int *w, int *h);
+// The render scale the CURRENT eye size carries (1.0 until
+// kl_ovrp_set_eye_texture_size has applied one) and the size it was taken
+// from — after the cap, before the scale and KL_OVRP_EYE_ALIGN. What the
+// compositor's MetalFX upscale restores to: the stored "Render resolution"
+// can be moved in the game at any time, but the guest keeps rendering at the
+// scale it was started with, so the setting is not the answer and this is.
+void kl_ovrp_eye_texture_scale(float *rs, int *full_w, int *full_h);
 // The same size reshaped for the cone the guest is actually TOLD. They differ
 // only under KL_OVRP_UNIFY_FRUSTUM, where both eyes get the union of the two
 // cones: that cone is wider than the one the display sized its texture for

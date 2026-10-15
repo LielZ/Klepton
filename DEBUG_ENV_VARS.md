@@ -2176,17 +2176,26 @@ The composite/timewarp pass — one file, compiled by both compositors
   that is the pose OVRPlugin reports, 10.2 cm back along the handle and pitched
   20.6 degrees off the grip (`tools/rendermodel_frames.py`). An OpenXR guest is
   unaffected either way — it asks for the grip and gets it.
-- `KL_XR_PREDICT=0` — return the head pose as it stands now from the pose
-  entry points instead of predicting it to the `displayTime` the guest named.
+- `KL_XR_PREDICT=1` — predict the head pose to the `displayTime` the guest
+  named instead of returning it as it stands now from the pose entry points.
+  **Off by default since 2026-10-15** (the owner tested games with and without
+  it on the headset and they ran fine either way); the OVRPlugin half of the
+  same default is `KL_OVRP_ONE_POSE`, which is on. The app's Advanced › Test
+  switch *XR prediction* sets `KL_XR_PREDICT=1` and `KL_OVRP_ONE_POSE=0`
+  together; an installation can start it on (`KLEPTON_TEST_ON=KL_XR_PREDICT`,
+  AVP Play's per-game option). The launch line wins over both.
   The prediction is the frontend's (a timestamped device-anchor query, walked
   back 5 ms at a time until the tracker answers), capped 50 ms ahead, and it is
   computed ONCE per (frame, instant): `xrLocateSpace`, `xrLocateViews` and the
   layer placement in `xrEndFrame` all read the same one, because a guest that
   renders from one of them and submits from another otherwise draws from one
-  head and declares another. Off restores exactly what this did before the seam
-  existed, which makes it the A/B for any motion artefact that appeared with it.
-  No host frontend publishes a tracker at all, so on host this knob does
-  nothing and every pose is the latched head.
+  head and declares another. Off is exactly what this did before the seam
+  existed. No host frontend publishes a tracker at all, so on host this knob
+  does nothing and every pose is the latched head. The log says the value once,
+  at the first pose a guest asks for: `[xr] head prediction ON|OFF`. Every
+  OpenXR guest goes through it — Android OpenXR games, Steam Link, and
+  Half-Life: Alyx through `kl_lx_openxr.c`. It is no longer switched live from
+  the metrics panel; that tap now switches MetalFX (see the metrics panel).
 - `KL_XR_POSE_TRACE=1` — once a second, the head each pose entry point answered
   with this frame and the head the guest actually submitted, differenced
   pairwise (worst degrees and metres over the second) with a count of the frames
@@ -3056,6 +3065,28 @@ records are never written):
   every MSL source, as patched. `KL_FOVE_TRACE_ENC=<n>` (debug) —
   the first n Metal render-pass descriptors after an eye is registered
   (textures, types, sample counts, slices, load/store, resolve, array length).
+- `KL_FOVE_SUBPASS_HELPERS=0|1` — default **1** whenever `KL_FOVEATION` is
+  on. A subpass-input read (`tex.read(uint2(gl_FragCoord.xy), …)`, MoltenVK's
+  emulation) must see the PHYSICAL position, because the attachment is in
+  physical layout while the mapped pass runs. Unreal 4's mobile depth fetch makes
+  that read inside a helper above the entry point
+  (`VulkanSubpassDepthFetch(…, thread float4& gl_FragCoord, …)`, used by DepthFade
+  and soft-edge translucency), which the entry-body scan never saw: the helper
+  got the remapped screen position and read the scene depth at the wrong texel.
+  In Moss that turned the soft shadow in the book's fold into a hard black band,
+  with foveation on only. With `1`, a helper whose only uses of the position are
+  `<tex>.read(uint2(<pos>.xy)…` from one of its own texture parameters is passed
+  the saved physical position (`kl_fove_phys`) at its call sites; a helper that
+  uses the position for anything else keeps the remapped one. `t_fove` covers
+  both settings (`kl_fove_set_subpass_helpers_for_test`). `0` = the old behaviour (A/B control). Proof line: `[fove]
+  shader …: N subpass-input read(s) kept at the PHYSICAL position (M through a
+  helper's call)`, and in the 10 s line `fragment entry points patched N (K with
+  subpass reads, …)` with K > 0 for Moss (before the fix: 0). **For a test
+  copy** (no launch line on the headset): it is a tester-only Test switch
+  ("Foveation (Vulkan): old depth reads in helper functions"), listed and
+  applied only in a test build (`KLTestBuild`); turn it on from the install with
+  `KLEPTON_TEST_ON_EXTRA=KL_FOVE_SUBPASS_HELPERS` (see "Test switches that are
+  on from the installation" below).
 - `KL_FOVE_FENCE=0|1` — default **1** (confirmed on the headset with
   Half-Life: Alyx). MoltenVK orders its passes with its own
   MTLFences, so without this the guest's next reader of the eye can run
@@ -3438,6 +3469,16 @@ Read by the scripts themselves, never forwarded to the app.
   an empty container: assets, OBB and the guest's saves stay in the old one. The
   staging stamp is keyed on the id, so the next build re-stages by itself rather
   than launching into an empty container — it is just not free.
+- `KLEPTON_DISPLAY_OVERRIDE=<name>` — the whole name under the icon
+  (CFBundleDisplayName), for every target. It takes precedence over the row's
+  `display`, over `KLEPTON_GENERIC_DISPLAY` and over the custom launcher's
+  compact name. `KLEPTON_DISPLAY_NAME` is the older spelling and still works;
+  `KLEPTON_DISPLAY_OVERRIDE` wins if both are set.
+- `KLEPTON_DISPLAY_SUFFIX=<text>` — appended to the name after the override is
+  applied, e.g. `" (Test)"` gives `Beat Saber (Test)`. Use it with
+  `KLEPTON_BUNDLE_ID` to install a test copy beside the one already on the headset
+  without the two icons looking the same. Unset or empty, neither variable
+  changes anything; non-printable characters are dropped.
 - `KLEPTON_TEAM=<id>` — override the signing team;
   `KLEPTON_DEVICE=<udid>` — skip device auto-detection;
   `KLEPTON_ENTITLEMENTS=0` — build without the two memory capabilities (see
@@ -3663,19 +3704,25 @@ Moss's defaults since 2026-10-13 (the owner's setting on the headset): `KL_OVRP_
 rendering at "high". "high" itself changed with it for every Vulkan game: box 0.18 and floor 0.16 (were
 0.30 and 0.08); the Test switch `KL_FOVE_BOX=0.30` + `KL_FOVE_FLOOR=0.08` is the way back.
 
-After the release, one piece of his pose core (his commit be18669), as a switch
-that is off (2026-10-13). For a run from `Documents/lx/env.txt`; not a row in
-the window. `runtime/xr/kl_ovrp.c`, the block `ONE POSE PER GUEST FRAME`.
+After the release, one piece of his pose core (his commit be18669): added as a
+switch that was off (2026-10-13), **on by default since 2026-10-15** as the
+OVRPlugin half of "no XR prediction". It is no longer a Test switch of its own;
+the Test switch *XR prediction* turns it off (`KL_OVRP_ONE_POSE=0`), and so does
+a run from `Documents/lx/env.txt` or the launch line. `runtime/xr/kl_ovrp.c`,
+the block `ONE POSE PER GUEST FRAME`.
 
-- `KL_OVRP_ONE_POSE=1` (or `index`) — one head pose per guest frame. At the
+- `KL_OVRP_ONE_POSE=1` (or `index`; **the default since 2026-10-15**) — one
+  head pose per guest frame, the OVRPlugin half of "no XR prediction" (see
+  `KL_XR_PREDICT`). `KL_OVRP_ONE_POSE=0` is the way back, which the app's Test
+  switch *XR prediction* sets. At the
   frame's boundary the published head pose is frozen together with the eye
   transform (offsets and cant), and every head-derived answer for the rest of
   that frame returns it: both `ovrp_Update2/3` steps, every
   `ovrp_GetNodePoseState`, the eye view and the head an OpenXR guest reads.
   Hands and controllers stay live. The frame record filed for reprojection is
   taken from the same samples and so carries the frozen pose.
-  **Default off** (unset, `0`, `off`, `live`): nothing is frozen and every read
-  takes the path it took before; his fork has it on. Without it an OVRPlugin
+  **Off** (`0`, `off`, `no`, `false`, `live`): nothing is frozen and every read
+  takes the path it took before; unset or anything else is on, as in his fork. Without it an OVRPlugin
   guest gets one sample per step, so the Physics and the Render step differ, and
   a second Render sample in the same frame differs again. `KL_OVRP_LATCH` and
   the step samples keep running underneath. A read that names a frame index
@@ -3800,6 +3847,17 @@ audio path that has shipped: both are linked in, and
   is then only what `KL_STATS_CARD` makes it. `applyPanelChord`,
   KleptonControllers.swift.
 
+  **A short tap of Create + Options together** (both up again within the
+  second) while the panel is shown switches **MetalFX upscaling** from the next
+  frame, in every build — where MetalFX can upscale: the device has Apple's
+  spatial scaler and the game was started below 100 % resolution
+  (`KleptonMetalFX.canUpscale`). The panel then has a second hint line, "Tap
+  both: MetalFX on / off", and redraws at once after a tap: *MetalFX*, *Path*
+  and *Output* show the new state. It is the same choice as *Settings ›
+  Rendering › MetalFX upscaling* and is stored the same way. Anywhere else the
+  tap does nothing (`[metalfx] tap of Create + Options: nothing to switch` in
+  the log). It replaces the live XR head prediction switch test builds had.
+
   | Row | What it is |
   | --- | --- |
   | FPS / Hz | new pictures of the game shown a second / pictures presented a second (the rate the system shows the app at) |
@@ -3811,7 +3869,13 @@ audio path that has shipped: both are linked in, and
   | (thread name) | the busiest thread's share of one core — the one a CPU-bound game waits for |
   | Memory | footprint, and what is left before the system's limit |
   | Heat | the system's thermal state |
-  | Picture | the eye picture the compositor reads, in pixels |
+  | Render | the picture the game draws, in pixels: the eye texture, or the first projection layer's (the backdrop) |
+  | MetalFX | the upscale (`KleptonMetalFX`): **on** (green) when this frame was upscaled, **off**, or **linear · <why>** (amber) when it is on and the picture keeps the linear stretch — `100 %`, `budget`, `format`, `texture view`, … (`[metalfx] linear path:` in the log says it in full) |
+  | Path | how the picture comes: the engine (`Vulkan`, `GL`), `OpenXR … · n layers` or the eye pass's `array` / `per eye`, and `foveated` for a GL eye drawn through the display's rate map |
+  | Output | the size after the upscale, in the picture's own pixels (for a foveated eye the screen size the copy stands for); only while it upscales |
+
+  The column closes up when it has more than nine rows, and a value too long
+  for its row is set smaller.
 
   Graphs: frames a second against the display rate; GPU load and the busiest
   thread; shaders a second, as a bar for every second that had any, the compiled
@@ -3835,12 +3899,64 @@ audio path that has shipped: both are linked in, and
 
 - `KLEPTON_TEST_ON=<name>[,<name>…]` — a BUILD-time variable, read by
   `visionos/gen_xcodeproj.py`: the Test switches (by the name of their
-  variable, e.g. `KL_OVRP_ONE_POSE,KL_AUDIO_SINK2`) that this installation has
+  variable, e.g. `KL_XR_PREDICT,KL_AUDIO_SINK2`) that this installation has
   on from its first start. It lands in Info.plist as `KLTestOn`;
   `KleptonTestSwitches.isOn` takes a choice made in the game's window first and
   this list second, so a switch named here can still be turned off in the game
   (and stays off), and one that is put back follows the installation again.
   Anything that is not a `KL_…` name is dropped. Unset: every switch is off
   until chosen, as before. AVP Play sets it from its setting "Experimental:
-  switch on the new pose and audio implementations when installing"; the log
-  line of such a switch ends in `(on from the installation)`.
+  switch on the new pose and audio implementations when installing" and from
+  a game's own option *XR prediction* (`KL_XR_PREDICT`); the log line of such a
+  switch ends in `(on from the installation)`. `KL_OVRP_ONE_POSE` in the list
+  is no longer a switch of its own (it is on by default) and does nothing.
+- `KLEPTON_TEST_ON_EXTRA=<name>[,<name>…]` — more names for the same list,
+  for a tester's own install. AVP Play sets `KLEPTON_TEST_ON` itself (and
+  drops a value from the shell), so a test copy that needs one more switch
+  cannot name it there; `gen_xcodeproj.py` adds the names from this variable
+  to `KLEPTON_TEST_ON`'s (same `KL_…` filter, duplicates dropped) and bakes
+  both into `KLTestOn`. Unset: `KLTestOn` is byte for byte what it was. It does
+  not make a test build by itself. Example (Moss test copy with the old depth
+  reads, as the A/B control for `KL_FOVE_SUBPASS_HELPERS`):
+  `KLEPTON_TEST_ON_EXTRA=KL_FOVE_SUBPASS_HELPERS avpplay install moss --bundle-id
+  <live-id>.test --display-suffix " (Test)" --toolchain <worktree> …`.
+- **Tester-only switches.** An entry marked `testBuildOnly` in
+  `KleptonTestSwitches.entries` is listed and applied only in a test build
+  (`KleptonTestBuild.on`: `KLTestBuild` in Info.plist or `KL_TEST_BUILD=1` at
+  launch); a player's build never shows it and ignores it in `KLTestOn`. The
+  first one is `KL_FOVE_SUBPASS_HELPERS=0` (an A/B control that turns a fix
+  OFF, so it has no place in a player's Test group).
+- `KLEPTON_RENDER_SCALE=<0.5..1.0>` (build/install environment, read by
+  `visionos/gen_xcodeproj.py`) — the render scale the game starts at: it
+  replaces the target's `render_scale` as `KL_RENDER_SCALE_DEFAULT` /
+  `KLRenderScaleDefault`, so *Resolution* in the game starts there and a value
+  chosen in the game still wins. AVP Play sets it with its MetalFX switch
+  (75 % unless chosen otherwise). Unset: the target's default, byte for byte
+  as before; a value outside 0.5..1.0 or not a number is said on stderr and
+  ignored.
+- `KL_METALFX_UPSCALE` in that list — not a Test switch of its own but the
+  start value of *Settings › Rendering › MetalFX upscaling*
+  (`klepton.metalfxUpscale`, `KleptonMetalFX`): on from the first start, off
+  again in the game if chosen there. Unnamed, the switch starts off, as
+  before. AVP Play sets it from its setting "MetalFX: switch on upscaling
+  automatically when installing". The compositor's `[metalfx] on` line then
+  ends in `(on from the installation, KL_METALFX_UPSCALE)`; each place it
+  keeps the linear path is said once as `[metalfx] linear path: <reason>`.
+  Every path is upscaled: the eye pass (a shared 2-slice array, a texture per
+  eye), a GL eye drawn through the display's rate map (only its physical
+  part, the grid normalised to it), and every projection layer of an OpenXR
+  guest, each eye from its own texture. `[metalfx] upscaling <what>` names
+  each copy when the arrangement changes. The metrics panel (`KL_STATS_CARD`)
+  shows *Render* (the size the game draws), *MetalFX* (on / off / linear and
+  why), *Path* (engine and composite path) and *Output* (the size after it).
+- `KL_METALFX_BUDGET=<full eyes>` — the projection layers' share of MetalFX
+  output a frame, in full eye pictures (1..16, default 4). A layer whose
+  copies would go past it is drawn linear and said once (`budget` on the
+  panel); the eye pass has no budget.
+- `KL_METALFX_COLOR=hdr|linear|perceptual` — the scaler's colour processing
+  mode, for A/B tests. Unset: RGBA16F `hdr` (the default, kept), the rest
+  `perceptual`. An sRGB eye (`rgba8Unorm_srgb`, `bgra8Unorm_srgb`) is always
+  `perceptual`, whatever this says: MetalFX makes no scaler for sRGB with
+  `linear` or `hdr` (said once). Said once as
+  `[metalfx] colour processing …`; any other value is said and ignored. Read
+  once a run, at the first copy.

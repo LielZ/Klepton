@@ -12,6 +12,8 @@
 // The environment still sets the starting values, so a run that never opens the
 // panel behaves exactly as it did before this file existed.
 import SwiftUI
+import Metal
+import MetalFX
 import simd
 
 /// One complete set. Value semantics on purpose: the render thread reads a
@@ -439,6 +441,79 @@ final class KleptonRendering: ObservableObject {
     }
 }
 
+// The guest renders small (the Render resolution slider); the LINEAR stretch
+// to the eye texture is then replaced by Apple's spatial scaler: same pixels
+// in, sharper picture out. Single frame in/out, no motion data.
+// Read live in the compositor, so the switch applies to the next frame.
+// "Never chosen" means what the installation started with: off, unless the
+// installer named KL_METALFX_UPSCALE among the switches it wants on
+// (KLEPTON_TEST_ON, KLTestOn in Info.plist — AVP Play's experimental setting
+// "MetalFX"). A choice made here then stays, the way a Test switch's does.
+final class KleptonMetalFX: ObservableObject {
+    static let shared = KleptonMetalFX()
+
+    static let key = "klepton.metalfxUpscale"
+    /// The name an installation switches this on from the start with.
+    static let installSwitch = "KL_METALFX_UPSCALE"
+
+    /// On from the installation (KleptonTestSwitches.onFromInstall).
+    static var onFromInstall: Bool { KleptonTestSwitches.onFromInstall.contains(installSwitch) }
+
+    /// What the compositor reads every frame: the choice made in the game, else
+    /// what the installation started with.
+    static var isOn: Bool {
+        (UserDefaults.standard.object(forKey: key) as? Bool) ?? onFromInstall
+    }
+
+    @Published var enabled: Bool {
+        didSet {
+            // Stored only where it differs from what the installation starts
+            // with (KleptonTestSwitches.set), so a switch put back follows a
+            // later installation that starts it differently.
+            if enabled == Self.onFromInstall { UserDefaults.standard.removeObject(forKey: Self.key) }
+            else { UserDefaults.standard.set(enabled, forKey: Self.key) }
+            NSLog("[metalfx] spatial upscale: \(enabled ? "on" : "off")")
+        }
+    }
+
+    private init() {
+        enabled = Self.isOn
+    }
+
+    /// Whether this device has Apple's spatial scaler at all.
+    static let deviceSupported: Bool =
+        MTLCreateSystemDefaultDevice().map { MTLFXSpatialScalerDescriptor.supportsDevice($0) } ?? false
+
+    /// Whether switching changes the picture: the device has the scaler, and the
+    /// game was started below 100 % (kl_ovrp_eye_texture_scale — the scale its
+    /// eye size was made with; at 100 % there is nothing to upscale).
+    static var canUpscale: Bool {
+        guard deviceSupported else { return false }
+        var rs: Float = 1
+        var w: Int32 = 0, h: Int32 = 0
+        kl_ovrp_eye_texture_scale(&rs, &w, &h)
+        return rs < 0.999 && w > 0 && h > 0
+    }
+
+    /// A tap of Create and Options together while the metrics panel is shown
+    /// (kl_metrics_chord's 2, KleptonControllers): switches upscaling, in every
+    /// build, from the next frame — the same choice as the switch under
+    /// Rendering, so it is stored the same way. Where MetalFX cannot upscale
+    /// (no scaler, or a game started at 100 %) it does nothing. The panel's
+    /// MetalFX, Path and Output rows show what it did.
+    static func tapToggle() {
+        guard canUpscale else {
+            NSLog("[metalfx] tap of Create + Options: nothing to switch (%@)",
+                  deviceSupported ? "the game was started at 100 % resolution" : "no MetalFX on this device")
+            return
+        }
+        DispatchQueue.main.async {
+            shared.enabled.toggle()
+            NSLog("[metalfx] switched %@ with Create + Options", shared.enabled ? "on" : "off")
+        }
+    }
+}
+
 /// "Record what the game waits for": the runtime's account of blocked threads
 /// (KL_TRACE_CONDDUMP — kl_pthread_stuck_diag has what it writes), as a switch
 /// a player can turn on for a game that stops in a loading screen. Off unless
@@ -470,6 +545,9 @@ enum KleptonTestSwitches {
         let note: String
         /// Further variables that belong to the same switch.
         var also: [(String, String)] = []
+        /// Only in a test build (KleptonTestBuild): listed and applied there,
+        /// never in a player's build, even when KLTestOn names it.
+        var testBuildOnly = false
         var id: String { env + "=" + value }
         var key: String { "klepton.test." + env + (also.isEmpty ? "" : "." + value) }
     }
@@ -513,11 +591,15 @@ enum KleptonTestSwitches {
                              "Foveation: keine Zone unter halber Auflösung"),
                   note: klT("GL games with foveated rendering. The edge of the picture gets sharper textures and costs about 70% more fragments; watch the frame rate.",
                             "GL-Spiele mit Foveated Rendering. Der Bildrand bekommt schärfere Texturen und kostet etwa 70 % mehr Bildpunkte; auf die Bildrate achten.")),
-            Entry(env: "KL_OVRP_ONE_POSE", value: "1",
-                  title: klT("Head pose: one per frame of the game",
-                             "Kopfpose: eine pro Frame des Spiels"),
-                  note: klT("Games that talk to Meta's own interface, such as Moss or Tetris Effect. The game gets one head pose for a whole frame instead of a newer one several times within it. Does nothing in games that come through OpenXR (Half-Life: Alyx, Steam Link, Doom 3, Walkabout, Beat Saber 1.45). Turn the head quickly in a level and compare: does the picture stay steadier, or does it lag?",
-                            "Spiele, die über Metas eigene Schnittstelle laufen, etwa Moss oder Tetris Effect. Das Spiel bekommt für einen ganzen Frame eine Kopfpose statt mehrmals darin eine neuere. Bewirkt nichts in Spielen, die über OpenXR kommen (Half-Life: Alyx, Steam Link, Doom 3, Walkabout, Beat Saber 1.45). Im Level den Kopf schnell drehen und vergleichen: steht das Bild ruhiger, oder hängt es nach?")),
+            // Off by default since 2026-10-15 on both paths: OpenXR (KL_XR_PREDICT) and Meta's own interface
+            // (KL_OVRP_ONE_POSE, one latched pose per frame, on by default). This switch brings back the
+            // behaviour before: the head predicted to the time the picture is shown, and a fresh pose for
+            // every query. AVP Play's per-game option "XR prediction" starts it on (KLEPTON_TEST_ON=KL_XR_PREDICT).
+            Entry(env: "KL_XR_PREDICT", value: "1",
+                  title: klT("XR prediction", "XR-Vorhersage"),
+                  note: klT("Every game. Off, the game gets the head pose as it is when the frame starts, one per frame. On, as before: games that come through OpenXR (Half-Life: Alyx, Steam Link, Doom 3, Walkabout, Beat Saber 1.45) get the head predicted to the moment the picture is shown, and games that talk to Meta's own interface (Moss, Tetris Effect) a newer pose each time they ask within a frame. Turn the head quickly in a level and compare: does the picture stay steadier, or does it lag?",
+                            "Jedes Spiel. Aus bekommt das Spiel die Kopfpose, wie sie zu Beginn des Frames ist, eine pro Frame. An wie bisher: Spiele, die über OpenXR kommen (Half-Life: Alyx, Steam Link, Doom 3, Walkabout, Beat Saber 1.45), bekommen den Kopf auf den Moment vorhergesagt, in dem das Bild gezeigt wird, und Spiele, die über Metas eigene Schnittstelle laufen (Moss, Tetris Effect), jedes Mal eine neuere Pose, wenn sie innerhalb eines Frames fragen. Im Level den Kopf schnell drehen und vergleichen: steht das Bild ruhiger, oder hängt es nach?"),
+                  also: [("KL_OVRP_ONE_POSE", "0")]),
             Entry(env: "KL_OVRP_EYE_DESC_CAP", value: "1",
                   title: klT("Resolution: the game's own scale stays under the limit",
                              "Auflösung: der eigene Faktor des Spiels bleibt unter der Obergrenze"),
@@ -595,7 +677,13 @@ enum KleptonTestSwitches {
                              "GL: auch anisotrope Filterung, DXT und BGRA anbieten"),
                   note: klT("GL games. A Unity game may then filter textures anisotropically: sharper floors at flat angles.",
                             "GL-Spiele. Ein Unity-Spiel filtert Texturen dann womöglich anisotrop: schärfere Böden bei flachem Blick.")),
-        ]
+            Entry(env: "KL_FOVE_SUBPASS_HELPERS", value: "0",
+                  title: klT("Foveation (Vulkan): old depth reads in helper functions",
+                             "Foveation (Vulkan): alte Tiefenzugriffe in Hilfsfunktionen"),
+                  note: klT("Test builds only, the comparison for a fix: Unreal games with foveated rendering read the depth for soft edges at the wrong spot again (Moss: the black stripe in the book's fold). Look at the open book with this on and off.",
+                            "Nur in Testversionen, der Vergleich zu einer Korrektur: Unreal-Spiele mit Foveated Rendering lesen die Tiefe für weiche Kanten wieder an der falschen Stelle (Moss: der schwarze Streifen im Falz des Buchs). Das offene Buch mit und ohne diesen Schalter ansehen."),
+                  testBuildOnly: true),
+        ].filter { !$0.testBuildOnly || KleptonTestBuild.on }
     }
 
     /// Into the environment, before kl_app_configure. Never over the launch
@@ -642,8 +730,8 @@ private struct TestSwitchRow: View {
                  + entry.also.map { " " + $0.0 + "=" + $0.1 }.joined() + ")")
                 .font(.caption).foregroundStyle(.secondary)
             if KleptonTestSwitches.onFromInstall.contains(entry.env) {
-                Text(klT("On from the start in this installation: AVP Play's experimental setting asked for it.",
-                         "In dieser Installation von Anfang an eingeschaltet: Die experimentelle Einstellung von AVP Play hat es so verlangt."))
+                Text(klT("On from the start in this installation: AVP Play's settings asked for it.",
+                         "In dieser Installation von Anfang an eingeschaltet: Die Einstellungen von AVP Play haben es so verlangt."))
                     .font(.caption).foregroundStyle(.orange)
             }
         }
@@ -692,6 +780,7 @@ extension KleptonRendering {
 
 struct RenderingView: View {
     @ObservedObject private var rendering = KleptonRendering.shared
+    @ObservedObject private var metalfx = KleptonMetalFX.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -733,6 +822,15 @@ struct RenderingView: View {
                  + "halves the rate head movement is corrected at. Takes "
                  + "effect the next time the app starts.")
                 .font(.caption).foregroundStyle(.secondary)
+            Toggle("MetalFX upscaling", isOn: $metalfx.enabled)
+            Text(klT("Sharpens the picture when the resolution the game was started with is below 100%: the game draws small and Apple's scaler stretches it to eye size instead of a plain linear stretch. Costs some graphics time. Switching takes effect on the next frame; a new resolution only with the next start. Works in every game: Vulkan and GL, through Meta's interface or OpenXR, with foveated rendering too. The metrics panel shows whether it is upscaling.",
+                     "Schärft das Bild, wenn die Auflösung, mit der das Spiel gestartet wurde, unter 100 % liegt: Das Spiel zeichnet klein, und Apples Scaler streckt es auf Augengröße statt einer einfachen linearen Streckung. Kostet etwas Grafikzeit. Das Umschalten wirkt ab dem nächsten Bild, eine neue Auflösung erst beim nächsten Start. Wirkt in jedem Spiel: Vulkan und GL, über Metas Schnittstelle oder OpenXR, auch mit Foveated Rendering. Ob hochskaliert wird, zeigt das Leistungs-Panel."))
+                .font(.caption).foregroundStyle(.secondary)
+            if KleptonMetalFX.onFromInstall {
+                Text(klT("On from the start in this installation: AVP Play's experimental setting asked for it.",
+                         "In dieser Installation von Anfang an eingeschaltet: Die experimentelle Einstellung von AVP Play hat es so verlangt."))
+                    .font(.caption).foregroundStyle(.orange)
+            }
         }
     }
 }
