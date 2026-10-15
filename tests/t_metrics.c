@@ -165,6 +165,20 @@ int main(void) {
     CHECK(m.gpu_busy <= 0.001f, "no command buffer was committed and the GPU reads %.3f busy", m.gpu_busy);
     CHECK(m.compiles == 0 && m.compiles_cached == 0, "no shader was asked for and the sample says %.1f compiled, "
           "%.1f cached a second", m.compiles, m.compiles_cached);
+    // A tap of Create + Options switches MetalFX; the panel draws the compositor's next word on it at once, from
+    // kl_metrics_upscale_now, before the next sample has it.
+    kl_metrics_note_upscale(0, 0, 0, "Vulkan \xc2\xb7 per eye", NULL);
+    kl_metrics now = m;
+    kl_metrics_upscale_now(&now);
+    CHECK(now.upscale == 0 && now.out_w == 0 && now.out_h == 0 && strcmp(now.path, "Vulkan \xc2\xb7 per eye") == 0,
+          "after the switch kl_metrics_upscale_now reads %d to %dx%d on \"%s\", not 0 to 0x0 on the same path",
+          now.upscale, now.out_w, now.out_h, now.path);
+    CHECK(now.fps == m.fps && now.seq == m.seq, "kl_metrics_upscale_now touched more than the upscale");
+    kl_metrics latest;
+    kl_metrics_latest(&latest);
+    // ...while the last sample keeps what was true when it was taken, until the next second.
+    CHECK(latest.upscale == 2, "the last sample was rewritten by the switch: it reads upscale %d, not the 2 it was "
+          "taken with", latest.upscale);
     if (chord()) return 1;
     printf("metrics: PASS\n");
     return 0;
